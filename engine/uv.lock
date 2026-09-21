@@ -501,7 +501,7 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
-cognee = [
+knowledge-provider = [
     { name = "cognee" },
 ]
 
@@ -518,11 +518,11 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "cognee", marker = "extra == 'cognee'", specifier = "==1.5.4" },
+    { name = "cognee", marker = "extra == 'knowledge-provider'", specifier = "==1.5.4" },
     { name = "fastapi", specifier = "==0.141.1" },
     { name = "uvicorn", specifier = "==0.53.0" },
 ]
-provides-extras = ["cognee"]
+provides-extras = ["knowledge-provider"]
 
 [package.metadata.requires-dev]
 dev = [

@@ -43,7 +43,7 @@ Run the normal local verification suite:
 ```bash
 uv run ruff format --check src tests ../tests
 uv run ruff check src tests ../tests
-TELEMETRY_DISABLED=1 COGNEE_LOG_FILE=false uv run pytest -m "not live_provider"
+uv run pytest -m "not live_provider"
 
 cd ..
 python3 scripts/check_provider_boundary.py
@@ -90,11 +90,11 @@ The live test is opt-in because it calls configured external models and writes l
 
 ```bash
 cd engine
-uv sync --group dev --extra cognee
+uv sync --group dev --extra knowledge-provider
 cp ../local/m0.env.example .env
 ```
 
-Edit `engine/.env` and set `LLM_API_KEY` and `EMBEDDING_API_KEY`. Keep the provider, model, storage, access-control, and safety settings explicit. The file is ignored by Git; never commit credentials.
+Edit `engine/.env` and set `CONTEXT_ENGINE_MODEL_API_KEY` and `CONTEXT_ENGINE_EMBEDDING_API_KEY`. All external configuration uses engine-owned names; the private adapter translates them to the native SDK configuration internally. Keep the model, storage, access-control, and safety settings explicit. The file is ignored by Git; never commit credentials.
 
 Load the profile and run only the live matrix:
 
@@ -105,7 +105,7 @@ set +a
 uv run pytest -m live_provider -v
 ```
 
-The test skips unless `CONTEXT_ENGINE_RUN_LIVE_COGNEE=1` and `LLM_API_KEY` are present. Record verified results in [the spike report](docs/m0/spike-report.md) and update [the exit decision](docs/m0/exit-decision.md) only when the complete isolation, lifecycle, and residue checks pass.
+The test skips unless `CONTEXT_ENGINE_RUN_LIVE_PROVIDER=true` and `CONTEXT_ENGINE_MODEL_API_KEY` are present. Record verified results in [the spike report](docs/m0/spike-report.md) and update [the exit decision](docs/m0/exit-decision.md) only when the complete isolation, lifecycle, and residue checks pass.
 
 ## Development workflow
 
@@ -117,7 +117,7 @@ Before opening a change, run:
 cd engine
 uv run ruff format --check src tests ../tests
 uv run ruff check src tests ../tests
-TELEMETRY_DISABLED=1 COGNEE_LOG_FILE=false uv run pytest -m "not live_provider"
+uv run pytest -m "not live_provider"
 cd ..
 python3 scripts/check_provider_boundary.py
 ```

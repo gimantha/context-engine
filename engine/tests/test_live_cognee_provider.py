@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import hashlib
-import os
 import secrets
+from dataclasses import replace
 from uuid import UUID, uuid4
 
 import pytest
 
+from context_engine.config import KnowledgeBackendSettings
 from context_engine.knowledge_backend import (
     AccessPartitionRef,
     BackendError,
@@ -28,19 +29,22 @@ pytestmark = pytest.mark.live_provider
 
 
 def _live_enabled() -> bool:
-    return os.getenv("CONTEXT_ENGINE_RUN_LIVE_COGNEE") == "1" and bool(os.getenv("LLM_API_KEY"))
+    settings = KnowledgeBackendSettings.from_env()
+    return settings.live_test_enabled and bool(settings.model_api_key)
 
 
-@pytest.mark.skipif(not _live_enabled(), reason="live Cognee credentials are not configured")
+@pytest.mark.skipif(not _live_enabled(), reason="live provider credentials are not configured")
 @pytest.mark.asyncio
 async def test_live_provider_two_audience_lifecycle(tmp_path):
-    import cognee
+    settings = replace(KnowledgeBackendSettings.from_env(), storage_path=tmp_path)
+    runtime = CogneeRuntime(settings)
+    runtime._module()
+
     from cognee.modules.engine.operations.setup import setup
     from cognee.modules.users.methods import create_user
     from cognee.modules.users.permissions.methods import authorized_give_permission_on_datasets
 
-    assert_runtime_matches_pinned_sdk()
-    cognee.config.system_root_directory(str(tmp_path / "system"))
+    assert_runtime_matches_pinned_sdk(runtime)
     await setup()
 
     users = {}
@@ -49,11 +53,11 @@ async def test_live_provider_two_audience_lifecycle(tmp_path):
         if principal.principal_id not in users:
             users[principal.principal_id] = await create_user(
                 principal.principal_id,
-                os.getenv("M0_COGNEE_TEST_PASSWORD", secrets.token_urlsafe(24)),
+                settings.live_test_password or secrets.token_urlsafe(24),
             )
         return users[principal.principal_id]
 
-    backend = CogneeBackend(CogneeRuntime(), resolve_user)
+    backend = CogneeBackend(runtime, resolve_user)
     alpha = PrincipalContext(f"m0-alpha-{uuid4()}@example.invalid", f"trace-{uuid4()}")
     beta = PrincipalContext(f"m0-beta-{uuid4()}@example.invalid", f"trace-{uuid4()}")
     alpha_partition = AccessPartitionRef(f"partition-alpha-{uuid4()}")

@@ -11,6 +11,4 @@ __pycache__/
 *.db-wal
 .coverage
 htmlcov/
-.cognee_data/
-.cognee_system/
 *.log

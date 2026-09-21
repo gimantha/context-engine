@@ -55,7 +55,7 @@ This table is updated by the implementation run:
 | Unit and contract tests | Pass | 18 passed; live-provider test deselected |
 | Provider-boundary lint | Pass | No private provider term in public contracts and no forbidden import |
 | Cognee 1.5.4 SDK signature compatibility | Pass | Installed package reports 1.5.4 and all mapped signatures match |
-| Live ingest/query/delete | Blocked | No `LLM_API_KEY` or configured local model endpoint was present |
+| Live ingest/query/delete | Blocked | No engine model credential or configured local model endpoint was present |
 | Live two-audience graph isolation | Blocked | Requires configured model and embedding providers |
 | Live partial-write/update residue scan | Blocked | Requires configured model and embedding providers |
 
@@ -85,7 +85,7 @@ uv run pytest -m "not live_provider"
 After configuring an explicit LLM and embedding provider:
 
 ```bash
-CONTEXT_ENGINE_RUN_LIVE_COGNEE=1 uv run --extra cognee pytest -m live_provider -v
+CONTEXT_ENGINE_RUN_LIVE_PROVIDER=true uv run --extra knowledge-provider pytest -m live_provider -v
 ```
 
 Do not place credentials in this report or committed environment files.

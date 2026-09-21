@@ -60,7 +60,7 @@ Use these engine terms in APIs, domain types, application services, schemas, MCP
 
 Never expose the native provider product name, native identifiers, native types, native operation names, native isolation terminology, or native errors. `dataset` and `DataItem` are private provider terms. The same restriction applies to provider verbs such as `remember`, `recall`, `improve`, and `forget`.
 
-Provider-specific ADRs, adapter implementation, adapter tests, dependency declarations, and local provider configuration are the narrow exceptions needed to maintain the integration. Keep those details out of public contracts and product-facing surfaces. Run the boundary checker after changes.
+Provider-specific ADRs, adapter implementation, adapter tests, and dependency declarations are the narrow exceptions needed to maintain the integration. Local configuration must use engine-owned names and reach the native SDK only through the private adapter. Keep native details out of public contracts and product-facing surfaces. Run the boundary checker after changes.
 
 ## Contract changes
 
@@ -97,7 +97,7 @@ For normal changes, run:
 cd engine
 uv run ruff format --check src tests ../tests
 uv run ruff check src tests ../tests
-TELEMETRY_DISABLED=1 COGNEE_LOG_FILE=false uv run pytest -m "not live_provider"
+uv run pytest -m "not live_provider"
 uv run context-engine-api --check
 uv run context-engine-worker --check
 cd ..

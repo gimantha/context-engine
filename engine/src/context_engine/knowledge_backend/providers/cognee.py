@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import hashlib
 import inspect
+import os
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, Protocol
 from uuid import UUID
+
+from context_engine.config import KnowledgeBackendSettings
 
 from ..errors import BackendError, BackendErrorCode
 from ..types import (
@@ -282,8 +285,13 @@ class CogneeBackend:
 class CogneeRuntime:
     """Lazy SDK wrapper. All Cognee imports and native calls stay in this module."""
 
-    @staticmethod
-    def _module() -> Any:
+    def __init__(self, settings: KnowledgeBackendSettings | None = None) -> None:
+        self._settings = settings or KnowledgeBackendSettings.from_env()
+
+    def _module(self) -> Any:
+        """Load the SDK only after applying the engine-owned configuration."""
+
+        _apply_native_environment(self._settings)
         try:
             import cognee
         except ImportError as exc:
@@ -382,10 +390,10 @@ class CogneeRuntime:
         )
 
     async def health(self) -> tuple[bool, str]:
-        """Load the pinned SDK and report its installed version."""
+        """Load the pinned SDK and return an engine-owned readiness detail."""
 
-        cognee = self._module()
-        return True, f"Cognee {getattr(cognee, '__version__', 'unknown')}"
+        self._module()
+        return True, "knowledge provider ready"
 
 
 def _translate_evidence(value: Any, index: int) -> EvidenceItem:
@@ -447,10 +455,50 @@ def _translate_error(exc: Exception) -> BackendError:
     )
 
 
-def assert_runtime_matches_pinned_sdk() -> None:
+def _native_bool(value: bool) -> str:
+    """Format an engine boolean for the native provider environment."""
+
+    return "true" if value else "false"
+
+
+def _apply_native_environment(settings: KnowledgeBackendSettings) -> None:
+    """Translate engine settings into native names inside the private boundary."""
+
+    storage = settings.storage_path.resolve()
+    native_values = {
+        "TELEMETRY_DISABLED": _native_bool(not settings.telemetry_enabled),
+        "COGNEE_LOG_FILE": _native_bool(settings.file_logging_enabled),
+        "COGNEE_LOGS_DIR": str(storage / "logs"),
+        "CACHING": _native_bool(settings.query_cache_enabled),
+        "ENABLE_BACKEND_ACCESS_CONTROL": _native_bool(settings.access_control_required),
+        "REQUIRE_AUTHENTICATION": _native_bool(settings.access_control_required),
+        "ACCEPT_LOCAL_FILE_PATH": _native_bool(settings.local_content_access_enabled),
+        "ALLOW_HTTP_REQUESTS": _native_bool(settings.remote_content_access_enabled),
+        "ALLOW_CYPHER_QUERY": _native_bool(settings.raw_graph_query_enabled),
+        "DB_PROVIDER": settings.relational_store,
+        "GRAPH_DATABASE_PROVIDER": settings.graph_store,
+        "GRAPH_DATASET_DATABASE_HANDLER": settings.graph_store,
+        "VECTOR_DB_PROVIDER": settings.vector_store,
+        "VECTOR_DATASET_DATABASE_HANDLER": settings.vector_store,
+        "LLM_PROVIDER": settings.model_provider,
+        "LLM_MODEL": settings.model_name,
+        "LLM_API_KEY": settings.model_api_key,
+        "EMBEDDING_PROVIDER": settings.embedding_provider,
+        "EMBEDDING_MODEL": settings.embedding_model,
+        "EMBEDDING_DIMENSIONS": str(settings.embedding_dimensions),
+        "EMBEDDING_API_KEY": settings.embedding_api_key,
+        "SYSTEM_ROOT_DIRECTORY": str(storage / "system"),
+        "DATA_ROOT_DIRECTORY": str(storage / "data"),
+        "CACHE_ROOT_DIRECTORY": str(storage / "cache"),
+    }
+    # Overwrite inherited native settings so callers cannot bypass engine policy.
+    os.environ.update(native_values)
+
+
+def assert_runtime_matches_pinned_sdk(runtime: CogneeRuntime | None = None) -> None:
     """Fail fast when the installed SDK signatures drift from the M0 mapping."""
 
-    cognee = CogneeRuntime._module()
+    cognee = (runtime or CogneeRuntime())._module()
     required = {
         "remember": {"data", "dataset_name", "dataset_id", "self_improvement"},
         "recall": {"query_text", "dataset_ids", "top_k", "user"},

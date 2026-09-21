@@ -18,7 +18,7 @@ context-engine-migrate = "context_engine.persistence.migrate:main"
 context-engine-worker = "context_engine.worker.main:main"
 
 [project.optional-dependencies]
-cognee = ["cognee==1.5.4"]
+knowledge-provider = ["cognee==1.5.4"]
 
 [dependency-groups]
 dev = [
@@ -40,7 +40,7 @@ asyncio_mode = "auto"
 pythonpath = ["src"]
 testpaths = ["tests", "../tests"]
 markers = [
-  "live_provider: requires Cognee, model credentials, and local provider stores",
+  "live_provider: requires the private provider, model credentials, and local stores",
 ]
 
 [tool.ruff]

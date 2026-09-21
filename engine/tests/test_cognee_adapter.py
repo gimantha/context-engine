@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
+from importlib.util import find_spec
 
 import pytest
 
+from context_engine.config import KnowledgeBackendSettings
 from context_engine.knowledge_backend import (
     AccessPartitionRef,
     BackendError,
@@ -16,6 +19,7 @@ from context_engine.knowledge_backend import (
 )
 from context_engine.knowledge_backend.providers.cognee import (
     CogneeBackend,
+    _apply_native_environment,
     _NativeIngestion,
     assert_runtime_matches_pinned_sdk,
 )
@@ -113,5 +117,40 @@ async def test_adapter_never_queries_uninitialized_or_empty_scope():
 
 
 def test_installed_sdk_signature_when_available():
-    pytest.importorskip("cognee")
+    if find_spec("cognee") is None:
+        pytest.skip("private provider dependency is not installed")
     assert_runtime_matches_pinned_sdk()
+
+
+def test_engine_settings_override_native_environment(monkeypatch, tmp_path):
+    settings = KnowledgeBackendSettings(
+        telemetry_enabled=True,
+        file_logging_enabled=True,
+        query_cache_enabled=True,
+        access_control_required=True,
+        local_content_access_enabled=False,
+        remote_content_access_enabled=False,
+        raw_graph_query_enabled=False,
+        relational_store="engine-relational",
+        graph_store="engine-graph",
+        vector_store="engine-vector",
+        model_provider="engine-model-provider",
+        model_name="engine-model",
+        model_api_key="engine-model-key",
+        embedding_provider="engine-embedding-provider",
+        embedding_model="engine-embedding-model",
+        embedding_dimensions=42,
+        embedding_api_key="engine-embedding-key",
+        storage_path=tmp_path,
+    )
+    monkeypatch.setenv("ENABLE_BACKEND_ACCESS_CONTROL", "false")
+    monkeypatch.setenv("LLM_API_KEY", "bypass-key")
+
+    _apply_native_environment(settings)
+
+    assert os.environ["ENABLE_BACKEND_ACCESS_CONTROL"] == "true"
+    assert os.environ["LLM_API_KEY"] == "engine-model-key"
+    assert os.environ["GRAPH_DATABASE_PROVIDER"] == "engine-graph"
+    assert os.environ["VECTOR_DB_PROVIDER"] == "engine-vector"
+    assert os.environ["EMBEDDING_DIMENSIONS"] == "42"
+    assert os.environ["SYSTEM_ROOT_DIRECTORY"] == str(tmp_path / "system")
