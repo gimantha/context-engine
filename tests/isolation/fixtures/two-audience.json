@@ -1,0 +1,36 @@
+{
+  "spaceId": "space-incident-response",
+  "audiences": {
+    "alpha": ["shared", "alpha"],
+    "beta": ["shared", "beta"]
+  },
+  "records": [
+    {
+      "recordId": "record-alpha",
+      "sourceId": "source-incidents",
+      "version": "1",
+      "audience": "alpha",
+      "title": "Gateway incident Alpha",
+      "content": "Gateway in region Colombo uses recovery canary ALPHA-7443.",
+      "entities": ["Gateway", "Colombo"]
+    },
+    {
+      "recordId": "record-beta",
+      "sourceId": "source-incidents",
+      "version": "1",
+      "audience": "beta",
+      "title": "Gateway incident Beta",
+      "content": "Gateway in region Colombo uses recovery canary BETA-9555.",
+      "entities": ["Gateway", "Colombo"]
+    },
+    {
+      "recordId": "record-shared",
+      "sourceId": "source-runbooks",
+      "version": "1",
+      "audience": "shared",
+      "title": "Shared gateway runbook",
+      "content": "Gateway incidents require an owner and a rollback checkpoint.",
+      "entities": ["Gateway", "Rollback"]
+    }
+  ]
+}

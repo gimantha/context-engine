@@ -1,0 +1,80 @@
+{
+  "version": "1",
+  "tools": [
+    {
+      "name": "list_context_spaces",
+      "description": "List context spaces visible to the current principal.",
+      "inputSchema": { "type": "object", "additionalProperties": false }
+    },
+    {
+      "name": "query_context",
+      "description": "Query one visible context space.",
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["spaceId", "question"],
+        "properties": {
+          "spaceId": { "type": "string" },
+          "question": { "type": "string" },
+          "mode": { "enum": ["context", "answer"], "default": "context" }
+        }
+      }
+    },
+    {
+      "name": "get_evidence",
+      "description": "Read one currently authorized evidence item.",
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["evidenceId"],
+        "properties": { "evidenceId": { "type": "string" } }
+      }
+    },
+    {
+      "name": "explain_query",
+      "description": "Return a caller-safe explanation of evidence selection.",
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["queryId"],
+        "properties": { "queryId": { "type": "string" } }
+      }
+    },
+    {
+      "name": "ingest_context",
+      "description": "Submit a versioned source record and return an engine job handle.",
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["spaceId", "sourceId", "sourceRecordId", "sourceVersion", "contentRef"],
+        "properties": {
+          "spaceId": { "type": "string" },
+          "sourceId": { "type": "string" },
+          "sourceRecordId": { "type": "string" },
+          "sourceVersion": { "type": "string" },
+          "contentRef": { "type": "string" }
+        }
+      }
+    },
+    {
+      "name": "enrich_context",
+      "description": "Start authorized enrichment for a context space.",
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["spaceId"],
+        "properties": { "spaceId": { "type": "string" } }
+      }
+    },
+    {
+      "name": "delete_context_record",
+      "description": "Delete one engine record and return an engine job handle.",
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["recordId"],
+        "properties": { "recordId": { "type": "string" } }
+      }
+    }
+  ]
+}

@@ -1,0 +1,18 @@
+{
+  "queryId": "query-01J8M0",
+  "state": "completed",
+  "answer": "Use the rollback checkpoint from the cited runbook.",
+  "evidence": [
+    {
+      "id": "evidence-01J8M0",
+      "recordId": "runbook-84",
+      "sourceId": "source-runbooks",
+      "sourceVersion": "84",
+      "passage": "Confirm the rollback checkpoint before remediation.",
+      "location": "page:4",
+      "sourceUrl": "https://sources.invalid/runbooks/84"
+    }
+  ],
+  "insufficientEvidence": false,
+  "traceId": "trace-01J8M0"
+}

@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://context-engine.invalid/schemas/ingestion-event-v1.json",
+  "title": "Context ingestion event",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "spaceId",
+    "sourceId",
+    "sourceRecordId",
+    "sourceVersion",
+    "operation",
+    "sourceObservedAt",
+    "audience",
+    "sourceAclVersion",
+    "idempotencyKey"
+  ],
+  "properties": {
+    "schemaVersion": { "const": "1" },
+    "spaceId": { "type": "string", "minLength": 1, "maxLength": 200 },
+    "sourceId": { "type": "string", "minLength": 1, "maxLength": 200 },
+    "sourceRecordId": { "type": "string", "minLength": 1, "maxLength": 500 },
+    "sourceVersion": { "type": "string", "minLength": 1, "maxLength": 200 },
+    "operation": { "enum": ["upsert", "delete", "acl_changed"] },
+    "contentType": { "type": "string", "maxLength": 200 },
+    "contentRef": { "type": "string", "minLength": 1, "maxLength": 1000 },
+    "sourceUrl": { "type": "string", "format": "uri", "maxLength": 2000 },
+    "contentHash": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "sourceObservedAt": { "type": "string", "format": "date-time" },
+    "audience": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": { "type": "string", "minLength": 1, "maxLength": 300 }
+    },
+    "sourceAclVersion": { "type": "string", "minLength": 1, "maxLength": 200 },
+    "idempotencyKey": { "type": "string", "minLength": 8, "maxLength": 500 }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "operation": { "const": "upsert" } } },
+      "then": { "required": ["contentType", "contentRef", "contentHash"] }
+    }
+  ]
+}

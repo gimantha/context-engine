@@ -1,0 +1,78 @@
+"""The only backend interface available to application services."""
+
+from __future__ import annotations
+
+from typing import Protocol
+
+from .types import (
+    AccessPartitionRef,
+    BackendHealth,
+    BackendReference,
+    DeletionResult,
+    EnrichmentRequest,
+    EnrichmentResult,
+    IngestionResult,
+    PrincipalContext,
+    QueryRequest,
+    QueryResult,
+    SourceRecord,
+)
+
+
+class KnowledgeBackend(Protocol):
+    """Internal provider-neutral interface used by worker pipelines."""
+
+    async def ingest(
+        self,
+        record: SourceRecord,
+        principal: PrincipalContext,
+        partition: AccessPartitionRef,
+    ) -> IngestionResult:
+        """Store a new source record in one explicit access partition."""
+
+        ...
+
+    async def query(
+        self,
+        request: QueryRequest,
+        principal: PrincipalContext,
+        authorized_partitions: tuple[AccessPartitionRef, ...],
+    ) -> QueryResult:
+        """Retrieve evidence from explicitly authorized partitions."""
+
+        ...
+
+    async def update(
+        self,
+        record: SourceRecord,
+        principal: PrincipalContext,
+        partition: AccessPartitionRef,
+    ) -> IngestionResult:
+        """Replace an existing source record in its access partition."""
+
+        ...
+
+    async def enrich(
+        self,
+        request: EnrichmentRequest,
+        principal: PrincipalContext,
+        authorized_partitions: tuple[AccessPartitionRef, ...],
+    ) -> EnrichmentResult:
+        """Run explicit enrichment within authorized partitions."""
+
+        ...
+
+    async def delete(
+        self,
+        reference: BackendReference,
+        principal: PrincipalContext,
+        partition: AccessPartitionRef,
+    ) -> DeletionResult:
+        """Delete one referenced record from its access partition."""
+
+        ...
+
+    async def health(self) -> BackendHealth:
+        """Report backend readiness and supported capabilities."""
+
+        ...

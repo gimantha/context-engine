@@ -1,0 +1,27 @@
+name: Engine verification
+
+on:
+  pull_request:
+  push:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: engine
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.8.17"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: uv sync --group dev
+      - run: uv run ruff format --check src tests ../tests
+      - run: uv run ruff check src tests ../tests
+      - run: uv run context-engine-migrate --database /tmp/context-engine-ci.db
+      - run: CONTEXT_ENGINE_DB_PATH=/tmp/context-engine-api.db uv run context-engine-api --check
+      - run: CONTEXT_ENGINE_DB_PATH=/tmp/context-engine-worker.db uv run context-engine-worker --check
+      - run: uv run pytest -m "not live_provider"
