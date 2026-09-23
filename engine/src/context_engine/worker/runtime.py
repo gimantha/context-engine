@@ -9,7 +9,8 @@ from context_engine.domain import JobState
 from context_engine.observability import MetricsRegistry, get_logger, log_event
 from context_engine.persistence import ControlPlaneRepository, EffectConflict
 
-from .handler import InjectedWorkerCrash, JobHandler
+from .handler import InjectedWorkerCrash, JobHandler, TerminalJobError
+from .reauthorize import JobAuthorizer
 
 logger = get_logger(__name__)
 
@@ -35,6 +36,7 @@ class JobWorker:
         repository: ControlPlaneRepository,
         handler: JobHandler,
         metrics: MetricsRegistry,
+        job_authorizer: JobAuthorizer,
         *,
         lease_seconds: int = 30,
         retry_policy: RetryPolicy | None = None,
@@ -42,6 +44,7 @@ class JobWorker:
         self._repository = repository
         self._handler = handler
         self._metrics = metrics
+        self._job_authorizer = job_authorizer
         self._lease_seconds = lease_seconds
         self._retry_policy = retry_policy or RetryPolicy()
 
@@ -61,23 +64,56 @@ class JobWorker:
             trace_id=job.trace_id,
         )
         self._metrics.increment("context_engine_jobs_started_total")
+        # Permissions may have changed while the job waited; re-decide before any effect.
+        decision = self._job_authorizer.authorize(job)
+        if not decision.allowed:
+            if not self._repository.fail_job(
+                job, "authorization_revoked", "Job authorization is no longer valid"
+            ):
+                raise RuntimeError("Job lease was lost before recording denial")
+            self._metrics.increment("context_engine_jobs_denied_total")
+            log_event(
+                logger,
+                "job_denied",
+                job_id=job.id,
+                operation=job.operation.value,
+                reason_code=decision.reason_code,
+                trace_id=job.trace_id,
+            )
+            return True
         try:
             result = await self._handler.handle(job)
         except InjectedWorkerCrash:
             # Deliberately retain the running lease so recovery follows the real crash path.
             self._metrics.increment("context_engine_worker_interruptions_total")
             raise
-        except EffectConflict:
-            state = self._repository.retry_or_fail_job(
-                job,
-                "effect_conflict",
-                "Record effect conflicts with existing state",
-                datetime.now(UTC),
+        except TerminalJobError as exc:
+            if not self._repository.fail_job(job, exc.code, exc.message):
+                raise RuntimeError("Job lease was lost before recording failure") from exc
+            self._metrics.increment("context_engine_jobs_failed_total")
+            log_event(
+                logger,
+                "job_failed",
+                job_id=job.id,
+                operation=job.operation.value,
+                error_code=exc.code,
+                trace_id=job.trace_id,
             )
-            self._metrics.increment(
-                "context_engine_jobs_failed_total"
-                if state is JobState.FAILED
-                else "context_engine_jobs_retried_total"
+            return True
+        except EffectConflict as exc:
+            # A version delivered with different content cannot become valid by retrying.
+            if not self._repository.fail_job(
+                job, "effect_conflict", "Record effect conflicts with existing state"
+            ):
+                raise RuntimeError("Job lease was lost before recording failure") from exc
+            self._metrics.increment("context_engine_jobs_failed_total")
+            log_event(
+                logger,
+                "job_failed",
+                job_id=job.id,
+                operation=job.operation.value,
+                error_code="effect_conflict",
+                trace_id=job.trace_id,
             )
             return True
         except Exception as exc:

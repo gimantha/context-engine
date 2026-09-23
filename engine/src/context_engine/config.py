@@ -16,6 +16,15 @@ def _env_bool(name: str, default: bool) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _env_list(name: str, default: tuple[str, ...]) -> tuple[str, ...]:
+    """Read a comma-separated environment value or return the supplied default."""
+
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return tuple(item.strip().lower() for item in value.split(",") if item.strip())
+
+
 @dataclass(frozen=True, slots=True)
 class Settings:
     """Configure API, worker, database, and migration behavior."""
@@ -26,6 +35,19 @@ class Settings:
     worker_poll_seconds: float = 1.0
     worker_lease_seconds: int = 30
     worker_max_attempts: int = 5
+    # Only the static mode exists in this milestone; there is no mode without a verifier.
+    auth_mode: str = "static"
+    static_tokens_path: Path = Path(".context-engine/static-tokens.json")
+    staging_path: Path = Path(".context-engine/staging")
+    upload_max_bytes: int = 25 * 1024 * 1024
+    upload_ttl_seconds: int = 24 * 60 * 60
+    upload_content_types: tuple[str, ...] = (
+        "text/plain",
+        "text/markdown",
+        "text/html",
+        "application/json",
+        "application/pdf",
+    )
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -43,6 +65,21 @@ class Settings:
             worker_poll_seconds=float(os.getenv("CONTEXT_ENGINE_WORKER_POLL_SECONDS", "1")),
             worker_lease_seconds=int(os.getenv("CONTEXT_ENGINE_WORKER_LEASE_SECONDS", "30")),
             worker_max_attempts=int(os.getenv("CONTEXT_ENGINE_WORKER_MAX_ATTEMPTS", "5")),
+            auth_mode=os.getenv("CONTEXT_ENGINE_AUTH_MODE", "static").strip().lower(),
+            static_tokens_path=Path(
+                os.getenv("CONTEXT_ENGINE_STATIC_TOKENS_PATH", ".context-engine/static-tokens.json")
+            ).expanduser(),
+            staging_path=Path(
+                os.getenv("CONTEXT_ENGINE_STAGING_PATH", ".context-engine/staging")
+            ).expanduser(),
+            upload_max_bytes=int(
+                os.getenv("CONTEXT_ENGINE_UPLOAD_MAX_BYTES", str(25 * 1024 * 1024))
+            ),
+            upload_ttl_seconds=int(os.getenv("CONTEXT_ENGINE_UPLOAD_TTL_SECONDS", "86400")),
+            upload_content_types=_env_list(
+                "CONTEXT_ENGINE_UPLOAD_CONTENT_TYPES",
+                ("text/plain", "text/markdown", "text/html", "application/json", "application/pdf"),
+            ),
         )
 
 

@@ -1,1 +1,1 @@
-"""Identity and authorization policy."""
+"""Identity verification and authorization policy."""

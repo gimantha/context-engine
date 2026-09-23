@@ -1,0 +1,29 @@
+{
+  "version": "1",
+  "tokens": [
+    {
+      "token": "replace-me-admin-0123456789abcdef",
+      "issuer": "static://local",
+      "subject": "local-admin",
+      "kind": "user",
+      "email": "admin@example.invalid",
+      "groups": ["operators"],
+      "bootstrapActions": ["access.manage", "space.manage"]
+    },
+    {
+      "token": "replace-me-reader-0123456789abcdef",
+      "issuer": "static://local",
+      "subject": "local-reader",
+      "kind": "user",
+      "email": "reader@example.invalid",
+      "groups": ["readers"]
+    },
+    {
+      "token": "replace-me-connector-0123456789abcdef",
+      "issuer": "static://local",
+      "subject": "file-source-connector",
+      "kind": "service",
+      "expiresAt": "2027-12-31T00:00:00Z"
+    }
+  ]
+}

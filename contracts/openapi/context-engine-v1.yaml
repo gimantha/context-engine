@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Context Engine API
-  version: 0.2.0
+  version: 0.4.0
   description: Provider-neutral API draft for governed context spaces.
 servers:
   - url: /v1
@@ -78,15 +78,20 @@ paths:
       operationId: listSources
       responses:
         "200":
-          description: Registered sources
+          description: Registered sources in a visible space
           content:
             application/json:
               schema:
                 type: array
                 items:
                   $ref: "#/components/schemas/Source"
+        "401":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
     post:
       operationId: registerSource
+      description: Requires source.manage or space.manage on the space.
       requestBody:
         required: true
         content:
@@ -100,27 +105,188 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Source"
-  /sources/{sourceId}/checkpoints:
+        "400":
+          $ref: "#/components/responses/Error"
+        "401":
+          $ref: "#/components/responses/Error"
+        "403":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
+  /sources/{sourceId}:
+    parameters:
+      - $ref: "#/components/parameters/SourceId"
     get:
-      operationId: getSourceCheckpoint
-      parameters:
-        - $ref: "#/components/parameters/SourceId"
+      operationId: getSource
       responses:
         "200":
-          description: Current source checkpoint
+          description: Visible source
           content:
             application/json:
               schema:
-                type: object
-                required: [sourceId, cursor, updatedAt]
-                properties:
-                  sourceId:
-                    $ref: "#/components/schemas/Identifier"
-                  cursor:
-                    type: string
-                  updatedAt:
-                    type: string
-                    format: date-time
+                $ref: "#/components/schemas/Source"
+        "401":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
+    patch:
+      operationId: updateSource
+      description: Rename, pause or resume, or remap a source; requires source.manage or space.manage.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateSource"
+      responses:
+        "200":
+          description: Updated source
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Source"
+        "400":
+          $ref: "#/components/responses/Error"
+        "401":
+          $ref: "#/components/responses/Error"
+        "403":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
+  /sources/{sourceId}/checkpoints:
+    parameters:
+      - $ref: "#/components/parameters/SourceId"
+    get:
+      operationId: getSourceCheckpoint
+      responses:
+        "200":
+          description: Current connector cursor
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Checkpoint"
+        "401":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
+    put:
+      operationId: putSourceCheckpoint
+      description: Store the connector cursor; requires ingest.write on the source.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [cursor]
+              properties:
+                cursor:
+                  type: string
+                  minLength: 1
+                  maxLength: 4000
+      responses:
+        "200":
+          description: Stored connector cursor
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Checkpoint"
+        "401":
+          $ref: "#/components/responses/Error"
+        "403":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
+  /sources/{sourceId}/uploads:
+    post:
+      operationId: stageUpload
+      description: >-
+        Stage content bytes for a later ingestion event. The response uploadId becomes the
+        event's contentRef and its contentHash and contentType must match. Requires
+        ingest.write on the source.
+      parameters:
+        - $ref: "#/components/parameters/SourceId"
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+      responses:
+        "201":
+          description: Content staged
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Upload"
+        "400":
+          $ref: "#/components/responses/Error"
+        "401":
+          $ref: "#/components/responses/Error"
+        "403":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
+        "409":
+          $ref: "#/components/responses/Error"
+        "413":
+          $ref: "#/components/responses/Error"
+        "415":
+          $ref: "#/components/responses/Error"
+  /sources/{sourceId}/records/{recordId}:
+    get:
+      operationId: getRecordStatus
+      description: Record lifecycle without content, audiences, or backend details.
+      parameters:
+        - $ref: "#/components/parameters/SourceId"
+        - name: recordId
+          in: path
+          required: true
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 500
+      responses:
+        "200":
+          description: Current record state
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RecordStatus"
+        "401":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
+  /sources/{sourceId}/jobs:
+    get:
+      operationId: listSourceJobs
+      description: Deliveries for a source, for dead-letter inspection; requires delivery or management rights.
+      parameters:
+        - $ref: "#/components/parameters/SourceId"
+        - name: state
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [queued, running, succeeded, failed]
+      responses:
+        "200":
+          description: Jobs newest first
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Job"
+        "401":
+          $ref: "#/components/responses/Error"
+        "403":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
   /ingestions:
     post:
       operationId: acceptIngestion
@@ -143,21 +309,6 @@ paths:
           $ref: "#/components/responses/Error"
         "409":
           $ref: "#/components/responses/Error"
-  /uploads:
-    post:
-      operationId: createUpload
-      parameters:
-        - $ref: "#/components/parameters/IdempotencyKey"
-      requestBody:
-        required: true
-        content:
-          application/octet-stream:
-            schema:
-              type: string
-              format: binary
-      responses:
-        "202":
-          $ref: "#/components/responses/JobAccepted"
   /jobs/{jobId}:
     get:
       operationId: getJob
@@ -268,6 +419,19 @@ paths:
       responses:
         "202":
           $ref: "#/components/responses/JobAccepted"
+  /auth/me:
+    get:
+      operationId: getCurrentPrincipal
+      description: The calling principal as the engine resolved it from the credential.
+      responses:
+        "200":
+          description: Current principal
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Principal"
+        "401":
+          $ref: "#/components/responses/Error"
   /auth/permissions:
     get:
       operationId: listEffectivePermissions
@@ -279,19 +443,25 @@ paths:
             $ref: "#/components/schemas/Identifier"
       responses:
         "200":
-          description: Effective engine actions
+          description: Effective engine actions of the caller on a visible resource
           content:
             application/json:
               schema:
                 type: object
+                additionalProperties: false
                 required: [resourceId, actions]
                 properties:
                   resourceId:
                     $ref: "#/components/schemas/Identifier"
                   actions:
                     type: array
+                    uniqueItems: true
                     items:
-                      type: string
+                      $ref: "#/components/schemas/Action"
+        "401":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
   /resources/{resourceId}/grants:
     get:
       operationId: listGrants
@@ -299,13 +469,19 @@ paths:
         - $ref: "#/components/parameters/ResourceId"
       responses:
         "200":
-          description: Visible grants
+          description: Grants on the resource; requires access.manage
           content:
             application/json:
               schema:
                 type: array
                 items:
                   $ref: "#/components/schemas/Grant"
+        "401":
+          $ref: "#/components/responses/Error"
+        "403":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
   /resources/{resourceId}/grants/{grantId}:
     parameters:
       - $ref: "#/components/parameters/ResourceId"
@@ -313,15 +489,19 @@ paths:
         in: path
         required: true
         schema:
-          $ref: "#/components/schemas/Identifier"
+          type: string
+          pattern: "^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$"
     put:
       operationId: putGrant
+      description: >-
+        Create or replace a grant. The acting principal comes from the credential; the body
+        names only the grant target and actions.
       requestBody:
         required: true
         content:
           application/json:
             schema:
-              $ref: "#/components/schemas/Grant"
+              $ref: "#/components/schemas/PutGrant"
       responses:
         "200":
           description: Grant stored
@@ -329,11 +509,25 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Grant"
+        "400":
+          $ref: "#/components/responses/Error"
+        "401":
+          $ref: "#/components/responses/Error"
+        "403":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
     delete:
       operationId: deleteGrant
       responses:
         "204":
           description: Grant removed
+        "401":
+          $ref: "#/components/responses/Error"
+        "403":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
   /health/live:
     get:
       operationId: getLiveness
@@ -464,7 +658,7 @@ components:
     Source:
       type: object
       additionalProperties: false
-      required: [id, spaceId, name, type, state]
+      required: [id, spaceId, name, type, state, versionOrdering, createdAt]
       properties:
         id:
           $ref: "#/components/schemas/Identifier"
@@ -472,11 +666,34 @@ components:
           $ref: "#/components/schemas/Identifier"
         name:
           type: string
+          minLength: 1
+          maxLength: 120
         type:
           type: string
+          minLength: 1
+          maxLength: 60
         state:
           type: string
           enum: [ready, paused, failed]
+        versionOrdering:
+          $ref: "#/components/schemas/VersionOrdering"
+        createdAt:
+          type: string
+          format: date-time
+    VersionOrdering:
+      type: string
+      description: How this source's version strings compare; numeric versions must parse as integers.
+      enum: [numeric, lexicographic]
+    AudienceMapping:
+      type: object
+      description: >-
+        Trusted source audience tags mapped to engine audiences. Records carrying an unmapped
+        tag are quarantined. Write-only; never returned.
+      maxProperties: 500
+      additionalProperties:
+        type: string
+        minLength: 1
+        maxLength: 300
     RegisterSource:
       type: object
       additionalProperties: false
@@ -484,12 +701,88 @@ components:
       properties:
         name:
           type: string
+          minLength: 1
+          maxLength: 120
         type:
           type: string
+          minLength: 1
+          maxLength: 60
         audienceMapping:
-          type: object
-          additionalProperties:
-            type: string
+          $ref: "#/components/schemas/AudienceMapping"
+        versionOrdering:
+          $ref: "#/components/schemas/VersionOrdering"
+    UpdateSource:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 120
+        state:
+          type: string
+          enum: [ready, paused]
+        audienceMapping:
+          $ref: "#/components/schemas/AudienceMapping"
+    Checkpoint:
+      type: object
+      additionalProperties: false
+      required: [sourceId, cursor, updatedAt]
+      properties:
+        sourceId:
+          $ref: "#/components/schemas/Identifier"
+        cursor:
+          type: string
+        updatedAt:
+          type: string
+          format: date-time
+    Upload:
+      type: object
+      additionalProperties: false
+      required: [uploadId, sourceId, contentType, sizeBytes, contentHash, expiresAt]
+      properties:
+        uploadId:
+          $ref: "#/components/schemas/Identifier"
+        sourceId:
+          $ref: "#/components/schemas/Identifier"
+        contentType:
+          type: string
+        sizeBytes:
+          type: integer
+          minimum: 1
+        contentHash:
+          type: string
+          pattern: "^sha256:[0-9a-f]{64}$"
+        expiresAt:
+          type: string
+          format: date-time
+    RecordStatus:
+      type: object
+      additionalProperties: false
+      required: [spaceId, sourceId, recordId, state, currentVersion, sourceAclVersion, updatedAt]
+      properties:
+        spaceId:
+          $ref: "#/components/schemas/Identifier"
+        sourceId:
+          $ref: "#/components/schemas/Identifier"
+        recordId:
+          type: string
+        state:
+          type: string
+          enum: [active, deleted, quarantined]
+        currentVersion:
+          type: string
+        sourceAclVersion:
+          type: string
+        contentHash:
+          type: string
+          pattern: "^sha256:[0-9a-f]{64}$"
+        quarantineReason:
+          type: string
+        updatedAt:
+          type: string
+          format: date-time
     JobAccepted:
       type: object
       additionalProperties: false
@@ -597,23 +890,81 @@ components:
         outcome:
           type: string
           enum: [answered, insufficient_evidence, denied]
-    Grant:
+    Action:
+      type: string
+      enum:
+        - space.manage
+        - source.manage
+        - ingest.write
+        - context.read
+        - evidence.read
+        - trace.read
+        - context.enrich
+        - record.delete
+        - access.manage
+    Principal:
       type: object
       additionalProperties: false
-      required: [id, principalId, resourceId, actions]
+      required: [id, kind, groups]
       properties:
         id:
           $ref: "#/components/schemas/Identifier"
+        kind:
+          type: string
+          enum: [user, service]
+        email:
+          type: string
+          maxLength: 320
+        groups:
+          type: array
+          uniqueItems: true
+          items:
+            type: string
+    PutGrant:
+      type: object
+      additionalProperties: false
+      required: [actions]
+      oneOf:
+        - required: [principalId]
+        - required: [group]
+      properties:
         principalId:
           $ref: "#/components/schemas/Identifier"
-        resourceId:
-          $ref: "#/components/schemas/Identifier"
+        group:
+          type: string
+          minLength: 1
+          maxLength: 300
         actions:
           type: array
           minItems: 1
           uniqueItems: true
           items:
-            type: string
+            $ref: "#/components/schemas/Action"
+    Grant:
+      type: object
+      additionalProperties: false
+      required: [id, resourceId, actions]
+      oneOf:
+        - required: [principalId]
+        - required: [group]
+      properties:
+        id:
+          type: string
+          pattern: "^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$"
+        resourceId:
+          $ref: "#/components/schemas/Identifier"
+        principalId:
+          $ref: "#/components/schemas/Identifier"
+        group:
+          type: string
+          minLength: 1
+          maxLength: 300
+        actions:
+          type: array
+          minItems: 1
+          uniqueItems: true
+          items:
+            $ref: "#/components/schemas/Action"
     Error:
       type: object
       additionalProperties: false

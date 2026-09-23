@@ -7,8 +7,12 @@ import logging
 from datetime import UTC, datetime
 from typing import Any
 
+# Authorization events may name the principal, engine resource, action, policy version, and
+# reason code (threat model logging rules); never content, titles, tokens, or native ids.
 _ALLOWED_FIELDS = frozenset(
     {
+        "action",
+        "allowed",
         "attempt",
         "duration_ms",
         "error_code",
@@ -17,6 +21,10 @@ _ALLOWED_FIELDS = frozenset(
         "method",
         "operation",
         "path",
+        "policy_version",
+        "principal_id",
+        "reason_code",
+        "resource_id",
         "status_code",
         "trace_id",
     }

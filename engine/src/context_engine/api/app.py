@@ -3,38 +3,75 @@
 from __future__ import annotations
 
 import time
+from typing import Annotated
 from uuid import uuid4
 
-from fastapi import FastAPI, Header, Request, Response
+from fastapi import Depends, FastAPI, Header, Path, Query, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, PlainTextResponse
 
 from context_engine.application import (
+    AccessDeniedError,
     ApplicationError,
     ConflictError,
     ContextEngineService,
     NotFoundError,
+    PayloadTooLargeError,
+    UnauthenticatedError,
+    UnsupportedContentTypeError,
+    UploadPolicy,
 )
 from context_engine.config import Settings
+from context_engine.domain import JobState, SourceState, VersionOrdering
 from context_engine.observability import (
     MetricsRegistry,
     configure_logging,
     get_logger,
     log_event,
 )
-from context_engine.persistence import ControlDatabase, ControlPlaneRepository
+from context_engine.persistence import (
+    AuthorizationRepository,
+    ControlDatabase,
+    ControlPlaneRepository,
+    SourceRepository,
+    StagingStore,
+)
+from context_engine.security.authorization import Authorizer
+from context_engine.security.identity import (
+    AuthenticatedPrincipal,
+    AuthenticationError,
+    TokenVerifier,
+    build_token_verifier,
+    provision_static_identities,
+)
 
 from .schemas import (
+    CheckpointResponse,
     ContextSpaceResponse,
     CreateContextSpaceRequest,
+    EffectivePermissionsResponse,
     ErrorResponse,
+    GrantResponse,
     HealthResponse,
     IngestionRequest,
     JobAcceptedResponse,
     JobResponse,
+    PrincipalResponse,
+    PutCheckpointRequest,
+    PutGrantRequest,
+    RecordStatusResponse,
+    RegisterSourceRequest,
+    SourceResponse,
+    UpdateSourceRequest,
+    UploadResponse,
 )
 
 logger = get_logger(__name__)
+
+ResourceId = Annotated[str, Path(min_length=1, max_length=200)]
+GrantId = Annotated[str, Path(pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")]
+RecordId = Annotated[str, Path(min_length=1, max_length=500)]
+IdempotencyKey = Annotated[str, Header(alias="Idempotency-Key", min_length=8, max_length=200)]
 
 
 def _trace_id(request: Request) -> str:
@@ -46,6 +83,14 @@ def _error_status(error: ApplicationError) -> int:
         return 404
     if isinstance(error, ConflictError):
         return 409
+    if isinstance(error, UnauthenticatedError):
+        return 401
+    if isinstance(error, AccessDeniedError):
+        return 403
+    if isinstance(error, PayloadTooLargeError):
+        return 413
+    if isinstance(error, UnsupportedContentTypeError):
+        return 415
     return 400
 
 
@@ -60,6 +105,7 @@ def create_app(
     service: ContextEngineService | None = None,
     database: ControlDatabase | None = None,
     metrics: MetricsRegistry | None = None,
+    verifier: TokenVerifier | None = None,
 ) -> FastAPI:
     """Build the REST application and wire its control-plane dependencies."""
 
@@ -68,14 +114,57 @@ def create_app(
     metrics = metrics or MetricsRegistry()
     database = database or ControlDatabase(settings.database_path, settings.migrations_path)
     database.migrate()
+    authorization = AuthorizationRepository(database)
+    if verifier is None:
+        static_verifier = build_token_verifier(settings)
+        provision_static_identities(static_verifier, authorization)
+        verifier = static_verifier
+    upload_policy = UploadPolicy(
+        max_bytes=settings.upload_max_bytes,
+        ttl_seconds=settings.upload_ttl_seconds,
+        content_types=frozenset(settings.upload_content_types),
+    )
     if service is None:
         repository = ControlPlaneRepository(database)
-        service = ContextEngineService(repository, metrics, settings.worker_max_attempts)
+        service = ContextEngineService(
+            repository,
+            authorization,
+            Authorizer(authorization, metrics),
+            metrics,
+            SourceRepository(database),
+            StagingStore(settings.staging_path),
+            upload_policy,
+            settings.worker_max_attempts,
+        )
 
-    app = FastAPI(title="Context Engine API", version="0.2.0")
+    app = FastAPI(title="Context Engine API", version="0.4.0")
     app.state.database = database
     app.state.metrics = metrics
     app.state.service = service
+
+    async def current_principal(
+        request: Request,
+        authorization_header: Annotated[str | None, Header(alias="Authorization")] = None,
+    ) -> AuthenticatedPrincipal:
+        # The principal is built only from the verified credential; bodies cannot supply it.
+        scheme, _, token = (authorization_header or "").strip().partition(" ")
+        token = token.strip()
+        if scheme.lower() != "bearer" or not token:
+            raise UnauthenticatedError()
+        try:
+            identity = await verifier.verify(token)
+        except AuthenticationError as exc:
+            raise UnauthenticatedError() from exc
+        principal = authorization.resolve_principal(
+            identity.issuer, identity.subject, identity.kind, identity.email
+        )
+        return AuthenticatedPrincipal(
+            principal_id=principal.id,
+            kind=principal.kind,
+            email=principal.email,
+            groups=identity.groups,
+            trace_id=_trace_id(request),
+        )
 
     @app.middleware("http")
     async def trace_requests(request: Request, call_next):
@@ -99,9 +188,12 @@ def create_app(
 
     @app.exception_handler(ApplicationError)
     async def application_error(request: Request, error: ApplicationError) -> JSONResponse:
+        status = _error_status(error)
+        headers = {"WWW-Authenticate": "Bearer"} if status == 401 else None
         return JSONResponse(
-            status_code=_error_status(error),
+            status_code=status,
             content=_error_body(error.code, error.message, _trace_id(request)),
+            headers=headers,
         )
 
     @app.exception_handler(RequestValidationError)
@@ -128,6 +220,31 @@ def create_app(
     async def process_metrics() -> PlainTextResponse:
         return PlainTextResponse(metrics.render_prometheus(), media_type="text/plain")
 
+    @app.get(
+        "/v1/auth/me",
+        response_model=PrincipalResponse,
+        response_model_by_alias=True,
+        response_model_exclude_none=True,
+    )
+    async def current_principal_view(
+        principal: AuthenticatedPrincipal = Depends(current_principal),
+    ) -> PrincipalResponse:
+        return PrincipalResponse.from_principal(principal)
+
+    @app.get(
+        "/v1/auth/permissions",
+        response_model=EffectivePermissionsResponse,
+        response_model_by_alias=True,
+    )
+    async def effective_permissions(
+        resource_id: Annotated[str, Query(alias="resourceId", min_length=1, max_length=200)],
+        principal: AuthenticatedPrincipal = Depends(current_principal),
+    ) -> EffectivePermissionsResponse:
+        actions = service.effective_permissions(principal, resource_id)
+        return EffectivePermissionsResponse(
+            resourceId=resource_id, actions=sorted(item.value for item in actions)
+        )
+
     @app.post(
         "/v1/spaces",
         response_model=ContextSpaceResponse,
@@ -135,9 +252,12 @@ def create_app(
         response_model_exclude_none=True,
         status_code=201,
     )
-    async def create_context_space(body: CreateContextSpaceRequest) -> ContextSpaceResponse:
+    async def create_context_space(
+        body: CreateContextSpaceRequest,
+        principal: AuthenticatedPrincipal = Depends(current_principal),
+    ) -> ContextSpaceResponse:
         return ContextSpaceResponse.from_domain(
-            service.create_context_space(body.name, body.description)
+            service.create_context_space(principal, body.name, body.description)
         )
 
     @app.get(
@@ -146,8 +266,13 @@ def create_app(
         response_model_by_alias=True,
         response_model_exclude_none=True,
     )
-    async def list_context_spaces() -> list[ContextSpaceResponse]:
-        return [ContextSpaceResponse.from_domain(space) for space in service.list_context_spaces()]
+    async def list_context_spaces(
+        principal: AuthenticatedPrincipal = Depends(current_principal),
+    ) -> list[ContextSpaceResponse]:
+        return [
+            ContextSpaceResponse.from_domain(space)
+            for space in service.list_context_spaces(principal)
+        ]
 
     @app.get(
         "/v1/spaces/{space_id}",
@@ -155,8 +280,163 @@ def create_app(
         response_model_by_alias=True,
         response_model_exclude_none=True,
     )
-    async def get_context_space(space_id: str) -> ContextSpaceResponse:
-        return ContextSpaceResponse.from_domain(service.get_context_space(space_id))
+    async def get_context_space(
+        space_id: str,
+        principal: AuthenticatedPrincipal = Depends(current_principal),
+    ) -> ContextSpaceResponse:
+        return ContextSpaceResponse.from_domain(service.get_context_space(principal, space_id))
+
+    @app.post(
+        "/v1/spaces/{space_id}/sources",
+        response_model=SourceResponse,
+        response_model_by_alias=True,
+        status_code=201,
+    )
+    async def register_source(
+        space_id: ResourceId,
+        body: RegisterSourceRequest,
+        principal: AuthenticatedPrincipal = Depends(current_principal),
+    ) -> SourceResponse:
+        return SourceResponse.from_domain(
+            service.register_source(
+                principal,
+                space_id,
+                body.name,
+                body.type,
+                VersionOrdering(body.version_ordering),
+                dict(body.audience_mapping),
+            )
+        )
+
+    @app.get(
+        "/v1/spaces/{space_id}/sources",
+        response_model=list[SourceResponse],
+        response_model_by_alias=True,
+    )
+    async def list_sources(
+        space_id: ResourceId, principal: AuthenticatedPrincipal = Depends(current_principal)
+    ) -> list[SourceResponse]:
+        return [
+            SourceResponse.from_domain(source)
+            for source in service.list_sources(principal, space_id)
+        ]
+
+    @app.get("/v1/sources/{source_id}", response_model=SourceResponse, response_model_by_alias=True)
+    async def get_source(
+        source_id: ResourceId, principal: AuthenticatedPrincipal = Depends(current_principal)
+    ) -> SourceResponse:
+        return SourceResponse.from_domain(service.get_source(principal, source_id))
+
+    @app.patch(
+        "/v1/sources/{source_id}", response_model=SourceResponse, response_model_by_alias=True
+    )
+    async def update_source(
+        source_id: ResourceId,
+        body: UpdateSourceRequest,
+        principal: AuthenticatedPrincipal = Depends(current_principal),
+    ) -> SourceResponse:
+        return SourceResponse.from_domain(
+            service.update_source(
+                principal,
+                source_id,
+                name=body.name,
+                state=SourceState(body.state) if body.state else None,
+                audience_mapping=(
+                    dict(body.audience_mapping) if body.audience_mapping is not None else None
+                ),
+            )
+        )
+
+    @app.get(
+        "/v1/sources/{source_id}/checkpoints",
+        response_model=CheckpointResponse,
+        response_model_by_alias=True,
+    )
+    async def get_checkpoint(
+        source_id: ResourceId, principal: AuthenticatedPrincipal = Depends(current_principal)
+    ) -> CheckpointResponse:
+        return CheckpointResponse.from_domain(service.get_checkpoint(principal, source_id))
+
+    @app.put(
+        "/v1/sources/{source_id}/checkpoints",
+        response_model=CheckpointResponse,
+        response_model_by_alias=True,
+    )
+    async def put_checkpoint(
+        source_id: ResourceId,
+        body: PutCheckpointRequest,
+        principal: AuthenticatedPrincipal = Depends(current_principal),
+    ) -> CheckpointResponse:
+        return CheckpointResponse.from_domain(
+            service.put_checkpoint(principal, source_id, body.cursor)
+        )
+
+    @app.post(
+        "/v1/sources/{source_id}/uploads",
+        response_model=UploadResponse,
+        response_model_by_alias=True,
+        status_code=201,
+        openapi_extra={
+            "requestBody": {
+                "required": True,
+                "content": {
+                    "application/octet-stream": {"schema": {"type": "string", "format": "binary"}}
+                },
+            }
+        },
+    )
+    async def stage_upload(
+        source_id: ResourceId,
+        request: Request,
+        idempotency_key: IdempotencyKey,
+        principal: AuthenticatedPrincipal = Depends(current_principal),
+    ) -> UploadResponse:
+        # Authorize before reading the body so an unbound caller cannot occupy the size budget.
+        service.authorize_upload(principal, source_id)
+        chunks: list[bytes] = []
+        total = 0
+        async for chunk in request.stream():
+            total += len(chunk)
+            if total > upload_policy.max_bytes:
+                raise PayloadTooLargeError()
+            chunks.append(chunk)
+        upload = service.stage_upload(
+            principal,
+            source_id,
+            request.headers.get("content-type", ""),
+            b"".join(chunks),
+            idempotency_key,
+        )
+        return UploadResponse.from_domain(upload)
+
+    @app.get(
+        "/v1/sources/{source_id}/records/{record_id}",
+        response_model=RecordStatusResponse,
+        response_model_by_alias=True,
+        response_model_exclude_none=True,
+    )
+    async def get_record_status(
+        source_id: ResourceId,
+        record_id: RecordId,
+        principal: AuthenticatedPrincipal = Depends(current_principal),
+    ) -> RecordStatusResponse:
+        return RecordStatusResponse.from_domain(
+            service.get_record_status(principal, source_id, record_id)
+        )
+
+    @app.get(
+        "/v1/sources/{source_id}/jobs",
+        response_model=list[JobResponse],
+        response_model_by_alias=True,
+        response_model_exclude_none=True,
+    )
+    async def list_source_jobs(
+        source_id: ResourceId,
+        state: Annotated[str | None, Query(pattern="^(queued|running|succeeded|failed)$")] = None,
+        principal: AuthenticatedPrincipal = Depends(current_principal),
+    ) -> list[JobResponse]:
+        jobs = service.list_source_jobs(principal, source_id, JobState(state) if state else None)
+        return [JobResponse.from_domain(job) for job in jobs]
 
     @app.post(
         "/v1/ingestions",
@@ -166,11 +446,11 @@ def create_app(
     )
     async def accept_ingestion(
         body: IngestionRequest,
-        request: Request,
         response: Response,
-        idempotency_key: str = Header(alias="Idempotency-Key", min_length=8, max_length=200),
+        idempotency_key: IdempotencyKey,
+        principal: AuthenticatedPrincipal = Depends(current_principal),
     ) -> JobAcceptedResponse:
-        job = service.accept_ingestion(body.to_command(), idempotency_key, _trace_id(request))
+        job = service.accept_ingestion(principal, body.to_command(), idempotency_key)
         status_url = f"/v1/jobs/{job.id}"
         response.headers["Location"] = status_url
         return JobAcceptedResponse(jobId=job.id, statusUrl=status_url)
@@ -181,7 +461,57 @@ def create_app(
         response_model_by_alias=True,
         response_model_exclude_none=True,
     )
-    async def get_job(job_id: str) -> JobResponse:
-        return JobResponse.from_domain(service.get_job(job_id))
+    async def get_job(
+        job_id: str,
+        principal: AuthenticatedPrincipal = Depends(current_principal),
+    ) -> JobResponse:
+        return JobResponse.from_domain(service.get_job(principal, job_id))
+
+    @app.get(
+        "/v1/resources/{resource_id}/grants",
+        response_model=list[GrantResponse],
+        response_model_by_alias=True,
+        response_model_exclude_none=True,
+    )
+    async def list_grants(
+        resource_id: ResourceId,
+        principal: AuthenticatedPrincipal = Depends(current_principal),
+    ) -> list[GrantResponse]:
+        return [
+            GrantResponse.from_domain(grant)
+            for grant in service.list_grants(principal, resource_id)
+        ]
+
+    @app.put(
+        "/v1/resources/{resource_id}/grants/{grant_id}",
+        response_model=GrantResponse,
+        response_model_by_alias=True,
+        response_model_exclude_none=True,
+    )
+    async def put_grant(
+        resource_id: ResourceId,
+        grant_id: GrantId,
+        body: PutGrantRequest,
+        principal: AuthenticatedPrincipal = Depends(current_principal),
+    ) -> GrantResponse:
+        return GrantResponse.from_domain(
+            service.put_grant(
+                principal,
+                resource_id,
+                grant_id,
+                body.to_actions(),
+                body.principal_id,
+                body.group,
+            )
+        )
+
+    @app.delete("/v1/resources/{resource_id}/grants/{grant_id}", status_code=204)
+    async def delete_grant(
+        resource_id: ResourceId,
+        grant_id: GrantId,
+        principal: AuthenticatedPrincipal = Depends(current_principal),
+    ) -> Response:
+        service.delete_grant(principal, resource_id, grant_id)
+        return Response(status_code=204)
 
     return app

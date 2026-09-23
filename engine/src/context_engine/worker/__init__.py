@@ -1,6 +1,14 @@
 """Durable worker process."""
 
-from .handler import InjectedWorkerCrash, LedgerJobHandler
+from .handler import InjectedWorkerCrash, LifecycleJobHandler, TerminalJobError
+from .reauthorize import JobAuthorizer
 from .runtime import JobWorker, RetryPolicy
 
-__all__ = ["InjectedWorkerCrash", "JobWorker", "LedgerJobHandler", "RetryPolicy"]
+__all__ = [
+    "InjectedWorkerCrash",
+    "JobAuthorizer",
+    "JobWorker",
+    "LifecycleJobHandler",
+    "RetryPolicy",
+    "TerminalJobError",
+]
