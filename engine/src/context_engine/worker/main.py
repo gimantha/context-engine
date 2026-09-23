@@ -7,9 +7,17 @@ import asyncio
 
 from context_engine.config import Settings
 from context_engine.observability import MetricsRegistry, configure_logging
-from context_engine.persistence import ControlDatabase, ControlPlaneRepository
+from context_engine.persistence import (
+    AuthorizationRepository,
+    ControlDatabase,
+    ControlPlaneRepository,
+    SourceRepository,
+)
+from context_engine.security.authorization import Authorizer
+from context_engine.security.identity import build_token_verifier
 
-from .handler import LedgerJobHandler
+from .handler import LifecycleJobHandler
+from .reauthorize import JobAuthorizer
 from .runtime import JobWorker
 
 
@@ -17,11 +25,15 @@ async def _run(args: argparse.Namespace, settings: Settings) -> None:
     database = ControlDatabase(settings.database_path, settings.migrations_path)
     database.migrate()
     repository = ControlPlaneRepository(database)
+    authorization = AuthorizationRepository(database)
     metrics = MetricsRegistry()
+    # The worker loads the same identity registry as the API so it can resolve current groups.
+    verifier = build_token_verifier(settings)
     worker = JobWorker(
         repository,
-        LedgerJobHandler(repository),
+        LifecycleJobHandler(SourceRepository(database)),
         metrics,
+        JobAuthorizer(Authorizer(authorization, metrics), authorization, verifier),
         lease_seconds=settings.worker_lease_seconds,
     )
     if args.check:

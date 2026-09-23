@@ -8,7 +8,7 @@ Before changing code or contracts, read these files in order:
 
 1. [README.md](README.md) for setup and verification commands.
 2. [The standalone implementation plan](docs/Devant%20Context%20Engine%20Implementation%20Plan.md) for product scope and milestone order.
-3. [The Milestone 0 plan](docs/Milestone%200%20Implementation%20Plan.md) and [M1 report](docs/m1/implementation-report.md) for acceptance evidence.
+3. [The Milestone 0 plan](docs/Milestone%200%20Implementation%20Plan.md) and the [M1](docs/m1/implementation-report.md), [M2](docs/m2/implementation-report.md), and [M3](docs/m3/implementation-report.md) reports for acceptance evidence.
 4. [ADR 0001](docs/decisions/0001-knowledge-backend-boundary.md) for terminology and dependency boundaries.
 5. The ADRs relevant to the files being changed.
 6. [The threat model](docs/m0/threat-model.md) and [M0 exit decision](docs/m0/exit-decision.md) for security gates and open risks.
@@ -17,7 +17,7 @@ Inspect the current working tree before editing and preserve user changes. Treat
 
 ## Current state
 
-Milestone 1 has a runnable REST API and independent worker backed by a migrated SQLite control database. The transactional outbox, job leases, retries, idempotent record-effect ledger, structured logs, metrics, and crash-replay test are implemented. The user explicitly authorized control-plane work while the M0 live-provider security gate remains open. Do not describe the provider-backed system as release-ready until the live isolation, stale-artifact, and deletion checks pass.
+Milestone 1 has a runnable REST API and independent worker backed by a migrated SQLite control database. The transactional outbox, job leases, retries, idempotent record-effect ledger, structured logs, metrics, and crash-replay test are implemented. Milestone 2 adds bearer-token authentication through a `TokenVerifier` protocol with a static pre-shared-token implementation, principals keyed on issuer and subject, grants on the root resource and context spaces, recorded access decisions, and worker-time reauthorization (ADR 0009). Identity-provider verifiers are deferred to M6. The engine half of Milestone 3 adds source registration with audience mappings and a version-ordering policy, staged uploads verified by type, size, and hash, connector checkpoints, the authoritative record ledger with tombstones and quarantine, record status and dead-letter routes, and a lifecycle worker handler. The Ballerina file-source connector is developed separately; `tests/end-to-end/` plays the connector's role. The access-partition-to-audience binding is deferred until the source ACL shape is decided; the envelope keeps its flat `audience` list, mapped per source. The user explicitly authorized control-plane work while the M0 live-provider security gate remains open. Do not describe the provider-backed system as release-ready until the live isolation, stale-artifact, and deletion checks pass.
 
 ## Ownership and dependency direction
 
@@ -34,16 +34,21 @@ Milestone 1 has a runnable REST API and independent worker backed by a migrated 
 | `engine/src/context_engine/observability/` | Secret-safe structured logs and metrics |
 | `engine/src/context_engine/knowledge_backend/` | Engine-owned backend port and immutable types |
 | `engine/src/context_engine/knowledge_backend/providers/` | Private native-provider integration and translation |
-| `engine/src/context_engine/security/` | Policy decisions and authorized partition resolution |
+| `engine/src/context_engine/security/` | Token verification, grant-based authorization, policy decisions, and partition resolution |
 | `engine/tests/` | Unit, adapter, contract, and live-provider tests |
 | `tests/isolation/` | Cross-audience isolation fixtures and checks |
 | `docs/decisions/` | Accepted architectural decisions |
-| `docs/m0/` | Milestone evidence, threats, and exit status |
+| `docs/m0/` through `docs/m3/` | Milestone evidence, threats, and exit status |
+| `tests/end-to-end/` | Reference-connector lifecycle tests against the REST API and worker |
 | `scripts/check_provider_boundary.py` | Automated public-boundary enforcement |
 
 The dependency flow is `REST API → application service → domain/persistence`. Client applications use the REST API only. The API and MCP packages must never import the knowledge-backend port or a provider implementation. Asynchronous provider work belongs in a worker handler, which may depend on the provider-neutral port. Only modules below `knowledge_backend/providers/` may import a native provider package or manipulate its native objects. Translate all native output, errors, and identifiers into engine-owned values before returning from an adapter.
 
 Do not bypass the port with raw graph, vector, relational, cache, or provider calls. Do not add a broad default identity or scope. Every ingest, query, update, enrichment, and deletion must carry an explicit `PrincipalContext` and explicit access partition input resolved by engine policy.
+
+Ingestion rules: the engine never fetches supplied URLs or enables a provider's loaders; bytes arrive as staged uploads scoped to a source. Delivery rights are `ingest.write` grants on the source. Ledger transitions live in `persistence/sources.py` and follow ADR 0006: compare versions under the source's ordering, never resurrect a deleted record with an older or equal version, quarantine unmapped audiences, and apply the effect row, record state, and version history in one transaction.
+
+Identity rules: the REST dependency builds `AuthenticatedPrincipal` only from the verified bearer credential. Never read the caller's identity from a body, query, or custom header. Never add an authentication mode that skips the verifier. Denials on resources the caller cannot see return not-found; denials on visible resources return the generic access-denied error. Record every explicit authorization decision with a reason code and never log content, titles, or tokens.
 
 ## Public language and private concepts
 

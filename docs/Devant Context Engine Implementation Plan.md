@@ -164,9 +164,9 @@ Build an engine-owned MCP server using the same application services as HTTP. St
 
 ### M2 — Authentication, resource scopes and grants
 
-**Implement:** Add pluggable token verifier, principal/group mapping, policy decision function, internal access-partition-to-audience binding and grant APIs. Cover `context.read`, `ingest.write`, `context.enrich`, `record.delete`, `access.manage`, `trace.read` and `evidence.read` separately. Record access decisions with reason codes. Add negative tests for forged principal fields, expired tokens, lost group membership, privilege escalation via grant, and permission change between job enqueue and execution.
+**Implement:** Add a pluggable token verifier behind a `TokenVerifier` protocol, shipped in this milestone with a static pre-shared-token implementation for local and test use (see ADR 0009). Add principal mapping keyed on issuer and subject, group membership from the verified identity, the policy decision function, internal access-partition-to-audience binding and grant APIs. Cover `space.manage`, `context.read`, `ingest.write`, `context.enrich`, `record.delete`, `access.manage`, `trace.read` and `evidence.read` separately. Record access decisions with reason codes. Reauthorize queued jobs at execution time. Add negative tests for forged principal fields, expired tokens, lost group membership, privilege escalation via grant, and permission change between job enqueue and execution. Identity-provider integrations move to M6.
 
-**Gate:** Grant, query and revoke a role; the same principal loses HTTP, UI and MCP read access on revocation. Every provider call is made through the knowledge-backend port with explicit authorized identity and internal access partitions. Denied access reveals no restricted title, passage, entity, partition, backend identifier or job details.
+**Gate:** Grant, read and revoke; the same principal loses access on revocation through every surface that exists at this milestone, and later surfaces reuse the same application service. Every provider call is made through the knowledge-backend port with explicit authorized identity and internal access partitions. Denied access reveals no restricted title, passage, entity, partition, backend identifier or job details.
 
 ### M3 — Ballerina source integration and ingestion lifecycle
 
@@ -188,7 +188,7 @@ Build an engine-owned MCP server using the same application services as HTTP. St
 
 ### M6 — HTTP, MCP and query UI
 
-**Implement:** Complete the API table and publish OpenAPI and examples. Implement the MCP facade with read tools first, then guarded write tools. Build a query workbench with a context-space selector, context versus answer mode, inline source citations, evidence drawer, bounded graph view, query trace, jobs/status and a grant/revoke screen. Use one identity/session flow and the same backend checks for UI, HTTP and MCP.
+**Implement:** Complete the API table and publish OpenAPI and examples. Add the identity-provider implementations of the `TokenVerifier` protocol: organization OIDC tokens, gateway-issued assertions with an audience check, connection service credentials bound to registered sources, and agent actor claims for on-behalf-of access (see ADR 0009). Implement the MCP facade with read tools first, then guarded write tools. Build a query workbench with a context-space selector, context versus answer mode, inline source citations, evidence drawer, bounded graph view, query trace, jobs/status and a grant/revoke screen. Use one identity/session flow and the same backend checks for UI, HTTP and MCP.
 
 **Gate:** A user can ingest through the Ballerina connector, query in the UI and through HTTP/MCP, open a citation and trace, grant a second user read permission and revoke it. A second user cannot access the same evidence, query handle or source link after revocation. Tool responses and UI screens expose neither internal access partitions nor provider details.
 

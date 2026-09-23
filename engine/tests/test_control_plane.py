@@ -14,7 +14,11 @@ from context_engine.persistence import ControlDatabase, ControlPlaneRepository, 
 def _repository(tmp_path):
     migrations = Path(__file__).resolve().parents[1] / "migrations"
     database = ControlDatabase(tmp_path / "control.db", migrations)
-    assert database.migrate() == ("0001_control_plane",)
+    assert database.migrate() == (
+        "0001_control_plane",
+        "0002_identity_and_grants",
+        "0003_sources_and_ledger",
+    )
     assert database.migrate() == ()
     return database, ControlPlaneRepository(database)
 
@@ -31,11 +35,12 @@ def test_migrations_and_transactional_outbox(tmp_path):
     }
 
     job, created = repository.enqueue_job(
-        JobOperation.INGESTION, "source-1:record-1:1", payload, "trace-1", 3
+        JobOperation.INGESTION, "source-1:record-1:1", payload, "trace-1", 3, "prn_test"
     )
 
     assert created
     assert job.state is JobState.ACCEPTED
+    assert job.principal_id == "prn_test"
     with database.connection() as connection:
         assert connection.execute("SELECT COUNT(*) FROM outbox_events").fetchone()[0] == 1
 
@@ -54,10 +59,10 @@ def test_idempotency_replay_and_conflict(tmp_path):
         "operation": "upsert",
     }
     first, created = repository.enqueue_job(
-        JobOperation.INGESTION, "source-1:record-1:1", payload, "trace-1", 3
+        JobOperation.INGESTION, "source-1:record-1:1", payload, "trace-1", 3, "prn_test"
     )
     replay, replay_created = repository.enqueue_job(
-        JobOperation.INGESTION, "source-1:record-1:1", payload, "trace-2", 3
+        JobOperation.INGESTION, "source-1:record-1:1", payload, "trace-2", 3, "prn_test"
     )
 
     assert created and not replay_created
@@ -71,6 +76,7 @@ def test_idempotency_replay_and_conflict(tmp_path):
             {**payload, "sourceVersion": "2"},
             "trace-3",
             3,
+            "prn_test",
         )
 
 
@@ -84,7 +90,7 @@ def test_expired_lease_can_be_reclaimed(tmp_path):
         "operation": "upsert",
     }
     job, _ = repository.enqueue_job(
-        JobOperation.INGESTION, "source-1:record-1:1", payload, "trace-1", 3
+        JobOperation.INGESTION, "source-1:record-1:1", payload, "trace-1", 3, "prn_test"
     )
     repository.dispatch_outbox()
     instant = datetime.now(UTC)

@@ -3,21 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from enum import StrEnum
 
+from context_engine.domain import Action
 from context_engine.knowledge_backend.types import AccessPartitionRef
 
-
-class Action(StrEnum):
-    """Fine-grained actions understood by the engine policy service."""
-
-    CONTEXT_READ = "context.read"
-    INGEST_WRITE = "ingest.write"
-    CONTEXT_ENRICH = "context.enrich"
-    RECORD_DELETE = "record.delete"
-    EVIDENCE_READ = "evidence.read"
-    TRACE_READ = "trace.read"
-    ACCESS_MANAGE = "access.manage"
+__all__ = ["Action", "PolicyDecision", "PolicyInput", "authorize"]
 
 
 @dataclass(frozen=True, slots=True)

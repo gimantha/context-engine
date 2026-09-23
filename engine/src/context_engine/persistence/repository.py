@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from datetime import UTC, datetime, timedelta
-from sqlite3 import Row
+from sqlite3 import Connection, Row
 from typing import Any
 from uuid import uuid4
 
@@ -58,6 +58,7 @@ def _job(row: Row) -> Job:
         payload=json.loads(row["payload_json"]),
         payload_hash=row["payload_hash"],
         trace_id=row["trace_id"],
+        principal_id=row["principal_id"],
         attempt_count=row["attempt_count"],
         max_attempts=row["max_attempts"],
         next_attempt_at=_datetime(row["next_attempt_at"]),
@@ -69,6 +70,44 @@ def _job(row: Row) -> Job:
         created_at=datetime.fromisoformat(row["created_at"]),
         updated_at=datetime.fromisoformat(row["updated_at"]),
     )
+
+
+def insert_source_effect(connection: Connection, job: Job) -> bool:
+    """Insert the idempotent effect row for a job inside the caller's transaction.
+
+    Returns True when the effect is new and False for an exact replay of the same idempotency
+    key. Raises `EffectConflict` when that key was already applied with a different payload.
+    """
+
+    payload = job.payload
+    cursor = connection.execute(
+        """
+        INSERT OR IGNORE INTO source_record_effects(
+            idempotency_key, space_id, source_id, source_record_id,
+            source_version, operation, payload_hash, applied_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            job.idempotency_key,
+            payload["spaceId"],
+            payload["sourceId"],
+            payload["sourceRecordId"],
+            payload["sourceVersion"],
+            payload["operation"],
+            job.payload_hash,
+            _timestamp(),
+        ),
+    )
+    if cursor.rowcount == 1:
+        return True
+    # The same idempotency key must carry the same payload; anything else is a conflict.
+    existing = connection.execute(
+        "SELECT payload_hash FROM source_record_effects WHERE idempotency_key = ?",
+        (job.idempotency_key,),
+    ).fetchone()
+    if existing and existing["payload_hash"] != job.payload_hash:
+        raise EffectConflict
+    return False
 
 
 class ControlPlaneRepository:
@@ -120,10 +159,12 @@ class ControlPlaneRepository:
         payload: dict[str, Any],
         trace_id: str,
         max_attempts: int,
+        principal_id: str,
     ) -> tuple[Job, bool]:
         """Atomically insert an idempotent job and matching outbox event.
 
-        The boolean result is true for a new job and false for an exact replay.
+        The boolean result is true for a new job and false for an exact replay. The accepting
+        principal is stored so the worker can reauthorize the job when it executes.
         """
 
         payload_json = _canonical(payload)
@@ -145,8 +186,8 @@ class ControlPlaneRepository:
                 """
                 INSERT INTO jobs(
                     id, operation, state, idempotency_key, payload_json, payload_hash,
-                    trace_id, max_attempts, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    trace_id, principal_id, max_attempts, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     job_id,
@@ -156,6 +197,7 @@ class ControlPlaneRepository:
                     payload_json,
                     payload_hash,
                     trace_id,
+                    principal_id,
                     max_attempts,
                     now,
                     now,
@@ -330,54 +372,52 @@ class ControlPlaneRepository:
             raise RuntimeError("Job lease was lost before recording failure")
         return state
 
-    def record_source_effect(self, job: Job) -> bool:
-        """Record one idempotent source-record effect for crash recovery."""
+    def fail_job(self, job: Job, error_code: str, error_message: str) -> bool:
+        """Terminally fail a leased job regardless of remaining attempts.
 
-        payload = job.payload
+        Used when the job's authorization no longer holds; retrying cannot make it valid.
+        """
+
         with self.database.transaction() as connection:
             cursor = connection.execute(
                 """
-                INSERT OR IGNORE INTO source_record_effects(
-                    idempotency_key, space_id, source_id, source_record_id,
-                    source_version, operation, payload_hash, applied_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                UPDATE jobs
+                SET state = ?, next_attempt_at = NULL, lease_token = NULL, lease_expires_at = NULL,
+                    error_code = ?, error_message = ?, updated_at = ?
+                WHERE id = ? AND state = ? AND lease_token = ?
                 """,
                 (
-                    job.idempotency_key,
-                    payload["spaceId"],
-                    payload["sourceId"],
-                    payload["sourceRecordId"],
-                    payload["sourceVersion"],
-                    payload["operation"],
-                    job.payload_hash,
+                    JobState.FAILED.value,
+                    error_code,
+                    error_message,
                     _timestamp(),
+                    job.id,
+                    JobState.RUNNING.value,
+                    job.lease_token,
                 ),
             )
-            if cursor.rowcount == 1:
-                return True
-            # INSERT OR IGNORE also covers the record-version uniqueness constraint; verify that
-            # an ignored row is an exact replay rather than a conflicting source event.
-            existing = connection.execute(
-                """
-                SELECT payload_hash FROM source_record_effects
-                WHERE idempotency_key = ? OR (
-                    space_id = ? AND source_id = ? AND source_record_id = ?
-                    AND source_version = ? AND operation = ?
-                )
-                LIMIT 1
-                """,
-                (
-                    job.idempotency_key,
-                    payload["spaceId"],
-                    payload["sourceId"],
-                    payload["sourceRecordId"],
-                    payload["sourceVersion"],
-                    payload["operation"],
-                ),
-            ).fetchone()
-            if existing and existing["payload_hash"] != job.payload_hash:
-                raise EffectConflict
-            return False
+        return cursor.rowcount == 1
+
+    def record_source_effect(self, job: Job) -> bool:
+        """Record one idempotent source-record effect for crash recovery."""
+
+        with self.database.transaction() as connection:
+            return insert_source_effect(connection, job)
+
+    def list_source_jobs(self, source_id: str, state: JobState | None = None) -> tuple[Job, ...]:
+        """Return jobs delivered for one source, newest first, optionally filtered by state."""
+
+        clause = "json_extract(payload_json, '$.sourceId') = ?"
+        parameters: list[str] = [source_id]
+        if state is not None:
+            clause += " AND state = ?"
+            parameters.append(state.value)
+        with self.database.connection() as connection:
+            rows = connection.execute(
+                f"SELECT * FROM jobs WHERE {clause} ORDER BY created_at DESC, id LIMIT 200",
+                parameters,
+            ).fetchall()
+        return tuple(_job(row) for row in rows)
 
     def count_source_effects(self) -> int:
         """Return the number of durable source-record effects."""

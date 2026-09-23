@@ -31,3 +31,34 @@ class ValidationError(ApplicationError):
 
     def __init__(self, message: str = "Request is invalid") -> None:
         super().__init__("invalid_request", message)
+
+
+class UnauthenticatedError(ApplicationError):
+    """Indicate that no verifiable credential accompanied the request."""
+
+    def __init__(self, message: str = "Authentication is required") -> None:
+        super().__init__("unauthenticated", message)
+
+
+class AccessDeniedError(ApplicationError):
+    """Indicate a denied action on a resource the caller may know exists.
+
+    The message is deliberately generic so a denial reveals nothing about the resource.
+    """
+
+    def __init__(self, message: str = "The requested context is not available.") -> None:
+        super().__init__("access_denied", message)
+
+
+class PayloadTooLargeError(ApplicationError):
+    """Indicate that an upload exceeded the configured size limit."""
+
+    def __init__(self, message: str = "Upload exceeds the size limit") -> None:
+        super().__init__("payload_too_large", message)
+
+
+class UnsupportedContentTypeError(ApplicationError):
+    """Indicate that an upload's content type is not accepted."""
+
+    def __init__(self, message: str = "Content type is not accepted") -> None:
+        super().__init__("unsupported_content_type", message)

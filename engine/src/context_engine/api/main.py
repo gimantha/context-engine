@@ -7,6 +7,7 @@ import argparse
 import uvicorn
 
 from context_engine.config import Settings
+from context_engine.security.identity import is_loopback_host
 
 from .app import create_app
 
@@ -20,6 +21,12 @@ def main() -> None:
     parser.add_argument("--check", action="store_true", help="Migrate and validate startup")
     args = parser.parse_args()
     settings = Settings.from_env()
+    # Static pre-shared tokens are a local development mode; never expose them off-host.
+    if not args.check and settings.auth_mode == "static" and not is_loopback_host(args.host):
+        raise SystemExit(
+            "Static authentication mode only serves loopback addresses; "
+            "use --host 127.0.0.1 or configure a provider-backed mode."
+        )
     app = create_app(settings)
     if args.check:
         print("Context Engine API startup check passed.")

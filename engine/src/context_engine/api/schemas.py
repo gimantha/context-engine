@@ -7,7 +7,20 @@ from typing import Annotated, Literal
 
 from pydantic import AnyUrl, BaseModel, ConfigDict, Field, model_validator
 
-from context_engine.domain import ContextSpace, IngestionCommand, Job
+from context_engine.domain import (
+    Action,
+    ContextSpace,
+    Grant,
+    IngestionCommand,
+    Job,
+    RecordStatus,
+    Source,
+    SourceCheckpoint,
+    StagedUpload,
+)
+from context_engine.security.identity import AuthenticatedPrincipal
+
+_GRANT_ID_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$"
 
 
 class _ApiModel(BaseModel):
@@ -172,3 +185,215 @@ class HealthResponse(_ApiModel):
     """Report process liveness or readiness."""
 
     status: Literal["ok", "unavailable"]
+
+
+class PrincipalResponse(_ApiModel):
+    """Describe the calling principal as the engine resolved it from the credential."""
+
+    id: str
+    kind: str
+    email: str | None = None
+    groups: list[str]
+
+    @classmethod
+    def from_principal(cls, value: AuthenticatedPrincipal) -> PrincipalResponse:
+        """Translate the authenticated principal into its REST representation."""
+
+        return cls(
+            id=value.principal_id,
+            kind=value.kind.value,
+            email=value.email,
+            groups=sorted(value.groups),
+        )
+
+
+class EffectivePermissionsResponse(_ApiModel):
+    """Return the caller's effective actions on one visible resource."""
+
+    resource_id: str = Field(alias="resourceId")
+    actions: list[str]
+
+
+class PutGrantRequest(_ApiModel):
+    """Validate a grant body; the actor is never part of it, only the target."""
+
+    actions: Annotated[list[str], Field(min_length=1, max_length=len(Action))]
+    principal_id: Annotated[str | None, Field(min_length=1, max_length=200)] = Field(
+        default=None, alias="principalId"
+    )
+    group: Annotated[str | None, Field(min_length=1, max_length=300)] = None
+
+    @model_validator(mode="after")
+    def validate_subject_and_actions(self) -> PutGrantRequest:
+        """Require exactly one subject and only known engine actions."""
+
+        if (self.principal_id is None) == (self.group is None):
+            raise ValueError("exactly one of principalId or group is required")
+        if len(set(self.actions)) != len(self.actions):
+            raise ValueError("actions must be unique")
+        known = {item.value for item in Action}
+        if not set(self.actions) <= known:
+            raise ValueError("actions must be engine actions")
+        return self
+
+    def to_actions(self) -> frozenset[Action]:
+        """Return the validated actions as domain values."""
+
+        return frozenset(Action(item) for item in self.actions)
+
+
+class GrantResponse(_ApiModel):
+    """Represent one grant without exposing who created it."""
+
+    id: str
+    resource_id: str = Field(alias="resourceId")
+    actions: list[str]
+    principal_id: str | None = Field(default=None, alias="principalId")
+    group: str | None = None
+
+    @classmethod
+    def from_domain(cls, value: Grant) -> GrantResponse:
+        """Translate a domain grant into its REST representation."""
+
+        return cls(
+            id=value.id,
+            resourceId=value.resource_id,
+            actions=sorted(item.value for item in value.actions),
+            principalId=value.principal_id,
+            group=value.group,
+        )
+
+
+_MappingKey = Annotated[str, Field(min_length=1, max_length=300)]
+_MappingValue = Annotated[str, Field(min_length=1, max_length=300)]
+
+
+class RegisterSourceRequest(_ApiModel):
+    """Validate a source registration; the audience mapping is write-only configuration."""
+
+    name: Annotated[str, Field(min_length=1, max_length=120)]
+    type: Annotated[str, Field(min_length=1, max_length=60)]
+    audience_mapping: Annotated[dict[_MappingKey, _MappingValue], Field(max_length=500)] = Field(
+        alias="audienceMapping"
+    )
+    version_ordering: Literal["numeric", "lexicographic"] = Field(
+        default="numeric", alias="versionOrdering"
+    )
+
+
+class UpdateSourceRequest(_ApiModel):
+    """Validate a partial source update; at least one field must be present."""
+
+    name: Annotated[str | None, Field(min_length=1, max_length=120)] = None
+    state: Literal["ready", "paused"] | None = None
+    audience_mapping: Annotated[dict[_MappingKey, _MappingValue] | None, Field(max_length=500)] = (
+        Field(default=None, alias="audienceMapping")
+    )
+
+    @model_validator(mode="after")
+    def require_a_change(self) -> UpdateSourceRequest:
+        """Reject an empty update."""
+
+        if self.name is None and self.state is None and self.audience_mapping is None:
+            raise ValueError("at least one field is required")
+        return self
+
+
+class SourceResponse(_ApiModel):
+    """Represent a source without its audience mapping or internal bindings."""
+
+    id: str
+    space_id: str = Field(alias="spaceId")
+    name: str
+    type: str
+    state: str
+    version_ordering: str = Field(alias="versionOrdering")
+    created_at: datetime = Field(alias="createdAt")
+
+    @classmethod
+    def from_domain(cls, value: Source) -> SourceResponse:
+        """Translate a domain source into its REST representation."""
+
+        return cls(
+            id=value.id,
+            spaceId=value.space_id,
+            name=value.name,
+            type=value.type,
+            state=value.state.value,
+            versionOrdering=value.version_ordering.value,
+            createdAt=value.created_at,
+        )
+
+
+class PutCheckpointRequest(_ApiModel):
+    """Validate a connector cursor."""
+
+    cursor: Annotated[str, Field(min_length=1, max_length=4000)]
+
+
+class CheckpointResponse(_ApiModel):
+    """Return the stored connector cursor."""
+
+    source_id: str = Field(alias="sourceId")
+    cursor: str
+    updated_at: datetime = Field(alias="updatedAt")
+
+    @classmethod
+    def from_domain(cls, value: SourceCheckpoint) -> CheckpointResponse:
+        """Translate a checkpoint into its REST representation."""
+
+        return cls(sourceId=value.source_id, cursor=value.cursor, updatedAt=value.updated_at)
+
+
+class UploadResponse(_ApiModel):
+    """Return the staged-object handle an ingestion event references as contentRef."""
+
+    upload_id: str = Field(alias="uploadId")
+    source_id: str = Field(alias="sourceId")
+    content_type: str = Field(alias="contentType")
+    size_bytes: int = Field(alias="sizeBytes")
+    content_hash: str = Field(alias="contentHash")
+    expires_at: datetime = Field(alias="expiresAt")
+
+    @classmethod
+    def from_domain(cls, value: StagedUpload) -> UploadResponse:
+        """Translate a staged upload into its REST representation."""
+
+        return cls(
+            uploadId=value.id,
+            sourceId=value.source_id,
+            contentType=value.content_type,
+            sizeBytes=value.size_bytes,
+            contentHash=value.content_hash,
+            expiresAt=value.expires_at,
+        )
+
+
+class RecordStatusResponse(_ApiModel):
+    """Expose a record's lifecycle without content, audiences, or backend references."""
+
+    space_id: str = Field(alias="spaceId")
+    source_id: str = Field(alias="sourceId")
+    record_id: str = Field(alias="recordId")
+    state: str
+    current_version: str = Field(alias="currentVersion")
+    source_acl_version: str = Field(alias="sourceAclVersion")
+    content_hash: str | None = Field(default=None, alias="contentHash")
+    quarantine_reason: str | None = Field(default=None, alias="quarantineReason")
+    updated_at: datetime = Field(alias="updatedAt")
+
+    @classmethod
+    def from_domain(cls, value: RecordStatus) -> RecordStatusResponse:
+        """Translate a ledger record into its REST representation."""
+
+        return cls(
+            spaceId=value.space_id,
+            sourceId=value.source_id,
+            recordId=value.source_record_id,
+            state=value.state.value,
+            currentVersion=value.current_version,
+            sourceAclVersion=value.source_acl_version,
+            contentHash=value.content_hash,
+            quarantineReason=value.quarantine_reason,
+            updatedAt=value.updated_at,
+        )
