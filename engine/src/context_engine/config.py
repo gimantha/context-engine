@@ -105,6 +105,8 @@ class KnowledgeBackendSettings:
     embedding_dimensions: int = 1536
     embedding_api_key: str = ""
     storage_path: Path = Path(".context-engine/knowledge")
+    # The engine's own identity; it owns every backend isolation unit and hands out read access.
+    service_principal_id: str = "context-engine-service"
     live_test_enabled: bool = False
     live_test_password: str = ""
 
@@ -139,6 +141,9 @@ class KnowledgeBackendSettings:
             storage_path=Path(
                 os.getenv("CONTEXT_ENGINE_KNOWLEDGE_STORAGE_PATH", ".context-engine/knowledge")
             ).expanduser(),
+            service_principal_id=os.getenv(
+                "CONTEXT_ENGINE_SERVICE_PRINCIPAL_ID", "context-engine-service"
+            ).strip(),
             live_test_enabled=_env_bool("CONTEXT_ENGINE_RUN_LIVE_PROVIDER", False),
             live_test_password=os.getenv("CONTEXT_ENGINE_LIVE_TEST_PASSWORD", ""),
         )

@@ -11,6 +11,7 @@ from datetime import UTC, datetime
 
 from context_engine.domain import IndexingSnapshot, IndexingState, Source
 from context_engine.knowledge_backend import (
+    AccessPartitionRef,
     BackendError,
     ExpectedRecord,
     IndexingProgressRequest,
@@ -46,7 +47,10 @@ class IndexingCollector:
         now = datetime.now(UTC)
         expected = tuple(
             ExpectedRecord(
-                partition_for(source.space_id, record.audience),
+                # Rows written before partitions were persisted derive the same key on the fly.
+                AccessPartitionRef(record.partition_id)
+                if record.partition_id
+                else partition_for(source.space_id, record.audience),
                 record.source_record_id,
                 record.current_version,
             )

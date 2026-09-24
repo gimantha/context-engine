@@ -52,7 +52,8 @@ class FakeCogneeRuntime:
                 "raw_data_location": "must-not-escape",
             }
         )
-        return _NativeIngestion(native_id, record.record_id, True)
+        item_id = str(uuid5(NAMESPACE_URL, f"{native_id}:{record.source_id}:{record.record_id}"))
+        return _NativeIngestion(native_id, item_id, True)
 
     async def list_items(self, binding, user):
         self.calls.append(("list_items", binding.dataset_id))

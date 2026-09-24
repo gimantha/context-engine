@@ -8,6 +8,7 @@ from sqlite3 import Connection, Row
 from uuid import uuid4
 
 from context_engine.domain import (
+    AccessPartition,
     IndexingSnapshot,
     IndexingState,
     Job,
@@ -23,6 +24,7 @@ from context_engine.domain import (
     SyncRun,
     SyncRunState,
     VersionOrdering,
+    partition_key,
 )
 
 from .database import ControlDatabase
@@ -85,6 +87,16 @@ def _record(row: Row) -> RecordStatus:
         quarantine_reason=row["quarantine_reason"],
         created_at=datetime.fromisoformat(row["created_at"]),
         updated_at=datetime.fromisoformat(row["updated_at"]),
+        partition_id=row["partition_id"],
+    )
+
+
+def _partition(row: Row) -> AccessPartition:
+    return AccessPartition(
+        id=row["id"],
+        space_id=row["space_id"],
+        audiences=tuple(json.loads(row["audiences_json"])),
+        created_at=datetime.fromisoformat(row["created_at"]),
     )
 
 
@@ -492,13 +504,30 @@ class SourceRepository:
                 content_ref = payload.get("contentRef")
                 audience = mapped
                 acl_version = payload["sourceAclVersion"]
+            partition_id = None
+            if transition.state is RecordState.ACTIVE and audience:
+                # Records sharing the same mapped audiences share one partition.
+                partition_id = partition_key(source.space_id, audience)
+                connection.execute(
+                    """
+                    INSERT OR IGNORE INTO access_partitions(
+                        id, space_id, audiences_json, created_at
+                    ) VALUES (?, ?, ?, ?)
+                    """,
+                    (
+                        partition_id,
+                        source.space_id,
+                        json.dumps(sorted(set(audience)), separators=(",", ":")),
+                        now,
+                    ),
+                )
             connection.execute(
                 """
                 INSERT INTO source_records(
                     space_id, source_id, source_record_id, state, current_version,
                     source_acl_version, content_hash, content_ref, audience_json,
-                    quarantine_reason, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    quarantine_reason, created_at, updated_at, partition_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(space_id, source_id, source_record_id) DO UPDATE SET
                     state = excluded.state,
                     current_version = excluded.current_version,
@@ -507,7 +536,8 @@ class SourceRepository:
                     content_ref = excluded.content_ref,
                     audience_json = excluded.audience_json,
                     quarantine_reason = excluded.quarantine_reason,
-                    updated_at = excluded.updated_at
+                    updated_at = excluded.updated_at,
+                    partition_id = excluded.partition_id
                 """,
                 (
                     source.space_id,
@@ -522,6 +552,7 @@ class SourceRepository:
                     transition.reason if transition.state is RecordState.QUARANTINED else None,
                     row["created_at"] if row else now,
                     now,
+                    partition_id,
                 ),
             )
         connection.execute(
@@ -688,6 +719,27 @@ class SourceRepository:
                 "SELECT * FROM indexing_snapshots WHERE source_id = ?", (source_id,)
             ).fetchone()
         return _snapshot(row) if row else None
+
+    # Partitions
+
+    def list_partitions(self, space_id: str) -> tuple[AccessPartition, ...]:
+        """Return every partition of a space; used by policy to resolve readable partitions."""
+
+        with self.database.connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM access_partitions WHERE space_id = ? ORDER BY created_at, id",
+                (space_id,),
+            ).fetchall()
+        return tuple(_partition(row) for row in rows)
+
+    def get_partition(self, partition_id: str) -> AccessPartition | None:
+        """Return one partition when it exists."""
+
+        with self.database.connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM access_partitions WHERE id = ?", (partition_id,)
+            ).fetchone()
+        return _partition(row) if row else None
 
 
 def _acl_key(source: Source, acl_version: str) -> tuple[int, int | str]:

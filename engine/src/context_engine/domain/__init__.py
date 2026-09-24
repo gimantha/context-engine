@@ -2,6 +2,7 @@
 
 from .models import (
     ROOT_RESOURCE_ID,
+    AccessPartition,
     Action,
     ContextSpace,
     Grant,
@@ -28,11 +29,13 @@ from .models import (
     SyncRun,
     SyncRunState,
     VersionOrdering,
+    partition_key,
     required_action,
 )
 
 __all__ = [
     "ROOT_RESOURCE_ID",
+    "AccessPartition",
     "Action",
     "ContextSpace",
     "Grant",
@@ -59,5 +62,6 @@ __all__ = [
     "SpaceState",
     "StagedUpload",
     "VersionOrdering",
+    "partition_key",
     "required_action",
 ]

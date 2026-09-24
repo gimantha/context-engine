@@ -38,3 +38,28 @@ def test_policy_denies_missing_action():
     )
     assert not decision.allowed
     assert decision.reason_code == "action_not_granted"
+
+
+def test_any_listed_audience_may_read_a_partition():
+    def decide(audiences):
+        return authorize(
+            PolicyInput(
+                principal_id="principal-alpha",
+                action=Action.CONTEXT_READ,
+                space_id="space-1",
+                granted_actions=frozenset({Action.CONTEXT_READ}),
+                principal_audiences=frozenset(audiences),
+                partition_audiences=(
+                    (AccessPartitionRef("alpha-or-beta"), frozenset({"alpha", "beta"})),
+                    (AccessPartitionRef("beta-only"), frozenset({"beta"})),
+                    (AccessPartitionRef("no-audience"), frozenset()),
+                ),
+                policy_version="8",
+            )
+        )
+
+    alpha = decide({"alpha"})
+    outsider = decide({"gamma"})
+
+    assert [item.value for item in alpha.partitions] == ["alpha-or-beta"]
+    assert not outsider.allowed and outsider.reason_code == "no_compatible_audience"

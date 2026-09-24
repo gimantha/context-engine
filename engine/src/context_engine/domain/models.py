@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -9,6 +12,20 @@ from typing import Any
 
 # The root resource owns every context space. Grants on it apply engine-wide.
 ROOT_RESOURCE_ID = "engine"
+
+
+def partition_key(space_id: str, audiences: Iterable[str]) -> str:
+    """Return the internal partition identifier for records sharing exactly these audiences.
+
+    The same audiences always yield the same partition, whatever order the tags arrived in.
+    The identifier is private: it never appears in a public payload.
+    """
+
+    unique = sorted(set(audiences))
+    if not space_id or not unique:
+        raise ValueError("a partition needs a space and at least one audience")
+    canonical = json.dumps([space_id, unique], separators=(",", ":"))
+    return "prt_" + hashlib.sha256(canonical.encode()).hexdigest()[:32]
 
 
 def utc_now() -> datetime:
@@ -231,6 +248,18 @@ class RecordStatus:
     quarantine_reason: str | None
     created_at: datetime
     updated_at: datetime
+    # Private: the partition the record should live in, or None while quarantined or deleted.
+    partition_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class AccessPartition:
+    """Private isolation unit: one set of mapped audiences within one context space."""
+
+    id: str
+    space_id: str
+    audiences: tuple[str, ...]
+    created_at: datetime
 
 
 @dataclass(frozen=True, slots=True)

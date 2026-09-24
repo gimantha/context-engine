@@ -40,10 +40,11 @@ def authorize(value: PolicyInput) -> PolicyDecision:
         return PolicyDecision(False, "invalid_context", value.policy_version)
     if value.action not in value.granted_actions:
         return PolicyDecision(False, "action_not_granted", value.policy_version)
+    # A partition's audiences are alternatives (ADR 0003): a member of any of them may read.
     partitions = tuple(
         partition
         for partition, audiences in value.partition_audiences
-        if audiences and audiences.issubset(value.principal_audiences)
+        if audiences & value.principal_audiences
     )
     if value.action in {Action.CONTEXT_READ, Action.EVIDENCE_READ, Action.TRACE_READ}:
         if not partitions:
