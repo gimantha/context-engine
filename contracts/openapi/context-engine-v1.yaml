@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Context Engine API
-  version: 0.4.0
+  version: 0.5.0
   description: Provider-neutral API draft for governed context spaces.
 servers:
   - url: /v1
@@ -284,6 +284,97 @@ paths:
         "401":
           $ref: "#/components/responses/Error"
         "403":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
+  /sources/{sourceId}/sync-runs:
+    post:
+      operationId: openSyncRun
+      description: >-
+        Mark the source as being read by its connector. An unfinished earlier run is
+        superseded. Processing progress is measured from the latest run's start. Requires
+        ingest.write on the source.
+      parameters:
+        - $ref: "#/components/parameters/SourceId"
+      responses:
+        "201":
+          description: Sync run opened
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SyncRun"
+        "401":
+          $ref: "#/components/responses/Error"
+        "403":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
+        "409":
+          $ref: "#/components/responses/Error"
+  /sources/{sourceId}/sync-runs/{runId}/complete:
+    post:
+      operationId: completeSyncRun
+      description: >-
+        Mark the run's reading as completed. Repeating the call is harmless; a superseded run
+        answers with a conflict. Requires ingest.write on the source.
+      parameters:
+        - $ref: "#/components/parameters/SourceId"
+        - name: runId
+          in: path
+          required: true
+          schema:
+            $ref: "#/components/schemas/Identifier"
+      responses:
+        "200":
+          description: Sync run with reading completed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SyncRun"
+        "401":
+          $ref: "#/components/responses/Error"
+        "403":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
+        "409":
+          $ref: "#/components/responses/Error"
+  /progress/sources/{sourceId}:
+    get:
+      operationId: getSourceProgress
+      description: >-
+        Read-only pipeline progress of one source. Requires ingest.write, source.manage, or
+        space.manage on the source, because the counts reveal record volume across every
+        audience.
+      parameters:
+        - $ref: "#/components/parameters/SourceId"
+      responses:
+        "200":
+          description: Source progress
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SourceProgress"
+        "401":
+          $ref: "#/components/responses/Error"
+        "403":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
+  /progress/spaces/{spaceId}:
+    get:
+      operationId: getSpaceProgress
+      description: Progress of the sources in a visible space that the caller may inspect.
+      parameters:
+        - $ref: "#/components/parameters/SpaceId"
+      responses:
+        "200":
+          description: Space progress
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SpaceProgress"
+        "401":
           $ref: "#/components/responses/Error"
         "404":
           $ref: "#/components/responses/Error"
@@ -965,6 +1056,129 @@ components:
           uniqueItems: true
           items:
             $ref: "#/components/schemas/Action"
+    SyncRun:
+      type: object
+      additionalProperties: false
+      required: [id, sourceId, state, startedAt]
+      properties:
+        id:
+          $ref: "#/components/schemas/Identifier"
+        sourceId:
+          $ref: "#/components/schemas/Identifier"
+        state:
+          type: string
+          enum: [reading, completed, superseded]
+        startedAt:
+          type: string
+          format: date-time
+        completedAt:
+          type: [string, "null"]
+          format: date-time
+    Percent:
+      type: [number, "null"]
+      minimum: 0
+      maximum: 100
+    Count:
+      type: integer
+      minimum: 0
+    OptionalCount:
+      type: [integer, "null"]
+      minimum: 0
+    SourceProgress:
+      type: object
+      additionalProperties: false
+      required: [sourceId, reading, processing, records, indexing]
+      properties:
+        sourceId:
+          $ref: "#/components/schemas/Identifier"
+        reading:
+          type: object
+          description: Whether the connector is still reading. No percentage by design.
+          additionalProperties: false
+          required: [state]
+          properties:
+            state:
+              type: string
+              enum: [idle, reading, completed]
+            runId:
+              type: [string, "null"]
+            startedAt:
+              type: [string, "null"]
+              format: date-time
+            completedAt:
+              type: [string, "null"]
+              format: date-time
+        processing:
+          type: object
+          description: >-
+            Delivered events the engine has finished applying since the latest run started.
+            Percent is finished (succeeded plus failed) over total.
+          additionalProperties: false
+          required: [total, queued, running, succeeded, failed]
+          properties:
+            since:
+              type: [string, "null"]
+              format: date-time
+            total:
+              $ref: "#/components/schemas/Count"
+            queued:
+              $ref: "#/components/schemas/Count"
+            running:
+              $ref: "#/components/schemas/Count"
+            succeeded:
+              $ref: "#/components/schemas/Count"
+            failed:
+              $ref: "#/components/schemas/Count"
+            percent:
+              $ref: "#/components/schemas/Percent"
+        records:
+          type: object
+          additionalProperties: false
+          required: [active, quarantined, deleted]
+          properties:
+            active:
+              $ref: "#/components/schemas/Count"
+            quarantined:
+              $ref: "#/components/schemas/Count"
+            deleted:
+              $ref: "#/components/schemas/Count"
+        indexing:
+          type: object
+          description: >-
+            Active record versions the knowledge backend has indexed, from the last background
+            collection. Percent is indexed over expected.
+          additionalProperties: false
+          required: [state]
+          properties:
+            state:
+              type: string
+              enum: [not_collected, ok, unavailable]
+            expected:
+              $ref: "#/components/schemas/OptionalCount"
+            indexed:
+              $ref: "#/components/schemas/OptionalCount"
+            indexing:
+              $ref: "#/components/schemas/OptionalCount"
+            failed:
+              $ref: "#/components/schemas/OptionalCount"
+            missing:
+              $ref: "#/components/schemas/OptionalCount"
+            percent:
+              $ref: "#/components/schemas/Percent"
+            collectedAt:
+              type: [string, "null"]
+              format: date-time
+    SpaceProgress:
+      type: object
+      additionalProperties: false
+      required: [spaceId, sources]
+      properties:
+        spaceId:
+          $ref: "#/components/schemas/Identifier"
+        sources:
+          type: array
+          items:
+            $ref: "#/components/schemas/SourceProgress"
     Error:
       type: object
       additionalProperties: false

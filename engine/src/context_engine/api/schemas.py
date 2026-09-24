@@ -11,12 +11,16 @@ from context_engine.domain import (
     Action,
     ContextSpace,
     Grant,
+    IndexingSnapshot,
     IngestionCommand,
     Job,
     RecordStatus,
     Source,
     SourceCheckpoint,
+    SourceProgress,
     StagedUpload,
+    SyncRun,
+    SyncRunState,
 )
 from context_engine.security.identity import AuthenticatedPrincipal
 
@@ -397,3 +401,148 @@ class RecordStatusResponse(_ApiModel):
             quarantineReason=value.quarantine_reason,
             updatedAt=value.updated_at,
         )
+
+
+def _percent(done: int | None, total: int | None) -> float | None:
+    """Return a one-decimal percentage, or None when there is nothing to measure."""
+
+    if not total or done is None:
+        return None
+    return round(min(done, total) * 100 / total, 1)
+
+
+class SyncRunResponse(_ApiModel):
+    """Represent a connector's reading window for a source."""
+
+    id: str
+    source_id: str = Field(alias="sourceId")
+    state: str
+    started_at: datetime = Field(alias="startedAt")
+    completed_at: datetime | None = Field(default=None, alias="completedAt")
+
+    @classmethod
+    def from_domain(cls, value: SyncRun) -> SyncRunResponse:
+        """Translate a sync run into its REST representation."""
+
+        return cls(
+            id=value.id,
+            sourceId=value.source_id,
+            state=value.state.value,
+            startedAt=value.started_at,
+            completedAt=value.completed_at,
+        )
+
+
+class ReadingProgressResponse(_ApiModel):
+    """Say whether the connector is still reading; no percentage by design."""
+
+    state: Literal["idle", "reading", "completed"]
+    run_id: str | None = Field(default=None, alias="runId")
+    started_at: datetime | None = Field(default=None, alias="startedAt")
+    completed_at: datetime | None = Field(default=None, alias="completedAt")
+
+    @classmethod
+    def from_domain(cls, value: SyncRun | None) -> ReadingProgressResponse:
+        """Translate the latest sync run into a reading state."""
+
+        if value is None:
+            return cls(state="idle")
+        state = "reading" if value.state is SyncRunState.READING else "completed"
+        return cls(
+            state=state,
+            runId=value.id,
+            startedAt=value.started_at,
+            completedAt=value.completed_at,
+        )
+
+
+class ProcessingProgressResponse(_ApiModel):
+    """Delivered events the engine has finished applying, over the latest run's window."""
+
+    since: datetime | None = None
+    total: int
+    queued: int
+    running: int
+    succeeded: int
+    failed: int
+    percent: float | None = None
+
+
+class RecordCountsResponse(_ApiModel):
+    """Ledger records of the source by lifecycle state."""
+
+    active: int
+    quarantined: int
+    deleted: int
+
+
+class IndexingProgressResponse(_ApiModel):
+    """Active record versions the knowledge backend has indexed, from the last collection."""
+
+    state: Literal["not_collected", "ok", "unavailable"]
+    expected: int | None = None
+    indexed: int | None = None
+    indexing: int | None = None
+    failed: int | None = None
+    missing: int | None = None
+    percent: float | None = None
+    collected_at: datetime | None = Field(default=None, alias="collectedAt")
+
+    @classmethod
+    def from_domain(cls, value: IndexingSnapshot | None) -> IndexingProgressResponse:
+        """Translate a stored snapshot, or report that none has been collected."""
+
+        if value is None:
+            return cls(state="not_collected")
+        return cls(
+            state=value.state.value,
+            expected=value.expected,
+            indexed=value.indexed,
+            indexing=value.indexing,
+            failed=value.failed,
+            missing=value.missing,
+            percent=_percent(value.indexed, value.expected),
+            collectedAt=value.collected_at,
+        )
+
+
+class SourceProgressResponse(_ApiModel):
+    """Reading, processing, ledger, and indexing progress of one source."""
+
+    source_id: str = Field(alias="sourceId")
+    reading: ReadingProgressResponse
+    processing: ProcessingProgressResponse
+    records: RecordCountsResponse
+    indexing: IndexingProgressResponse
+
+    @classmethod
+    def from_domain(cls, value: SourceProgress) -> SourceProgressResponse:
+        """Translate source progress into its REST representation."""
+
+        jobs = value.jobs
+        return cls(
+            sourceId=value.source_id,
+            reading=ReadingProgressResponse.from_domain(value.sync_run),
+            processing=ProcessingProgressResponse(
+                since=value.processing_since,
+                total=jobs.total,
+                queued=jobs.queued,
+                running=jobs.running,
+                succeeded=jobs.succeeded,
+                failed=jobs.failed,
+                percent=_percent(jobs.finished, jobs.total),
+            ),
+            records=RecordCountsResponse(
+                active=value.records.active,
+                quarantined=value.records.quarantined,
+                deleted=value.records.deleted,
+            ),
+            indexing=IndexingProgressResponse.from_domain(value.indexing),
+        )
+
+
+class SpaceProgressResponse(_ApiModel):
+    """Progress of every source in a space that the caller may inspect."""
+
+    space_id: str = Field(alias="spaceId")
+    sources: list[SourceProgressResponse]

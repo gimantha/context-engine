@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from importlib.util import find_spec
+from uuid import NAMESPACE_URL, uuid5
 
 import pytest
 
@@ -14,6 +15,8 @@ from context_engine.knowledge_backend import (
     BackendError,
     BackendErrorCode,
     EnrichmentRequest,
+    ExpectedRecord,
+    IndexingProgressRequest,
     PrincipalContext,
     QueryRequest,
 )
@@ -33,10 +36,35 @@ class FakeNativeUser:
 class FakeCogneeRuntime:
     def __init__(self):
         self.calls = []
+        self.items = {}
+        self.states = {}
 
     async def remember(self, record, binding, user):
         self.calls.append(("remember", record, binding, user))
-        return _NativeIngestion("00000000-0000-0000-0000-000000000001", record.record_id, True)
+        native_id = binding.dataset_id or str(uuid5(NAMESPACE_URL, binding.dataset_name))
+        self.items.setdefault(native_id, []).append(
+            {
+                "external_metadata": {
+                    "record_id": record.record_id,
+                    "source_id": record.source_id,
+                    "source_version": record.version,
+                },
+                "raw_data_location": "must-not-escape",
+            }
+        )
+        return _NativeIngestion(native_id, record.record_id, True)
+
+    async def list_items(self, binding, user):
+        self.calls.append(("list_items", binding.dataset_id))
+        return list(self.items.get(binding.dataset_id, []))
+
+    async def processing_states(self, bindings):
+        self.calls.append(("processing_states", tuple(item.dataset_id for item in bindings)))
+        return {
+            item.dataset_id: self.states[item.dataset_id]
+            for item in bindings
+            if item.dataset_id in self.states
+        }
 
     async def recall(self, request, bindings, user):
         self.calls.append(("recall", request, bindings, user))
@@ -154,3 +182,56 @@ def test_engine_settings_override_native_environment(monkeypatch, tmp_path):
     assert os.environ["VECTOR_DB_PROVIDER"] == "engine-vector"
     assert os.environ["EMBEDDING_DIMENSIONS"] == "42"
     assert os.environ["SYSTEM_ROOT_DIRECTORY"] == str(tmp_path / "system")
+
+
+class _NativeStatus:
+    def __init__(self, value):
+        self.value = value
+
+
+@pytest.mark.asyncio
+async def test_adapter_attributes_native_processing_state_to_source_records(record_factory):
+    runtime = FakeCogneeRuntime()
+    backend = CogneeBackend(runtime, resolve_user)
+    principal = PrincipalContext("engine-service", "trace-indexing")
+    done, busy, broken, empty = (
+        AccessPartitionRef(name) for name in ("p-done", "p-busy", "p-broken", "p-empty")
+    )
+    await backend.ingest(record_factory("r-done", "1", "a"), principal, done)
+    await backend.ingest(record_factory("r-busy", "1", "b"), principal, busy)
+    await backend.ingest(record_factory("r-broken", "1", "c"), principal, broken)
+    await backend.ingest(
+        record_factory("r-other", "1", "d", source_id="source-other"), principal, done
+    )
+    native = {ref: backend._bindings.resolve(ref).dataset_id for ref in (done, busy, broken)}
+    runtime.states = {
+        native[done]: {"status": _NativeStatus("DATASET_PROCESSING_COMPLETED"), "progress": None},
+        native[busy]: {"status": "DATASET_PROCESSING_STARTED", "progress": {"total_items": 3}},
+        native[broken]: {"status": "DATASET_PROCESSING_ERRORED"},
+    }
+    request = IndexingProgressRequest(
+        "source-incidents",
+        (
+            ExpectedRecord(done, "r-done", "1"),
+            ExpectedRecord(done, "r-done", "2"),
+            ExpectedRecord(done, "r-other", "1"),
+            ExpectedRecord(busy, "r-busy", "1"),
+            ExpectedRecord(broken, "r-broken", "1"),
+            ExpectedRecord(empty, "r-never", "1"),
+        ),
+    )
+
+    progress = await backend.indexing_progress(request, principal, (done, busy, broken, empty))
+    with pytest.raises(BackendError) as scoped:
+        await backend.indexing_progress(request, principal, (done,))
+
+    # A newer version not yet stored, another source's item, and an empty binding are missing.
+    assert (
+        progress.expected,
+        progress.indexed,
+        progress.indexing,
+        progress.failed,
+        progress.missing,
+    ) == (6, 1, 1, 1, 3)
+    assert "DATASET" not in repr(progress) and "must-not-escape" not in repr(progress)
+    assert scoped.value.code == BackendErrorCode.ACCESS_DENIED

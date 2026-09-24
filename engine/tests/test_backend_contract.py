@@ -12,6 +12,8 @@ from context_engine.knowledge_backend import (
     BackendErrorCode,
     DummyKnowledgeBackend,
     EnrichmentRequest,
+    ExpectedRecord,
+    IndexingProgressRequest,
     PrincipalContext,
     QueryRequest,
 )
@@ -102,3 +104,22 @@ async def test_concurrent_queries_keep_principal_and_partition_scope(record_fact
     )
     assert [item.record_id for item in alpha_result.evidence] == ["alpha"]
     assert [item.record_id for item in beta_result.evidence] == ["beta"]
+
+
+@pytest.mark.asyncio
+async def test_indexing_progress_requires_explicit_scope(record_factory, principal, partition):
+    backend = DummyKnowledgeBackend()
+    await backend.ingest(record_factory("record-1", "1", "content"), principal, partition)
+    request = IndexingProgressRequest(
+        "source-incidents", (ExpectedRecord(partition, "record-1", "1"),)
+    )
+
+    progress = await backend.indexing_progress(request, principal, (partition,))
+    with pytest.raises(BackendError) as empty:
+        await backend.indexing_progress(request, principal, ())
+    with pytest.raises(BackendError) as outside:
+        await backend.indexing_progress(request, principal, (AccessPartitionRef("other"),))
+
+    assert (progress.expected, progress.indexed, progress.missing) == (1, 1, 0)
+    assert empty.value.code == BackendErrorCode.ACCESS_DENIED
+    assert outside.value.code == BackendErrorCode.ACCESS_DENIED

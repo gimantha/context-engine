@@ -22,6 +22,9 @@ from ..types import (
     EnrichmentRequest,
     EnrichmentResult,
     EvidenceItem,
+    ExpectedRecord,
+    IndexingProgress,
+    IndexingProgressRequest,
     IngestionResult,
     PrincipalContext,
     QueryRequest,
@@ -74,6 +77,16 @@ class _CogneeRuntimePort(Protocol):
 
     async def forget(self, binding: _CogneeBinding, data_id: str, user: Any) -> Any:
         """Invoke native deletion for one bound record."""
+
+        ...
+
+    async def list_items(self, binding: _CogneeBinding, user: Any) -> list[Any]:
+        """List the native content items stored in one binding."""
+
+        ...
+
+    async def processing_states(self, bindings: tuple[_CogneeBinding, ...]) -> dict[str, Any]:
+        """Return the latest native processing-run state keyed by native binding id."""
 
         ...
 
@@ -268,6 +281,54 @@ class CogneeBackend:
         except Exception as exc:
             raise _translate_error(exc) from exc
 
+    async def indexing_progress(
+        self,
+        request: IndexingProgressRequest,
+        principal: PrincipalContext,
+        authorized_partitions: tuple[AccessPartitionRef, ...],
+    ) -> IndexingProgress:
+        """Attribute native per-binding processing state to one source's record versions.
+
+        Native status is kept per binding run, not per item, so a present item takes the state
+        of its binding's latest run. Items are matched to the source through the engine
+        metadata attached at ingestion. Uninitialized bindings hold nothing.
+        """
+
+        self._partitions(authorized_partitions)
+        allowed = {item.value for item in authorized_partitions}
+        if any(item.partition.value not in allowed for item in request.records):
+            raise BackendError(BackendErrorCode.ACCESS_DENIED, "Record partition is out of scope")
+        grouped: dict[str, list[ExpectedRecord]] = {}
+        for item in request.records:
+            grouped.setdefault(item.partition.value, []).append(item)
+        bindings = {value: self._bindings.resolve(AccessPartitionRef(value)) for value in grouped}
+        initialized = tuple(binding for binding in bindings.values() if binding.dataset_id)
+        counts = {"indexed": 0, "indexing": 0, "failed": 0, "missing": 0}
+        try:
+            user = await self._user_resolver(principal)
+            states = await self._runtime.processing_states(initialized) if initialized else {}
+            for value, items in grouped.items():
+                binding = bindings[value]
+                if binding.dataset_id is None:
+                    counts["missing"] += len(items)
+                    continue
+                present = set()
+                for entry in await self._runtime.list_items(binding, user):
+                    metadata = _item_metadata(entry)
+                    if metadata.get("source_id") == request.source_id:
+                        present.add(
+                            (str(metadata.get("record_id")), str(metadata.get("source_version")))
+                        )
+                state = _run_state(states.get(binding.dataset_id))
+                for item in items:
+                    key = (item.record_id, item.version)
+                    counts[state if key in present else "missing"] += 1
+            return IndexingProgress(expected=len(request.records), **counts)
+        except BackendError:
+            raise
+        except Exception as exc:
+            raise _translate_error(exc) from exc
+
     async def health(self) -> BackendHealth:
         """Translate native runtime readiness into engine health."""
 
@@ -389,6 +450,21 @@ class CogneeRuntime:
             user=user,
         )
 
+    async def list_items(self, binding: _CogneeBinding, user: Any) -> list[Any]:
+        """List native content items in one binding with the resolved user."""
+
+        cognee = self._module()
+        return list(await cognee.datasets.list_data(UUID(binding.dataset_id), user=user))
+
+    async def processing_states(self, bindings: tuple[_CogneeBinding, ...]) -> dict[str, Any]:
+        """Read the latest processing-run state per binding from the native status API."""
+
+        cognee = self._module()
+        ids = [UUID(item.dataset_id) for item in bindings if item.dataset_id]
+        # With no pipeline names the SDK returns a flat map for its processing pipeline.
+        result = await cognee.datasets.get_progress(ids)
+        return {str(key): value for key, value in (result or {}).items()}
+
     async def health(self) -> tuple[bool, str]:
         """Load the pinned SDK and return an engine-owned readiness detail."""
 
@@ -436,6 +512,34 @@ def _translate_evidence(value: Any, index: int) -> EvidenceItem:
         score=float(raw.get("score") or 0.0),
         location=str(metadata.get("location")) if metadata.get("location") else None,
     )
+
+
+_PROCESSING_PIPELINE = "cognify_pipeline"
+
+
+def _item_metadata(entry: Any) -> Mapping[str, Any]:
+    """Return the engine metadata attached to a native content item."""
+
+    raw = entry.model_dump() if hasattr(entry, "model_dump") else entry
+    if not isinstance(raw, Mapping):
+        return {}
+    metadata = raw.get("external_metadata")
+    return metadata if isinstance(metadata, Mapping) else {}
+
+
+def _run_state(value: Any) -> str:
+    """Map a native processing-run state to an engine indexing state name."""
+
+    if isinstance(value, Mapping) and "status" not in value and _PROCESSING_PIPELINE in value:
+        value = value[_PROCESSING_PIPELINE]
+    status = value.get("status") if isinstance(value, Mapping) else value
+    name = str(getattr(status, "value", status) or "").upper()
+    if name.endswith("COMPLETED"):
+        return "indexed"
+    if name.endswith("ERRORED"):
+        return "failed"
+    # A started, initiated, or not-yet-recorded run means the items are still processing.
+    return "indexing"
 
 
 def _translate_error(exc: Exception) -> BackendError:
@@ -512,6 +616,19 @@ def assert_runtime_matches_pinned_sdk(runtime: CogneeRuntime | None = None) -> N
             raise RuntimeError(f"Pinned provider is missing {operation}")
         actual = set(inspect.signature(function).parameters)
         missing = parameters - actual
+        if missing:
+            raise RuntimeError(
+                f"Pinned provider {operation} signature is missing {sorted(missing)}"
+            )
+    status_api = getattr(cognee, "datasets", None)
+    for operation, parameters in {
+        "get_progress": {"dataset_ids", "pipeline_names"},
+        "list_data": {"dataset_id", "user"},
+    }.items():
+        function = getattr(status_api, operation, None)
+        if function is None:
+            raise RuntimeError(f"Pinned provider status API is missing {operation}")
+        missing = parameters - set(inspect.signature(function).parameters)
         if missing:
             raise RuntimeError(
                 f"Pinned provider {operation} signature is missing {sorted(missing)}"

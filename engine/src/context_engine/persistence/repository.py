@@ -9,7 +9,7 @@ from sqlite3 import Connection, Row
 from typing import Any
 from uuid import uuid4
 
-from context_engine.domain import ContextSpace, Job, JobOperation, JobState, SpaceState
+from context_engine.domain import ContextSpace, Job, JobCounts, JobOperation, JobState, SpaceState
 
 from .database import ControlDatabase
 
@@ -424,3 +424,27 @@ class ControlPlaneRepository:
 
         with self.database.connection() as connection:
             return connection.execute("SELECT COUNT(*) FROM source_record_effects").fetchone()[0]
+
+    def count_source_jobs(self, source_id: str, since: datetime | None = None) -> JobCounts:
+        """Count a source's deliveries in the public job-state model, optionally since a time."""
+
+        clause = "json_extract(payload_json, '$.sourceId') = ?"
+        parameters: list[str] = [source_id]
+        if since is not None:
+            clause += " AND created_at >= ?"
+            parameters.append(_timestamp(since))
+        with self.database.connection() as connection:
+            rows = connection.execute(
+                f"SELECT state, COUNT(*) AS n FROM jobs WHERE {clause} GROUP BY state", parameters
+            ).fetchall()
+        counts = {row["state"]: row["n"] for row in rows}
+        # Scheduling states are private; callers only see queued, running, and finished work.
+        return JobCounts(
+            queued=sum(
+                counts.get(state.value, 0)
+                for state in (JobState.ACCEPTED, JobState.QUEUED, JobState.RETRY_WAIT)
+            ),
+            running=counts.get(JobState.RUNNING.value, 0),
+            succeeded=counts.get(JobState.SUCCEEDED.value, 0),
+            failed=counts.get(JobState.FAILED.value, 0),
+        )

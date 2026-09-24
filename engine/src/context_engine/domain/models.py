@@ -243,6 +243,91 @@ class RecordTransition:
     reason: str | None = None
 
 
+class SyncRunState(StrEnum):
+    """Whether a connector is still reading a source for one sync run."""
+
+    READING = "reading"
+    COMPLETED = "completed"
+    SUPERSEDED = "superseded"
+
+
+class IndexingState(StrEnum):
+    """Outcome of the last collection of a source's indexing progress."""
+
+    OK = "ok"
+    UNAVAILABLE = "unavailable"
+
+
+@dataclass(frozen=True, slots=True)
+class SyncRun:
+    """Connector-declared window during which it reads a source."""
+
+    id: str
+    source_id: str
+    state: SyncRunState
+    started_by: str
+    started_at: datetime
+    completed_at: datetime | None
+
+
+@dataclass(frozen=True, slots=True)
+class JobCounts:
+    """Delivery counts for a source in the public job-state model."""
+
+    queued: int = 0
+    running: int = 0
+    succeeded: int = 0
+    failed: int = 0
+
+    @property
+    def total(self) -> int:
+        """Return every delivery counted."""
+
+        return self.queued + self.running + self.succeeded + self.failed
+
+    @property
+    def finished(self) -> int:
+        """Return deliveries that will not progress further."""
+
+        return self.succeeded + self.failed
+
+
+@dataclass(frozen=True, slots=True)
+class RecordCounts:
+    """Ledger record counts for a source by lifecycle state."""
+
+    active: int = 0
+    quarantined: int = 0
+    deleted: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class IndexingSnapshot:
+    """Last collected indexing progress of a source, in engine terms only."""
+
+    source_id: str
+    state: IndexingState
+    collected_at: datetime
+    expected: int | None = None
+    indexed: int | None = None
+    indexing: int | None = None
+    failed: int | None = None
+    missing: int | None = None
+    error_code: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class SourceProgress:
+    """Reading, processing, ledger, and indexing state of one source."""
+
+    source_id: str
+    sync_run: SyncRun | None
+    processing_since: datetime | None
+    jobs: JobCounts
+    records: RecordCounts
+    indexing: IndexingSnapshot | None
+
+
 @dataclass(frozen=True, slots=True)
 class ContextSpace:
     """Public context-space metadata stored by the control plane."""

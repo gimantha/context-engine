@@ -8,7 +8,10 @@ from sqlite3 import Connection, Row
 from uuid import uuid4
 
 from context_engine.domain import (
+    IndexingSnapshot,
+    IndexingState,
     Job,
+    RecordCounts,
     RecordOutcome,
     RecordState,
     RecordStatus,
@@ -17,6 +20,8 @@ from context_engine.domain import (
     SourceCheckpoint,
     SourceState,
     StagedUpload,
+    SyncRun,
+    SyncRunState,
     VersionOrdering,
 )
 
@@ -80,6 +85,35 @@ def _record(row: Row) -> RecordStatus:
         quarantine_reason=row["quarantine_reason"],
         created_at=datetime.fromisoformat(row["created_at"]),
         updated_at=datetime.fromisoformat(row["updated_at"]),
+    )
+
+
+def _optional_datetime(value: str | None) -> datetime | None:
+    return datetime.fromisoformat(value) if value else None
+
+
+def _sync_run(row: Row) -> SyncRun:
+    return SyncRun(
+        id=row["id"],
+        source_id=row["source_id"],
+        state=SyncRunState(row["state"]),
+        started_by=row["started_by"],
+        started_at=datetime.fromisoformat(row["started_at"]),
+        completed_at=_optional_datetime(row["completed_at"]),
+    )
+
+
+def _snapshot(row: Row) -> IndexingSnapshot:
+    return IndexingSnapshot(
+        source_id=row["source_id"],
+        state=IndexingState(row["state"]),
+        collected_at=datetime.fromisoformat(row["collected_at"]),
+        expected=row["expected"],
+        indexed=row["indexed"],
+        indexing=row["indexing"],
+        failed=row["failed"],
+        missing=row["missing"],
+        error_code=row["error_code"],
     )
 
 
@@ -512,6 +546,148 @@ class SourceRepository:
                 now,
             ),
         )
+
+    # Sync runs
+
+    def open_sync_run(self, source_id: str, principal_id: str) -> SyncRun:
+        """Start a reading window; an unfinished earlier run is marked superseded.
+
+        A connector that crashed mid-scan must be able to start again, so a new run never
+        fails because an old one is still open.
+        """
+
+        now = _timestamp()
+        run_id = f"run_{uuid4().hex}"
+        with self.database.transaction() as connection:
+            connection.execute(
+                """
+                UPDATE sync_runs SET state = ?, completed_at = ?
+                WHERE source_id = ? AND state = ?
+                """,
+                (SyncRunState.SUPERSEDED.value, now, source_id, SyncRunState.READING.value),
+            )
+            connection.execute(
+                """
+                INSERT INTO sync_runs(id, source_id, state, started_by, started_at, completed_at)
+                VALUES (?, ?, ?, ?, ?, NULL)
+                """,
+                (run_id, source_id, SyncRunState.READING.value, principal_id, now),
+            )
+            row = connection.execute("SELECT * FROM sync_runs WHERE id = ?", (run_id,)).fetchone()
+        return _sync_run(row)
+
+    def get_sync_run(self, run_id: str) -> SyncRun | None:
+        """Return one sync run when it exists."""
+
+        with self.database.connection() as connection:
+            row = connection.execute("SELECT * FROM sync_runs WHERE id = ?", (run_id,)).fetchone()
+        return _sync_run(row) if row else None
+
+    def latest_sync_run(self, source_id: str) -> SyncRun | None:
+        """Return the most recently started sync run of a source."""
+
+        with self.database.connection() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM sync_runs WHERE source_id = ?
+                ORDER BY started_at DESC, rowid DESC LIMIT 1
+                """,
+                (source_id,),
+            ).fetchone()
+        return _sync_run(row) if row else None
+
+    def complete_sync_run(self, run_id: str) -> SyncRun | None:
+        """Mark a reading run completed; runs in any other state are returned unchanged."""
+
+        with self.database.transaction() as connection:
+            connection.execute(
+                "UPDATE sync_runs SET state = ?, completed_at = ? WHERE id = ? AND state = ?",
+                (SyncRunState.COMPLETED.value, _timestamp(), run_id, SyncRunState.READING.value),
+            )
+            row = connection.execute("SELECT * FROM sync_runs WHERE id = ?", (run_id,)).fetchone()
+        return _sync_run(row) if row else None
+
+    # Progress inputs
+
+    def list_all_sources(self) -> tuple[Source, ...]:
+        """Return every registered source for background collection."""
+
+        with self.database.connection() as connection:
+            rows = connection.execute("SELECT * FROM sources ORDER BY created_at, id").fetchall()
+        return tuple(_source(row) for row in rows)
+
+    def list_active_records(self, source_id: str) -> tuple[RecordStatus, ...]:
+        """Return the active records of a source, which are the ones a backend should hold."""
+
+        with self.database.connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM source_records WHERE source_id = ? AND state = ?
+                ORDER BY source_record_id
+                """,
+                (source_id, RecordState.ACTIVE.value),
+            ).fetchall()
+        return tuple(_record(row) for row in rows)
+
+    def record_counts(self, source_id: str) -> RecordCounts:
+        """Count a source's ledger records by lifecycle state."""
+
+        with self.database.connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT state, COUNT(*) AS n FROM source_records
+                WHERE source_id = ? GROUP BY state
+                """,
+                (source_id,),
+            ).fetchall()
+        counts = {row["state"]: row["n"] for row in rows}
+        return RecordCounts(
+            active=counts.get(RecordState.ACTIVE.value, 0),
+            quarantined=counts.get(RecordState.QUARANTINED.value, 0),
+            deleted=counts.get(RecordState.DELETED.value, 0),
+        )
+
+    def put_indexing_snapshot(self, snapshot: IndexingSnapshot) -> None:
+        """Store the latest collected indexing progress of a source."""
+
+        with self.database.transaction() as connection:
+            connection.execute(
+                """
+                INSERT INTO indexing_snapshots(
+                    source_id, state, expected, indexed, indexing, failed, missing,
+                    error_code, collected_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(source_id) DO UPDATE SET
+                    state = excluded.state,
+                    expected = excluded.expected,
+                    indexed = excluded.indexed,
+                    indexing = excluded.indexing,
+                    failed = excluded.failed,
+                    missing = excluded.missing,
+                    error_code = excluded.error_code,
+                    collected_at = excluded.collected_at
+                """,
+                (
+                    snapshot.source_id,
+                    snapshot.state.value,
+                    snapshot.expected,
+                    snapshot.indexed,
+                    snapshot.indexing,
+                    snapshot.failed,
+                    snapshot.missing,
+                    snapshot.error_code,
+                    _timestamp(snapshot.collected_at),
+                ),
+            )
+
+    def get_indexing_snapshot(self, source_id: str) -> IndexingSnapshot | None:
+        """Return the last collected indexing progress, or None when never collected."""
+
+        with self.database.connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM indexing_snapshots WHERE source_id = ?", (source_id,)
+            ).fetchone()
+        return _snapshot(row) if row else None
 
 
 def _acl_key(source: Source, acl_version: str) -> tuple[int, int | str]:
