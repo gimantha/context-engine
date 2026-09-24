@@ -384,6 +384,8 @@ class RecordStatusResponse(_ApiModel):
     source_acl_version: str = Field(alias="sourceAclVersion")
     content_hash: str | None = Field(default=None, alias="contentHash")
     quarantine_reason: str | None = Field(default=None, alias="quarantineReason")
+    index_state: str = Field(alias="indexState")
+    index_error: str | None = Field(default=None, alias="indexError")
     updated_at: datetime = Field(alias="updatedAt")
 
     @classmethod
@@ -399,6 +401,8 @@ class RecordStatusResponse(_ApiModel):
             sourceAclVersion=value.source_acl_version,
             contentHash=value.content_hash,
             quarantineReason=value.quarantine_reason,
+            indexState=value.index_state.value,
+            indexError=value.index_error,
             updatedAt=value.updated_at,
         )
 

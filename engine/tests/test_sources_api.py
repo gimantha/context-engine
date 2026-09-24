@@ -319,6 +319,7 @@ async def test_checkpoints_record_status_and_dead_letters(tmp_path):
     assert admin_jobs.status_code == 200
     assert status.status_code == 200
     assert status.json()["state"] == "active" and status.json()["currentVersion"] == "84"
+    assert status.json()["indexState"] == "pending"
     assert "audience" not in status.json() and "contentRef" not in status.json()
     assert member_status.status_code == 404
     assert unknown.status_code == 404

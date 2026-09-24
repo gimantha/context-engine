@@ -40,3 +40,7 @@ Reviewed on 2026-09-24 after noting that the provider reports status per native 
 - `engine/tests/test_indexing_collector.py`
 - `engine/tests/test_cognee_adapter.py::test_adapter_attributes_native_processing_state_to_source_records`
 - `engine/tests/test_backend_contract.py::test_indexing_progress_requires_explicit_scope`
+
+## Revision (2026-09-24, M4 slice 2)
+
+Indexing progress now comes from the ledger, as the granularity decision above anticipated. When the worker runs with the provider backend (`CONTEXT_ENGINE_KNOWLEDGE_BACKEND=provider`), each active record carries an index state (`pending`, `indexed`, `failed`, or `reconcile_required`), and the progress route counts them. With the backend disabled, indexing still reports `not_collected`. The collector snapshots remain in place for the cross-check planned in slice 3.

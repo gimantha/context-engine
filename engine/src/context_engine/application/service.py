@@ -69,6 +69,8 @@ class ContextEngineService:
         staging: StagedBytes,
         upload_policy: UploadPolicy,
         max_job_attempts: int = 5,
+        *,
+        indexing_enabled: bool = False,
     ) -> None:
         self._store = store
         self._grants = grants
@@ -78,6 +80,7 @@ class ContextEngineService:
         self._staging = staging
         self._upload_policy = upload_policy
         self._max_job_attempts = max_job_attempts
+        self._indexing_enabled = indexing_enabled
 
     # Authorization helpers
 
@@ -276,7 +279,8 @@ class ContextEngineService:
             processing_since=since,
             jobs=self._store.count_source_jobs(source.id, since),
             records=self._sources.record_counts(source.id),
-            indexing=self._sources.get_indexing_snapshot(source.id),
+            # The ledger is the source of truth for indexing (ADR 0010 granularity decision).
+            indexing=self._sources.index_snapshot(source.id) if self._indexing_enabled else None,
         )
 
     def source_progress(self, principal: AuthenticatedPrincipal, source_id: str) -> SourceProgress:

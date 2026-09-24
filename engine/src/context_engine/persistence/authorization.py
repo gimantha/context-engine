@@ -62,6 +62,13 @@ class AuthorizationRepository:
             ).fetchone()
         return _principal(row) if row else None
 
+    def list_principals(self) -> tuple[Principal, ...]:
+        """Return every known principal in stable order."""
+
+        with self.database.connection() as connection:
+            rows = connection.execute("SELECT * FROM principals ORDER BY created_at, id").fetchall()
+        return tuple(_principal(row) for row in rows)
+
     def resolve_principal(
         self, issuer: str, subject: str, kind: PrincipalKind, email: str | None
     ) -> Principal:

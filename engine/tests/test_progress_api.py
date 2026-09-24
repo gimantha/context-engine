@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
-
 from test_api import (
     ADMIN,
     MEMBER,
@@ -19,7 +17,7 @@ from test_api import (
 )
 from test_sources_api import _client, _drain, _setup
 
-from context_engine.domain import IndexingSnapshot, IndexingState
+from context_engine.domain import IndexState
 from context_engine.observability import MetricsRegistry
 from context_engine.persistence import (
     AuthorizationRepository,
@@ -162,28 +160,39 @@ def test_progress_requires_delivery_or_management_rights(tmp_path):
     assert paused_run.status_code == 409
 
 
-def test_indexing_snapshot_is_reported_with_a_percentage(tmp_path):
+async def test_indexing_comes_from_the_ledger_when_the_backend_is_enabled(tmp_path):
+    with _client(tmp_path, knowledge_backend="provider") as client:
+        space, source = _setup(client)
+        url = f"/v1/progress/sources/{source['id']}"
+        for number in range(3):
+            _deliver(client, space, source, number)
+        await _drain(tmp_path)
+        pending = client.get(url, headers=_auth(SERVICE)).json()["indexing"]
+        sources = SourceRepository(ControlDatabase(tmp_path / "control.db", MIGRATIONS))
+        sources.set_index_state(space["id"], source["id"], "doc-0", IndexState.INDEXED)
+        sources.set_index_state(space["id"], source["id"], "doc-1", IndexState.INDEXED)
+        sources.set_index_state(
+            space["id"], source["id"], "doc-2", IndexState.FAILED, "extraction_unsupported"
+        )
+        settled = client.get(url, headers=_auth(SERVICE))
+        status = client.get(
+            f"/v1/sources/{source['id']}/records/doc-2", headers=_auth(SERVICE)
+        ).json()
+
+    indexing = settled.json()["indexing"]
+    assert (pending["state"], pending["expected"], pending["indexing"]) == ("ok", 3, 3)
+    assert pending["percent"] == 0.0
+    assert indexing["state"] == "ok" and indexing["percent"] == 66.7
+    assert (indexing["indexed"], indexing["failed"], indexing["missing"]) == (2, 1, 0)
+    assert status["indexState"] == "failed" and status["indexError"] == "extraction_unsupported"
+    assert "dataset" not in settled.text.lower()
+
+
+def test_indexing_is_not_reported_while_the_backend_is_disabled(tmp_path):
     with _client(tmp_path) as client:
         _, source = _setup(client)
-        url = f"/v1/progress/sources/{source['id']}"
-        sources = SourceRepository(ControlDatabase(tmp_path / "control.db", MIGRATIONS))
-        sources.put_indexing_snapshot(
-            IndexingSnapshot(source["id"], IndexingState.OK, datetime.now(UTC), 8, 6, 1, 0, 1)
-        )
-        ok = client.get(url, headers=_auth(SERVICE))
-        sources.put_indexing_snapshot(
-            IndexingSnapshot(
-                source["id"],
-                IndexingState.UNAVAILABLE,
-                datetime.now(UTC),
-                error_code="unavailable",
-            )
-        )
-        down = client.get(url, headers=_auth(SERVICE)).json()["indexing"]
+        indexing = client.get(
+            f"/v1/progress/sources/{source['id']}", headers=_auth(SERVICE)
+        ).json()["indexing"]
 
-    indexing = ok.json()["indexing"]
-    assert indexing["state"] == "ok" and indexing["percent"] == 75.0
-    assert (indexing["expected"], indexing["indexing"], indexing["missing"]) == (8, 1, 1)
-    assert indexing["collectedAt"] is not None
-    assert down["state"] == "unavailable" and down["percent"] is None
-    assert "dataset" not in ok.text.lower()
+    assert indexing["state"] == "not_collected" and indexing["percent"] is None

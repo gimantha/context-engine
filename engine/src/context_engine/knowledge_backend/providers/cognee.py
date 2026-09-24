@@ -66,10 +66,13 @@ class _CogneeRuntimePort(Protocol):
 
         ...
 
-    async def update(
-        self, record: SourceRecord, binding: _CogneeBinding, data_id: str, user: Any
-    ) -> None:
-        """Invoke native update for one bound record."""
+    async def grant_read(self, binding: _CogneeBinding, reader: Any, owner: Any) -> None:
+        """Give a native user read permission on one binding, acting as its owner."""
+
+        ...
+
+    async def revoke_read(self, binding: _CogneeBinding, reader: Any, owner: Any) -> None:
+        """Remove a native user's read permission on one binding, acting as its owner."""
 
         ...
 
@@ -285,12 +288,68 @@ class CogneeBackend:
         )
         if stored is None:
             raise BackendError(BackendErrorCode.NOT_FOUND, "Record binding is not initialized")
-        reference = BackendReference(stored)
-        _, data_id = _parse_reference(reference)
+        _, previous_item = _parse_reference(BackendReference(stored))
         try:
             user = await self._user_resolver(principal)
-            await self._runtime.update(record, binding, data_id, user)
+            # Replace rather than edit in place: the new item carries the new version in its
+            # metadata, which evidence lineage and progress rely on (ADR 0007).
+            result = await self._runtime.remember(record, binding, user)
+            if result.dataset_id != binding.dataset_id:
+                raise BackendError(
+                    BackendErrorCode.PARTIAL_WRITE,
+                    "Provider wrote the replacement to an unexpected isolation unit",
+                )
+            reference = _native_reference(result.dataset_id, result.data_id)
+            self._state.put_record_reference(
+                partition.value, record.source_id, record.record_id, reference.value
+            )
+            if result.data_id != previous_item:
+                await self._runtime.forget(binding, previous_item, user)
             return IngestionResult(record.record_id, record.version, reference, created=False)
+        except BackendError:
+            raise
+        except Exception as exc:
+            raise _translate_error(exc) from exc
+
+    async def grant_read(
+        self,
+        partition: AccessPartitionRef,
+        reader: PrincipalContext,
+        principal: PrincipalContext,
+    ) -> None:
+        """Give a reader native read permission on the partition's binding."""
+
+        await self._change_read(partition, reader, principal, grant=True)
+
+    async def revoke_read(
+        self,
+        partition: AccessPartitionRef,
+        reader: PrincipalContext,
+        principal: PrincipalContext,
+    ) -> None:
+        """Remove a reader's native read permission on the partition's binding."""
+
+        await self._change_read(partition, reader, principal, grant=False)
+
+    async def _change_read(
+        self,
+        partition: AccessPartitionRef,
+        reader: PrincipalContext,
+        principal: PrincipalContext,
+        *,
+        grant: bool,
+    ) -> None:
+        self._partitions((partition,))
+        binding = self._bindings.resolve(partition)
+        if binding.dataset_id is None:
+            raise BackendError(BackendErrorCode.NOT_FOUND, "Access partition is not initialized")
+        try:
+            owner = await self._user_resolver(principal)
+            user = await self._user_resolver(reader)
+            if grant:
+                await self._runtime.grant_read(binding, user, owner)
+            else:
+                await self._runtime.revoke_read(binding, user, owner)
         except BackendError:
             raise
         except Exception as exc:
@@ -483,18 +542,28 @@ class CogneeRuntime:
             user=user,
         )
 
-    async def update(
-        self, record: SourceRecord, binding: _CogneeBinding, data_id: str, user: Any
-    ) -> None:
-        """Invoke the native update operation for one bound record."""
+    async def grant_read(self, binding: _CogneeBinding, reader: Any, owner: Any) -> None:
+        """Give read permission on one binding through the native sharing API."""
 
-        cognee = self._module()
-        await cognee.update(
-            data_id=UUID(data_id),
-            data=record.content,
-            dataset_id=UUID(binding.dataset_id),
-            user=user,
-            chunk_level_diff=True,
+        self._module()
+        from cognee.modules.users.permissions.methods import (
+            authorized_give_permission_on_datasets,
+        )
+
+        await authorized_give_permission_on_datasets(
+            reader.id, [UUID(binding.dataset_id)], "read", owner.id
+        )
+
+    async def revoke_read(self, binding: _CogneeBinding, reader: Any, owner: Any) -> None:
+        """Remove read permission on one binding through the native sharing API."""
+
+        self._module()
+        from cognee.modules.users.permissions.methods import (
+            authorized_revoke_permission_on_datasets,
+        )
+
+        await authorized_revoke_permission_on_datasets(
+            reader.id, [UUID(binding.dataset_id)], "read", owner.id
         )
 
     async def improve(self, binding: _CogneeBinding, user: Any) -> Any:
@@ -698,7 +767,6 @@ def assert_runtime_matches_pinned_sdk(runtime: CogneeRuntime | None = None) -> N
     required = {
         "remember": {"data", "dataset_name", "dataset_id", "self_improvement"},
         "recall": {"query_text", "dataset_ids", "top_k", "user"},
-        "update": {"data_id", "data", "dataset_id", "user"},
         "forget": {"data_id", "dataset_id", "user"},
         "improve": {"dataset"},
     }
@@ -713,6 +781,21 @@ def assert_runtime_matches_pinned_sdk(runtime: CogneeRuntime | None = None) -> N
                 f"Pinned provider {operation} signature is missing {sorted(missing)}"
             )
     from cognee.modules.users import methods as user_methods
+    from cognee.modules.users.permissions import methods as permission_methods
+
+    for operation in (
+        "authorized_give_permission_on_datasets",
+        "authorized_revoke_permission_on_datasets",
+    ):
+        function = getattr(permission_methods, operation, None)
+        if function is None:
+            raise RuntimeError(f"Pinned provider permission API is missing {operation}")
+        expected = {"principal_id", "dataset_ids", "permission_name", "owner_id"}
+        missing = expected - set(inspect.signature(function).parameters)
+        if missing:
+            raise RuntimeError(
+                f"Pinned provider {operation} signature is missing {sorted(missing)}"
+            )
 
     for operation, parameters in {
         "create_user": {"email", "password"},
