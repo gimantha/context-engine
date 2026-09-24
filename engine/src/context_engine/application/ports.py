@@ -9,15 +9,19 @@ from context_engine.domain import (
     Action,
     ContextSpace,
     Grant,
+    IndexingSnapshot,
     Job,
+    JobCounts,
     JobOperation,
     JobState,
     Principal,
+    RecordCounts,
     RecordStatus,
     Source,
     SourceCheckpoint,
     SourceState,
     StagedUpload,
+    SyncRun,
     VersionOrdering,
 )
 
@@ -60,6 +64,11 @@ class ControlPlaneStore(Protocol):
 
     def list_source_jobs(self, source_id: str, state: JobState | None = None) -> tuple[Job, ...]:
         """Return jobs delivered for one source, optionally filtered by state."""
+
+        ...
+
+    def count_source_jobs(self, source_id: str, since: datetime | None = None) -> JobCounts:
+        """Count a source's deliveries by public state, optionally since a time."""
 
         ...
 
@@ -134,6 +143,36 @@ class SourceStore(Protocol):
         self, space_id: str, source_id: str, source_record_id: str
     ) -> RecordStatus | None:
         """Return the ledger state of one record."""
+
+        ...
+
+    def open_sync_run(self, source_id: str, principal_id: str) -> SyncRun:
+        """Start a reading window, superseding an unfinished one."""
+
+        ...
+
+    def get_sync_run(self, run_id: str) -> SyncRun | None:
+        """Return one sync run when it exists."""
+
+        ...
+
+    def latest_sync_run(self, source_id: str) -> SyncRun | None:
+        """Return the most recent sync run of a source."""
+
+        ...
+
+    def complete_sync_run(self, run_id: str) -> SyncRun | None:
+        """Mark a reading run completed."""
+
+        ...
+
+    def record_counts(self, source_id: str) -> RecordCounts:
+        """Count a source's ledger records by lifecycle state."""
+
+        ...
+
+    def get_indexing_snapshot(self, source_id: str) -> IndexingSnapshot | None:
+        """Return the last collected indexing progress of a source."""
 
         ...
 

@@ -115,6 +115,19 @@ curl -H "Authorization: Bearer <connector token>" -H "Idempotency-Key: upload-00
 
 The upload response carries `uploadId` and `contentHash`. Put them into an ingestion event as `contentRef` and `contentHash`, post it to `/v1/ingestions` with the same `Idempotency-Key` as the body, and watch `/v1/jobs/<job id>` and `/v1/sources/<source id>/records/<record id>` as the worker applies it. Failed deliveries are listed at `/v1/sources/<source id>/jobs?state=failed`.
 
+Watch a source's progress through the separate, read-only progress API. A connector marks reading with a sync run; the progress response reports the reading state, processing counts and percentage since the latest run started, ledger record counts, and indexing counts and percentage from the last background collection:
+
+```bash
+curl -X POST -H "Authorization: Bearer <connector token>" \
+  http://127.0.0.1:8000/v1/sources/<source id>/sync-runs
+curl -H "Authorization: Bearer <connector token>" \
+  http://127.0.0.1:8000/v1/progress/sources/<source id>
+curl -X POST -H "Authorization: Bearer <connector token>" \
+  http://127.0.0.1:8000/v1/sources/<source id>/sync-runs/<run id>/complete
+```
+
+Indexing reports `not_collected` until provider-backed ingestion is enabled in M4.
+
 Interactive API documentation is available at `http://127.0.0.1:8000/docs`. Identity-provider integrations arrive in M6. Provider-backed execution arrives in M4.
 
 ## Run the live-provider verification
@@ -168,6 +181,7 @@ Changes to a public contract should update its examples and contract tests in th
 - A connector's delivery right is a grant of `ingest.write` on the source. The ingestion body cannot pick a space or source the credential is not bound to, and staged content must match the event's type and hash.
 - The engine never fetches a supplied URL. `sourceUrl` is display provenance; bytes arrive through staged uploads delivered by a connector, whatever the source type.
 - The record ledger is authoritative. Versions compare under the source's declared ordering, an older event never replaces or resurrects a newer or deleted record, and records with an unmapped audience tag are quarantined.
+- Progress is read-only observability under `/v1/progress/`. It needs delivery or management rights on the source, and it never queries the knowledge backend on the request path; a worker collector stores indexing snapshots that the API reads (ADR 0010).
 - Context spaces are public resources. Internal access partitions are resolved by policy and never accepted from or returned to callers.
 - Every backend data operation receives an explicit principal and explicit authorized partition scope. Missing or ambiguous scope fails closed.
 - Internal provider-backed worker code depends on the port in `engine/src/context_engine/knowledge_backend/`.

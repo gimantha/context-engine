@@ -73,3 +73,14 @@ provider boundary check: passed
 - `local/m3.env.example` adds the staging path, upload size limit, upload time to live, and the content type allowlist.
 - The staging directory lives under `.context-engine/`, which Git ignores.
 - Failed deliveries stay in the jobs table with their error code. There is no automatic replay of dead letters; a connector re-delivers with a new idempotency key once the cause is fixed.
+
+## Addendum: source progress (2026-09-24)
+
+Added before M4 at the user's request, recorded in ADR 0010.
+
+- **Reading marker.** `POST /v1/sources/{sourceId}/sync-runs` opens a run in the `reading` state and `POST /v1/sources/{sourceId}/sync-runs/{runId}/complete` completes it. A new run supersedes an unfinished one. The connector needs these two calls and no envelope change.
+- **Progress API.** `GET /v1/progress/sources/{sourceId}` and `GET /v1/progress/spaces/{spaceId}` report the reading state, processing counts and percentage since the latest run started, ledger record counts, and indexing counts and percentage. They require delivery or management rights on the source.
+- **Indexing plumbing.** The knowledge-backend port gains `indexing_progress`. The dummy backend and the private adapter implement it; the adapter maps native per-binding run status and item metadata to per-source counts through the provider's public status and listing calls, and the pinned-SDK guard now checks those signatures. A worker `IndexingCollector` stores snapshots. It is not yet started by the worker process, so indexing reports `not_collected` until M4.
+- **Migration** `0004_source_progress.sql` adds `sync_runs`, `indexing_snapshots`, and an expression index on jobs by source.
+
+Validation on 2026-09-24: ruff clean, 64 non-live tests passing, API and worker startup checks, four migrations on a fresh database, and the provider boundary check.

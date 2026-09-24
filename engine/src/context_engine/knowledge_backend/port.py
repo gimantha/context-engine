@@ -11,6 +11,8 @@ from .types import (
     DeletionResult,
     EnrichmentRequest,
     EnrichmentResult,
+    IndexingProgress,
+    IndexingProgressRequest,
     IngestionResult,
     PrincipalContext,
     QueryRequest,
@@ -69,6 +71,19 @@ class KnowledgeBackend(Protocol):
         partition: AccessPartitionRef,
     ) -> DeletionResult:
         """Delete one referenced record from its access partition."""
+
+        ...
+
+    async def indexing_progress(
+        self,
+        request: IndexingProgressRequest,
+        principal: PrincipalContext,
+        authorized_partitions: tuple[AccessPartitionRef, ...],
+    ) -> IndexingProgress:
+        """Report how many expected record versions are indexed, in progress, failed, or absent.
+
+        Every expected record must sit in one of the explicitly authorized partitions.
+        """
 
         ...
 

@@ -16,6 +16,8 @@ from .types import (
     EnrichmentRequest,
     EnrichmentResult,
     EvidenceItem,
+    IndexingProgress,
+    IndexingProgressRequest,
     IngestionResult,
     PrincipalContext,
     QueryRequest,
@@ -219,6 +221,30 @@ class DummyKnowledgeBackend:
         self._references.pop(reference.value, None)
         self._invalidate(partition)
         return DeletionResult(record_id=record_id, deleted=True)
+
+    async def indexing_progress(
+        self,
+        request: IndexingProgressRequest,
+        principal: PrincipalContext,
+        authorized_partitions: tuple[AccessPartitionRef, ...],
+    ) -> IndexingProgress:
+        """Count expected record versions held in their partitions; writes are synchronous."""
+
+        self._check_context(principal, authorized_partitions)
+        allowed = {item.value for item in authorized_partitions}
+        if any(item.partition.value not in allowed for item in request.records):
+            raise BackendError(BackendErrorCode.ACCESS_DENIED, "Record partition is out of scope")
+        indexed = 0
+        for item in request.records:
+            stored = self._records.get(item.partition.value, {}).get(item.record_id)
+            if (
+                stored is not None
+                and stored.record.source_id == request.source_id
+                and stored.record.version == item.version
+            ):
+                indexed += 1
+        expected = len(request.records)
+        return IndexingProgress(expected, indexed, 0, 0, expected - indexed)
 
     async def health(self) -> BackendHealth:
         """Report the deterministic backend as ready for all test operations."""

@@ -45,6 +45,7 @@ from context_engine.security.identity import (
     provision_static_identities,
 )
 
+from .progress import build_progress_router
 from .schemas import (
     CheckpointResponse,
     ContextSpaceResponse,
@@ -62,6 +63,7 @@ from .schemas import (
     RecordStatusResponse,
     RegisterSourceRequest,
     SourceResponse,
+    SyncRunResponse,
     UpdateSourceRequest,
     UploadResponse,
 )
@@ -424,6 +426,30 @@ def create_app(
             service.get_record_status(principal, source_id, record_id)
         )
 
+    @app.post(
+        "/v1/sources/{source_id}/sync-runs",
+        response_model=SyncRunResponse,
+        response_model_by_alias=True,
+        status_code=201,
+    )
+    async def open_sync_run(
+        source_id: ResourceId,
+        principal: AuthenticatedPrincipal = Depends(current_principal),
+    ) -> SyncRunResponse:
+        return SyncRunResponse.from_domain(service.open_sync_run(principal, source_id))
+
+    @app.post(
+        "/v1/sources/{source_id}/sync-runs/{run_id}/complete",
+        response_model=SyncRunResponse,
+        response_model_by_alias=True,
+    )
+    async def complete_sync_run(
+        source_id: ResourceId,
+        run_id: ResourceId,
+        principal: AuthenticatedPrincipal = Depends(current_principal),
+    ) -> SyncRunResponse:
+        return SyncRunResponse.from_domain(service.complete_sync_run(principal, source_id, run_id))
+
     @app.get(
         "/v1/sources/{source_id}/jobs",
         response_model=list[JobResponse],
@@ -514,4 +540,5 @@ def create_app(
         service.delete_grant(principal, resource_id, grant_id)
         return Response(status_code=204)
 
+    app.include_router(build_progress_router(service, current_principal))
     return app

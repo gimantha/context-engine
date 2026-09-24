@@ -21,8 +21,11 @@ from context_engine.domain import (
     RecordStatus,
     Source,
     SourceCheckpoint,
+    SourceProgress,
     SourceState,
     StagedUpload,
+    SyncRun,
+    SyncRunState,
     VersionOrdering,
 )
 from context_engine.observability import MetricsRegistry
@@ -234,10 +237,77 @@ class ContextEngineService:
         self._require(principal, Action.INGEST_WRITE, source_id)
         return self._sources.put_checkpoint(source_id, cursor, principal.principal_id)
 
+    # Sync runs and progress
+
+    def open_sync_run(self, principal: AuthenticatedPrincipal, source_id: str) -> SyncRun:
+        """Mark a source as being read by its connector."""
+
+        source = self.authorize_upload(principal, source_id)
+        run = self._sources.open_sync_run(source.id, principal.principal_id)
+        self._metrics.increment("context_engine_sync_runs_opened_total")
+        return run
+
+    def complete_sync_run(
+        self, principal: AuthenticatedPrincipal, source_id: str, run_id: str
+    ) -> SyncRun:
+        """Mark a sync run's reading as completed; repeating the call is harmless."""
+
+        self._visible_source(principal, source_id)
+        self._require(principal, Action.INGEST_WRITE, source_id)
+        run = self._sources.get_sync_run(run_id)
+        if run is None or run.source_id != source_id:
+            raise NotFoundError("Sync run not found")
+        if run.state is SyncRunState.SUPERSEDED:
+            raise ConflictError("Sync run was superseded by a newer run")
+        if run.state is SyncRunState.COMPLETED:
+            return run
+        completed = self._sources.complete_sync_run(run_id)
+        if completed is None:
+            raise NotFoundError("Sync run not found")
+        return completed
+
+    def _progress_for(self, source: Source) -> SourceProgress:
+        run = self._sources.latest_sync_run(source.id)
+        # Processing is measured over the latest run's window so a new scan starts from zero.
+        since = run.started_at if run else None
+        return SourceProgress(
+            source_id=source.id,
+            sync_run=run,
+            processing_since=since,
+            jobs=self._store.count_source_jobs(source.id, since),
+            records=self._sources.record_counts(source.id),
+            indexing=self._sources.get_indexing_snapshot(source.id),
+        )
+
+    def source_progress(self, principal: AuthenticatedPrincipal, source_id: str) -> SourceProgress:
+        """Return a source's pipeline progress to principals who deliver or manage it.
+
+        Counts reveal record volume across every audience, so readers are not enough.
+        """
+
+        source = self._visible_source(principal, source_id)
+        self._require_any(principal, _INSPECT_DELIVERIES, source_id)
+        return self._progress_for(source)
+
+    def space_progress(
+        self, principal: AuthenticatedPrincipal, space_id: str
+    ) -> tuple[SourceProgress, ...]:
+        """Return progress for the sources in a visible space the principal may inspect."""
+
+        self.get_context_space(principal, space_id)
+        result: list[SourceProgress] = []
+        for source in self._sources.list_sources(space_id):
+            actions = self._authorizer.effective_actions(
+                principal.principal_id, principal.groups, source.id
+            )
+            if actions and actions & _INSPECT_DELIVERIES:
+                result.append(self._progress_for(source))
+        return tuple(result)
+
     # Staged uploads
 
     def authorize_upload(self, principal: AuthenticatedPrincipal, source_id: str) -> Source:
-        """Check delivery rights before any upload bytes are read."""
+        """Check delivery rights on a ready source before any delivery work begins."""
 
         source = self._visible_source(principal, source_id)
         self._require(principal, Action.INGEST_WRITE, source_id)

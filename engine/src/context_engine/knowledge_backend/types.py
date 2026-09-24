@@ -156,3 +156,45 @@ class BackendHealth:
     capabilities: BackendCapabilities = field(
         default_factory=lambda: BackendCapabilities(False, False, False, False)
     )
+
+
+@dataclass(frozen=True, slots=True)
+class ExpectedRecord:
+    """One record version the engine expects a backend to hold in one partition."""
+
+    partition: AccessPartitionRef
+    record_id: str
+    version: str
+
+    def __post_init__(self) -> None:
+        _required(self.record_id, "record_id")
+        _required(self.version, "version")
+
+
+@dataclass(frozen=True, slots=True)
+class IndexingProgressRequest:
+    """Ask a backend how far it has indexed a source's expected record versions."""
+
+    source_id: str
+    records: tuple[ExpectedRecord, ...]
+
+    def __post_init__(self) -> None:
+        _required(self.source_id, "source_id")
+
+
+@dataclass(frozen=True, slots=True)
+class IndexingProgress:
+    """Counts of expected record versions by backend indexing state."""
+
+    expected: int
+    indexed: int
+    indexing: int
+    failed: int
+    missing: int
+
+    def __post_init__(self) -> None:
+        values = (self.expected, self.indexed, self.indexing, self.failed, self.missing)
+        if any(value < 0 for value in values):
+            raise ValueError("indexing counts cannot be negative")
+        if self.indexed + self.indexing + self.failed + self.missing != self.expected:
+            raise ValueError("indexing counts must add up to the expected total")
