@@ -176,6 +176,11 @@ class SourceStore(Protocol):
 
         ...
 
+    def index_snapshot(self, source_id: str) -> IndexingSnapshot:
+        """Count a source's active records by index state from the ledger."""
+
+        ...
+
 
 class StagedBytes(Protocol):
     """Byte storage for staged uploads."""

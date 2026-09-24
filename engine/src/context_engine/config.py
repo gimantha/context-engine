@@ -38,6 +38,8 @@ class Settings:
     # Only the static mode exists in this milestone; there is no mode without a verifier.
     auth_mode: str = "static"
     static_tokens_path: Path = Path(".context-engine/static-tokens.json")
+    # "none" keeps the worker ledger-only; "provider" converges the knowledge backend (M4).
+    knowledge_backend: str = "none"
     staging_path: Path = Path(".context-engine/staging")
     upload_max_bytes: int = 25 * 1024 * 1024
     upload_ttl_seconds: int = 24 * 60 * 60
@@ -69,6 +71,7 @@ class Settings:
             static_tokens_path=Path(
                 os.getenv("CONTEXT_ENGINE_STATIC_TOKENS_PATH", ".context-engine/static-tokens.json")
             ).expanduser(),
+            knowledge_backend=os.getenv("CONTEXT_ENGINE_KNOWLEDGE_BACKEND", "none").strip().lower(),
             staging_path=Path(
                 os.getenv("CONTEXT_ENGINE_STAGING_PATH", ".context-engine/staging")
             ).expanduser(),

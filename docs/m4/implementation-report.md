@@ -1,10 +1,10 @@
 # M4 Knowledge-Backend Pipeline and Graph Lifecycle
 
-**Status:** Slice 1 of 3 implemented; the live-provider gate is still not run
+**Status:** Slices 1 and 2 of 3 implemented; the live-provider gate is still not run
 
 **Date:** 2026-09-24
 
-**Release limitation:** Provider-backed execution is not wired into the worker yet, and the M0 live isolation, stale-artifact, and deletion checks remain unverified
+**Release limitation:** The provider-backed worker path is verified only against the deterministic backend. The M0 live isolation, stale-artifact, and deletion checks remain unverified, and there is no query route yet
 
 ## Plan
 
@@ -25,6 +25,20 @@ M4 is delivered in three slices, each leaving the full non-live suite passing.
 
 Migration `0005_partitions_and_backend_state.sql` adds `access_partitions`, `source_records.partition_id`, `backend_bindings`, `backend_record_refs`, and `backend_identities`.
 
+## Slice 2 delivered
+
+- **Provider mode.** `CONTEXT_ENGINE_KNOWLEDGE_BACKEND=provider` makes the worker build the private backend over the control database's backend state. The default, `none`, keeps the worker ledger-only.
+- **Text extraction.** Plain text, Markdown, HTML, and JSON become normalized text with a recorded parser version (`plain@1`, `markdown@1`, `html@1`, `json@1`). PDF is accepted for staging but fails indexing with `extraction_unsupported` until a pinned parser is added. The worker re-checks the staged bytes against the content hash before extracting.
+- **Convergence per record.** After every ledger transition the worker writes, replaces, moves, or removes the record's backend copies until they match the ledger (ADR 0007 revision). Physical copies are tracked in `record_locations`.
+- **Crash safety.** Writes record their intent before calling the backend. After a crash, an absent version is written again and a present but unrecorded one makes the record reconcile-required. Partial-write errors do the same.
+- **Residue checks.** Every removal and replacement is followed by a check that the old version is gone from its partition.
+- **Replace-style updates.** The private adapter's update writes a new item and drops the previous one, so metadata always carries the current version.
+- **Per-record index state.** Each record carries `pending`, `indexed`, `failed`, `reconcile_required`, or `not_indexed`, with a stable error code. The record-status route exposes both, and source progress now counts indexing from the ledger when the backend is enabled.
+- **Read access.** The worker grants and revokes backend read access so it matches engine policy: `context.read` on the space plus membership in one of the partition's audiences (ADR 0011).
+- **Staged bytes released.** Uploads that no live record needs are deleted after convergence: every version of a deleted record and superseded versions of a live one.
+
+Migration `0006_provider_pipeline.sql` adds the ledger fields, `record_locations`, `backend_read_access`, and `read_access_sync`.
+
 ## Gate status
 
 | M4 gate item | Status | Evidence |
@@ -35,20 +49,23 @@ Migration `0005_partitions_and_backend_state.sql` adds `access_partitions`, `sou
 | No default provider identity | Pass | Resolver tests; every principal gets its own account |
 | Query the ingested record through its context space | Slice 3 | |
 | Enrichment creates traceable derived data | Slice 3 | |
-| Replacing a record supersedes old answers | Slice 2 and live gate | |
-| Deleting a record removes every searchable artifact | Slice 2 and live gate | |
+| Replacing a record supersedes old answers | Pass against the deterministic backend; live gate pending | `test_record_indexer.py` replacement and residue tests |
+| Deleting a record removes every searchable artifact | Pass against the deterministic backend for item-level residue; raw-file and graph residue pending the live scan | `test_record_indexer.py` deletion and residue tests |
+| Partial writes are never silently repeated | Pass | Crash-before and crash-after tests in `test_record_indexer.py` |
+| Backend read access follows engine policy | Pass against the deterministic backend | `test_read_access.py` |
 | Swapping in a test backend needs no application change | Holds so far | Dummy backend passes the shared contract tests |
 | No public payload exposes provider terms | Pass | Boundary check and contract tests |
 
-Validation performed on 2026-09-24 from `engine/`:
+Validation performed on 2026-09-24 from `engine/`, after slice 2:
 
 ```text
 ruff format --check: passed
 ruff check: passed
-pytest -m "not live_provider": 73 passed, 1 provider-extra check skipped, 1 live test deselected
+pytest -m "not live_provider": 104 passed, 1 provider-extra check skipped, 1 live test deselected
 context-engine-api --check: passed
 context-engine-worker --check: passed
-context-engine-migrate: applied 5 migrations to a fresh database
+context-engine-migrate: applied 6 migrations to a fresh database
+context-engine-worker --check with CONTEXT_ENGINE_KNOWLEDGE_BACKEND=provider: passed without the provider installed
 provider boundary check: passed
 ```
 

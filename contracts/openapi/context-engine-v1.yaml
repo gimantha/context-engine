@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Context Engine API
-  version: 0.5.0
+  version: 0.6.0
   description: Provider-neutral API draft for governed context spaces.
 servers:
   - url: /v1
@@ -851,7 +851,8 @@ components:
     RecordStatus:
       type: object
       additionalProperties: false
-      required: [spaceId, sourceId, recordId, state, currentVersion, sourceAclVersion, updatedAt]
+      required:
+        [spaceId, sourceId, recordId, state, currentVersion, sourceAclVersion, indexState, updatedAt]
       properties:
         spaceId:
           $ref: "#/components/schemas/Identifier"
@@ -871,6 +872,15 @@ components:
           pattern: "^sha256:[0-9a-f]{64}$"
         quarantineReason:
           type: string
+        indexState:
+          type: string
+          description: >-
+            Whether the knowledge backend matches the ledger for this record. Pending means
+            the backend still has to catch up; not_indexed means nothing should be searchable.
+          enum: [pending, indexed, failed, reconcile_required, not_indexed]
+        indexError:
+          type: string
+          description: Stable code explaining a failed or reconcile-required index state.
         updatedAt:
           type: string
           format: date-time

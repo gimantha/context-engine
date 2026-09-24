@@ -50,7 +50,11 @@ class KnowledgeBackend(Protocol):
         principal: PrincipalContext,
         partition: AccessPartitionRef,
     ) -> IngestionResult:
-        """Replace an existing source record in its access partition."""
+        """Replace an existing source record in its access partition.
+
+        On success the new version is searchable and the previous one is not. The returned
+        reference may differ from the previous one and replaces it.
+        """
 
         ...
 
@@ -71,6 +75,29 @@ class KnowledgeBackend(Protocol):
         partition: AccessPartitionRef,
     ) -> DeletionResult:
         """Delete one referenced record from its access partition."""
+
+        ...
+
+    async def grant_read(
+        self,
+        partition: AccessPartitionRef,
+        reader: PrincipalContext,
+        principal: PrincipalContext,
+    ) -> None:
+        """Let a reader query one partition; the acting principal must own it.
+
+        Raises a not-found error while the partition holds nothing yet.
+        """
+
+        ...
+
+    async def revoke_read(
+        self,
+        partition: AccessPartitionRef,
+        reader: PrincipalContext,
+        principal: PrincipalContext,
+    ) -> None:
+        """Remove a reader's access to one partition; the acting principal must own it."""
 
         ...
 

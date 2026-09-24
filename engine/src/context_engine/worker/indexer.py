@@ -1,0 +1,367 @@
+"""Converge the knowledge backend to the ledger, one record at a time (ADR 0007).
+
+The ledger says which partition and version each record should have; `record_locations`
+says where copies actually are. Each call compares the two and writes, replaces, moves, or
+removes copies until they match. Every backend write records its intent first, so a crash is
+detected on the next attempt instead of being repeated blindly (ADR 0006). Every removal and
+replacement is followed by a check that the old version is gone.
+"""
+
+from __future__ import annotations
+
+import hashlib
+from collections.abc import Awaitable, Callable
+from dataclasses import replace
+
+from context_engine.domain import (
+    IndexState,
+    LocationState,
+    RecordLocation,
+    RecordState,
+    RecordStatus,
+    Source,
+)
+from context_engine.ingestion.extraction import ExtractedText, ExtractionError, extract
+from context_engine.knowledge_backend import (
+    AccessPartitionRef,
+    BackendError,
+    BackendErrorCode,
+    BackendReference,
+    ExpectedRecord,
+    IndexingProgressRequest,
+    KnowledgeBackend,
+    PrincipalContext,
+    SourceRecord,
+)
+from context_engine.observability import MetricsRegistry, get_logger, log_event
+from context_engine.persistence import SourceRepository, StagingStore
+
+from .handler import TerminalJobError
+
+logger = get_logger(__name__)
+
+PartitionBound = Callable[[str, str], Awaitable[object]]
+
+
+class _Failure(Exception):
+    """A record-level indexing failure that retrying cannot fix."""
+
+    def __init__(self, code: str, message: str, state: IndexState = IndexState.FAILED) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.state = state
+
+
+class RecordIndexer:
+    """Write, replace, move, and remove backend copies so they match the ledger."""
+
+    def __init__(
+        self,
+        sources: SourceRepository,
+        backend: KnowledgeBackend,
+        staging: StagingStore,
+        service_principal_id: str,
+        metrics: MetricsRegistry,
+        on_partition_bound: PartitionBound | None = None,
+    ) -> None:
+        self._sources = sources
+        self._backend = backend
+        self._staging = staging
+        self._service_principal_id = service_principal_id
+        self._metrics = metrics
+        self._on_partition_bound = on_partition_bound
+
+    async def converge(self, source: Source, source_record_id: str, trace_id: str) -> IndexState:
+        """Bring one record's backend copies in line with the ledger and return its state.
+
+        Retryable backend errors propagate so the job retries with backoff. Anything that
+        retrying cannot fix fails the job terminally and is recorded on the record.
+        """
+
+        # Content is always written as the engine's service identity, never as a caller.
+        principal = PrincipalContext(self._service_principal_id, trace_id)
+        record = self._sources.get_record(source.space_id, source.id, source_record_id)
+        if record is None:
+            return IndexState.NOT_INDEXED
+        try:
+            state = await self._converge(source, record, principal)
+        except _Failure as failure:
+            self._record_failure(source, record, failure.state, failure.code, trace_id)
+            raise TerminalJobError(failure.code, failure.message) from failure
+        except BackendError as exc:
+            if exc.retryable:
+                raise
+            code = f"backend_{exc.code.value}"
+            self._record_failure(source, record, IndexState.FAILED, code, trace_id)
+            raise TerminalJobError(code, "Knowledge backend rejected the operation") from exc
+        self._sources.set_index_state(source.space_id, source.id, source_record_id, state)
+        return state
+
+    def _record_failure(
+        self, source: Source, record: RecordStatus, state: IndexState, code: str, trace_id: str
+    ) -> None:
+        self._sources.set_index_state(
+            source.space_id, source.id, record.source_record_id, state, code
+        )
+        self._metrics.increment("context_engine_index_failures_total")
+        log_event(logger, "record_index_failed", error_code=code, trace_id=trace_id)
+
+    async def _converge(
+        self, source: Source, record: RecordStatus, principal: PrincipalContext
+    ) -> IndexState:
+        locations = self._sources.list_locations(
+            source.space_id, source.id, record.source_record_id
+        )
+        locations = await self._recover(source, record, locations, principal)
+        desired = self._desired_partition(source, record)
+        if desired is not None:
+            await self._place(source, record, desired, locations, principal)
+        # Copies anywhere else are stale: a moved record, a deleted one, or a quarantined one.
+        for location in locations:
+            if location.partition_id != desired:
+                await self._remove(source, record, location, principal)
+        return IndexState.INDEXED if desired is not None else IndexState.NOT_INDEXED
+
+    def _desired_partition(self, source: Source, record: RecordStatus) -> str | None:
+        if record.state is not RecordState.ACTIVE:
+            return None
+        if record.partition_id:
+            return record.partition_id
+        # Records written before partitions were persisted get theirs registered now.
+        return self._sources.ensure_partition(source.space_id, record.audience)
+
+    async def _recover(
+        self,
+        source: Source,
+        record: RecordStatus,
+        locations: tuple[RecordLocation, ...],
+        principal: PrincipalContext,
+    ) -> list[RecordLocation]:
+        """Resolve copies left mid-operation by an earlier attempt."""
+
+        settled: list[RecordLocation] = []
+        for location in locations:
+            if location.state is LocationState.RECONCILE_REQUIRED:
+                raise _Failure(
+                    "reconcile_required",
+                    "The record needs reconciliation before it can be indexed",
+                    IndexState.RECONCILE_REQUIRED,
+                )
+            if location.state is LocationState.REMOVING:
+                await self._remove(source, record, location, principal)
+                continue
+            if location.state is LocationState.WRITING:
+                target = location.target_version
+                if target and not await self._absent(
+                    location.partition_id, source, record, target, principal
+                ):
+                    self._set_location(source, record, location, LocationState.RECONCILE_REQUIRED)
+                    raise _Failure(
+                        "reconcile_required",
+                        "A backend write may have finished without being recorded",
+                        IndexState.RECONCILE_REQUIRED,
+                    )
+                # Nothing landed, so the write can simply be attempted again.
+                self._sources.abort_location_write(
+                    source.space_id, source.id, record.source_record_id, location.partition_id
+                )
+                if location.version is None:
+                    continue
+                location = replace(location, state=LocationState.INDEXED, target_version=None)
+            settled.append(location)
+        return settled
+
+    async def _place(
+        self,
+        source: Source,
+        record: RecordStatus,
+        partition_id: str,
+        locations: list[RecordLocation],
+        principal: PrincipalContext,
+    ) -> None:
+        """Make the current version searchable in the desired partition."""
+
+        target = next((item for item in locations if item.partition_id == partition_id), None)
+        replacing = target is not None and target.state is LocationState.INDEXED
+        if replacing and target.version == record.current_version:
+            return
+        if replacing and target.content_hash == record.content_hash:
+            # Same bytes under a new version number: nothing to rewrite (ADR 0007).
+            self._sources.confirm_location(
+                source.space_id,
+                source.id,
+                record.source_record_id,
+                partition_id,
+                record.current_version,
+                target.backend_ref or "",
+                record.content_hash or "",
+                None,
+            )
+            return
+        try:
+            extracted = self._content(record)
+        except _Failure:
+            # The current version cannot be indexed, so no older copy may stay searchable.
+            for location in locations:
+                await self._remove(source, record, location, principal)
+            raise
+        partition = AccessPartitionRef(partition_id)
+        backend_record = SourceRecord(
+            record_id=record.source_record_id,
+            source_id=source.id,
+            version=record.current_version,
+            content=extracted.text,
+            content_hash=record.content_hash or "",
+            source_url=record.source_url,
+            attributes=(("space_id", source.space_id),),
+        )
+        self._sources.begin_location_write(
+            source.space_id,
+            source.id,
+            record.source_record_id,
+            partition_id,
+            record.current_version,
+        )
+        try:
+            if replacing:
+                result = await self._backend.update(backend_record, principal, partition)
+            else:
+                result = await self._backend.ingest(backend_record, principal, partition)
+        except BackendError as exc:
+            self._handle_write_error(source, record, partition_id, exc)
+            raise
+        self._sources.confirm_location(
+            source.space_id,
+            source.id,
+            record.source_record_id,
+            partition_id,
+            record.current_version,
+            result.backend_reference.value,
+            record.content_hash or "",
+            extracted.parser_version,
+        )
+        self._metrics.increment("context_engine_index_writes_total")
+        if (
+            replacing
+            and target.version
+            and not await self._absent(partition_id, source, record, target.version, principal)
+        ):
+            self._sources.set_location_state(
+                source.space_id,
+                source.id,
+                record.source_record_id,
+                partition_id,
+                LocationState.RECONCILE_REQUIRED,
+            )
+            raise _Failure(
+                "residue_found",
+                "A replaced version is still searchable",
+                IndexState.RECONCILE_REQUIRED,
+            )
+        if not replacing and self._on_partition_bound is not None:
+            await self._on_partition_bound(partition_id, principal.trace_id)
+
+    def _handle_write_error(
+        self, source: Source, record: RecordStatus, partition_id: str, exc: BackendError
+    ) -> None:
+        key = (source.space_id, source.id, record.source_record_id, partition_id)
+        if exc.code is BackendErrorCode.PARTIAL_WRITE:
+            self._sources.set_location_state(*key, LocationState.RECONCILE_REQUIRED)
+            raise _Failure(
+                "backend_partial_write",
+                "The backend wrote part of the record",
+                IndexState.RECONCILE_REQUIRED,
+            ) from exc
+        if exc.code is BackendErrorCode.TIMEOUT:
+            # The write may or may not have landed; the next attempt checks before retrying.
+            return
+        self._sources.abort_location_write(*key)
+
+    async def _remove(
+        self,
+        source: Source,
+        record: RecordStatus,
+        location: RecordLocation,
+        principal: PrincipalContext,
+    ) -> None:
+        """Delete one copy and confirm that nothing of it stays searchable."""
+
+        if location.state is LocationState.RECONCILE_REQUIRED:
+            raise _Failure(
+                "reconcile_required",
+                "The record needs reconciliation before it can be removed",
+                IndexState.RECONCILE_REQUIRED,
+            )
+        self._set_location(source, record, location, LocationState.REMOVING)
+        if location.backend_ref:
+            try:
+                await self._backend.delete(
+                    BackendReference(location.backend_ref),
+                    principal,
+                    AccessPartitionRef(location.partition_id),
+                )
+            except BackendError as exc:
+                if exc.code is not BackendErrorCode.NOT_FOUND:
+                    raise
+        version = location.version or location.target_version
+        if version and not await self._absent(
+            location.partition_id, source, record, version, principal
+        ):
+            self._set_location(source, record, location, LocationState.RECONCILE_REQUIRED)
+            raise _Failure(
+                "residue_found",
+                "A removed copy is still searchable",
+                IndexState.RECONCILE_REQUIRED,
+            )
+        self._sources.drop_location(
+            source.space_id, source.id, record.source_record_id, location.partition_id
+        )
+        self._metrics.increment("context_engine_index_removals_total")
+
+    def _set_location(
+        self,
+        source: Source,
+        record: RecordStatus,
+        location: RecordLocation,
+        state: LocationState,
+    ) -> None:
+        self._sources.set_location_state(
+            source.space_id, source.id, record.source_record_id, location.partition_id, state
+        )
+
+    async def _absent(
+        self,
+        partition_id: str,
+        source: Source,
+        record: RecordStatus,
+        version: str,
+        principal: PrincipalContext,
+    ) -> bool:
+        partition = AccessPartitionRef(partition_id)
+        progress = await self._backend.indexing_progress(
+            IndexingProgressRequest(
+                source.id, (ExpectedRecord(partition, record.source_record_id, version),)
+            ),
+            principal,
+            (partition,),
+        )
+        return progress.missing == 1
+
+    def _content(self, record: RecordStatus) -> ExtractedText:
+        """Read and verify the current version's staged bytes, then extract its text."""
+
+        upload = self._sources.get_upload(record.content_ref) if record.content_ref else None
+        if upload is None:
+            raise _Failure("content_missing", "No staged content exists for the current version")
+        try:
+            data = self._staging.read(upload.id)
+        except FileNotFoundError as exc:
+            raise _Failure("content_missing", "Staged content was removed") from exc
+        # Bytes are checked again at execution time, not only when the event was accepted.
+        if "sha256:" + hashlib.sha256(data).hexdigest() != record.content_hash:
+            raise _Failure("content_mismatch", "Staged content no longer matches its hash")
+        try:
+            return extract(upload.content_type, data)
+        except ExtractionError as exc:
+            raise _Failure(exc.code, exc.message) from exc

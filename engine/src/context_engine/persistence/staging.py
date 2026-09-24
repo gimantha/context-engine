@@ -31,6 +31,11 @@ class StagingStore:
         os.replace(temporary, target)
         return target
 
+    def read(self, upload_id: str) -> bytes:
+        """Return the staged bytes; raises FileNotFoundError when they were released."""
+
+        return self.path_for(upload_id).read_bytes()
+
     def exists(self, upload_id: str) -> bool:
         """Return whether the staged bytes are present."""
 

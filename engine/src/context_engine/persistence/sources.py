@@ -11,8 +11,11 @@ from context_engine.domain import (
     AccessPartition,
     IndexingSnapshot,
     IndexingState,
+    IndexState,
     Job,
+    LocationState,
     RecordCounts,
+    RecordLocation,
     RecordOutcome,
     RecordState,
     RecordStatus,
@@ -88,6 +91,25 @@ def _record(row: Row) -> RecordStatus:
         created_at=datetime.fromisoformat(row["created_at"]),
         updated_at=datetime.fromisoformat(row["updated_at"]),
         partition_id=row["partition_id"],
+        source_url=row["source_url"],
+        index_state=IndexState(row["index_state"]),
+        index_error=row["index_error"],
+    )
+
+
+def _location(row: Row) -> RecordLocation:
+    return RecordLocation(
+        space_id=row["space_id"],
+        source_id=row["source_id"],
+        source_record_id=row["source_record_id"],
+        partition_id=row["partition_id"],
+        state=LocationState(row["state"]),
+        version=row["version"],
+        target_version=row["target_version"],
+        backend_ref=row["backend_ref"],
+        content_hash=row["content_hash"],
+        parser_version=row["parser_version"],
+        updated_at=datetime.fromisoformat(row["updated_at"]),
     )
 
 
@@ -489,6 +511,7 @@ class SourceRepository:
         if transition.outcome in {RecordOutcome.APPLIED, RecordOutcome.QUARANTINED}:
             operation = payload["operation"]
             mapped, _ = source.map_audience(tuple(payload.get("audience", ())))
+            source_url = row["source_url"] if row else None
             if operation == "delete":
                 content_hash = row["content_hash"] if row else None
                 content_ref = None
@@ -502,8 +525,23 @@ class SourceRepository:
             else:
                 content_hash = payload.get("contentHash")
                 content_ref = payload.get("contentRef")
+                source_url = payload.get("sourceUrl")
                 audience = mapped
                 acl_version = payload["sourceAclVersion"]
+            located = connection.execute(
+                """
+                SELECT 1 FROM record_locations
+                WHERE space_id = ? AND source_id = ? AND source_record_id = ? LIMIT 1
+                """,
+                (source.space_id, source.id, record_id),
+            ).fetchone()
+            # Pending means the backend still has to converge: write an active record, or remove
+            # copies of one that is no longer active. Nothing to do otherwise.
+            index_state = (
+                IndexState.PENDING
+                if transition.state is RecordState.ACTIVE or located
+                else IndexState.NOT_INDEXED
+            )
             partition_id = None
             if transition.state is RecordState.ACTIVE and audience:
                 # Records sharing the same mapped audiences share one partition.
@@ -526,8 +564,9 @@ class SourceRepository:
                 INSERT INTO source_records(
                     space_id, source_id, source_record_id, state, current_version,
                     source_acl_version, content_hash, content_ref, audience_json,
-                    quarantine_reason, created_at, updated_at, partition_id
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    quarantine_reason, created_at, updated_at, partition_id,
+                    source_url, index_state, index_error
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
                 ON CONFLICT(space_id, source_id, source_record_id) DO UPDATE SET
                     state = excluded.state,
                     current_version = excluded.current_version,
@@ -537,7 +576,10 @@ class SourceRepository:
                     audience_json = excluded.audience_json,
                     quarantine_reason = excluded.quarantine_reason,
                     updated_at = excluded.updated_at,
-                    partition_id = excluded.partition_id
+                    partition_id = excluded.partition_id,
+                    source_url = excluded.source_url,
+                    index_state = excluded.index_state,
+                    index_error = NULL
                 """,
                 (
                     source.space_id,
@@ -553,14 +595,17 @@ class SourceRepository:
                     row["created_at"] if row else now,
                     now,
                     partition_id,
+                    source_url,
+                    index_state.value,
                 ),
             )
         connection.execute(
             """
             INSERT INTO record_versions(
                 id, space_id, source_id, source_record_id, source_version, operation,
-                source_acl_version, content_hash, outcome, resulting_state, job_id, applied_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                source_acl_version, content_hash, outcome, resulting_state, job_id, applied_at,
+                content_ref
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 f"ver_{uuid4().hex}",
@@ -575,6 +620,7 @@ class SourceRepository:
                 transition.state.value,
                 job.id,
                 now,
+                payload.get("contentRef"),
             ),
         )
 
@@ -740,6 +786,266 @@ class SourceRepository:
                 "SELECT * FROM access_partitions WHERE id = ?", (partition_id,)
             ).fetchone()
         return _partition(row) if row else None
+
+    def ensure_partition(self, space_id: str, audiences: tuple[str, ...]) -> str:
+        """Register the partition for these audiences if needed and return its identifier."""
+
+        partition_id = partition_key(space_id, audiences)
+        with self.database.transaction() as connection:
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO access_partitions(id, space_id, audiences_json, created_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (
+                    partition_id,
+                    space_id,
+                    json.dumps(sorted(set(audiences)), separators=(",", ":")),
+                    _timestamp(),
+                ),
+            )
+        return partition_id
+
+    def list_all_partitions(self) -> tuple[AccessPartition, ...]:
+        """Return every partition, for full read-access synchronization."""
+
+        with self.database.connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM access_partitions ORDER BY created_at, id"
+            ).fetchall()
+        return tuple(_partition(row) for row in rows)
+
+    # Physical record locations in the knowledge backend
+
+    def list_locations(
+        self, space_id: str, source_id: str, source_record_id: str
+    ) -> tuple[RecordLocation, ...]:
+        """Return every backend copy of a record, in stable order."""
+
+        with self.database.connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM record_locations
+                WHERE space_id = ? AND source_id = ? AND source_record_id = ?
+                ORDER BY partition_id
+                """,
+                (space_id, source_id, source_record_id),
+            ).fetchall()
+        return tuple(_location(row) for row in rows)
+
+    def begin_location_write(
+        self,
+        space_id: str,
+        source_id: str,
+        source_record_id: str,
+        partition_id: str,
+        target_version: str,
+    ) -> None:
+        """Record the intent to write a version before calling the backend."""
+
+        with self.database.transaction() as connection:
+            connection.execute(
+                """
+                INSERT INTO record_locations(
+                    space_id, source_id, source_record_id, partition_id, state,
+                    version, target_version, updated_at
+                ) VALUES (?, ?, ?, ?, ?, NULL, ?, ?)
+                ON CONFLICT(space_id, source_id, source_record_id, partition_id) DO UPDATE SET
+                    state = excluded.state,
+                    target_version = excluded.target_version,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    space_id,
+                    source_id,
+                    source_record_id,
+                    partition_id,
+                    LocationState.WRITING.value,
+                    target_version,
+                    _timestamp(),
+                ),
+            )
+
+    def abort_location_write(
+        self, space_id: str, source_id: str, source_record_id: str, partition_id: str
+    ) -> None:
+        """Undo a write intent known not to have reached the backend."""
+
+        with self.database.transaction() as connection:
+            key = (space_id, source_id, source_record_id, partition_id)
+            clause = "space_id = ? AND source_id = ? AND source_record_id = ? AND partition_id = ?"
+            # A copy that already held a confirmed version returns to it; a new copy disappears.
+            connection.execute(
+                f"""
+                UPDATE record_locations SET state = ?, target_version = NULL, updated_at = ?
+                WHERE {clause} AND version IS NOT NULL
+                """,
+                (LocationState.INDEXED.value, _timestamp(), *key),
+            )
+            connection.execute(
+                f"DELETE FROM record_locations WHERE {clause} AND version IS NULL", key
+            )
+
+    def confirm_location(
+        self,
+        space_id: str,
+        source_id: str,
+        source_record_id: str,
+        partition_id: str,
+        version: str,
+        backend_ref: str,
+        content_hash: str,
+        parser_version: str | None,
+    ) -> None:
+        """Record that the backend now holds this version in this partition."""
+
+        with self.database.transaction() as connection:
+            connection.execute(
+                """
+                INSERT INTO record_locations(
+                    space_id, source_id, source_record_id, partition_id, state, version,
+                    target_version, backend_ref, content_hash, parser_version, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)
+                ON CONFLICT(space_id, source_id, source_record_id, partition_id) DO UPDATE SET
+                    state = excluded.state,
+                    version = excluded.version,
+                    target_version = NULL,
+                    backend_ref = excluded.backend_ref,
+                    content_hash = excluded.content_hash,
+                    parser_version = COALESCE(excluded.parser_version, parser_version),
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    space_id,
+                    source_id,
+                    source_record_id,
+                    partition_id,
+                    LocationState.INDEXED.value,
+                    version,
+                    backend_ref,
+                    content_hash,
+                    parser_version,
+                    _timestamp(),
+                ),
+            )
+
+    def set_location_state(
+        self,
+        space_id: str,
+        source_id: str,
+        source_record_id: str,
+        partition_id: str,
+        state: LocationState,
+    ) -> None:
+        """Mark a copy as being removed or as needing reconciliation."""
+
+        with self.database.transaction() as connection:
+            connection.execute(
+                """
+                UPDATE record_locations SET state = ?, updated_at = ?
+                WHERE space_id = ? AND source_id = ? AND source_record_id = ? AND partition_id = ?
+                """,
+                (state.value, _timestamp(), space_id, source_id, source_record_id, partition_id),
+            )
+
+    def drop_location(
+        self, space_id: str, source_id: str, source_record_id: str, partition_id: str
+    ) -> None:
+        """Drop a copy once the backend no longer holds it."""
+
+        with self.database.transaction() as connection:
+            connection.execute(
+                """
+                DELETE FROM record_locations
+                WHERE space_id = ? AND source_id = ? AND source_record_id = ? AND partition_id = ?
+                """,
+                (space_id, source_id, source_record_id, partition_id),
+            )
+
+    def set_index_state(
+        self,
+        space_id: str,
+        source_id: str,
+        source_record_id: str,
+        state: IndexState,
+        error: str | None = None,
+    ) -> None:
+        """Record whether the backend matches the ledger for one record."""
+
+        with self.database.transaction() as connection:
+            connection.execute(
+                """
+                UPDATE source_records SET index_state = ?, index_error = ?
+                WHERE space_id = ? AND source_id = ? AND source_record_id = ?
+                """,
+                (state.value, error, space_id, source_id, source_record_id),
+            )
+
+    def index_snapshot(self, source_id: str) -> IndexingSnapshot:
+        """Count a source's active records by index state; the ledger is the source of truth."""
+
+        with self.database.connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT index_state, COUNT(*) AS n FROM source_records
+                WHERE source_id = ? AND state = ? GROUP BY index_state
+                """,
+                (source_id, RecordState.ACTIVE.value),
+            ).fetchall()
+        counts = {row["index_state"]: row["n"] for row in rows}
+        indexed = counts.get(IndexState.INDEXED.value, 0)
+        pending = counts.get(IndexState.PENDING.value, 0)
+        failed = counts.get(IndexState.FAILED.value, 0) + counts.get(
+            IndexState.RECONCILE_REQUIRED.value, 0
+        )
+        return IndexingSnapshot(
+            source_id=source_id,
+            state=IndexingState.OK,
+            collected_at=datetime.now(UTC),
+            expected=indexed + pending + failed,
+            indexed=indexed,
+            indexing=pending,
+            failed=failed,
+            missing=0,
+        )
+
+    # Staged content release
+
+    def release_candidates(
+        self, space_id: str, source_id: str, source_record_id: str
+    ) -> tuple[str, ...]:
+        """Return this record's staged uploads that no live record still points at.
+
+        That covers every version of a deleted record and superseded versions of a live one.
+        """
+
+        with self.database.connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT DISTINCT v.content_ref AS upload_id FROM record_versions AS v
+                JOIN staged_uploads AS u ON u.id = v.content_ref AND u.released_at IS NULL
+                WHERE v.space_id = ? AND v.source_id = ? AND v.source_record_id = ?
+                    AND v.content_ref NOT IN (
+                        SELECT content_ref FROM source_records
+                        WHERE content_ref IS NOT NULL AND state != ?
+                    )
+                ORDER BY v.content_ref
+                """,
+                (space_id, source_id, source_record_id, RecordState.DELETED.value),
+            ).fetchall()
+        return tuple(row["upload_id"] for row in rows)
+
+    def mark_released(self, upload_ids: tuple[str, ...]) -> None:
+        """Record that staged bytes were removed; the metadata row stays for audit."""
+
+        if not upload_ids:
+            return
+        now = _timestamp()
+        with self.database.transaction() as connection:
+            connection.executemany(
+                "UPDATE staged_uploads SET released_at = ? WHERE id = ?",
+                [(now, upload_id) for upload_id in upload_ids],
+            )
 
 
 def _acl_key(source: Source, acl_version: str) -> tuple[int, int | str]:

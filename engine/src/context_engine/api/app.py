@@ -137,6 +137,7 @@ def create_app(
             StagingStore(settings.staging_path),
             upload_policy,
             settings.worker_max_attempts,
+            indexing_enabled=settings.knowledge_backend == "provider",
         )
 
     app = FastAPI(title="Context Engine API", version="0.4.0")

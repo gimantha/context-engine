@@ -87,6 +87,25 @@ class RecordOutcome(StrEnum):
     QUARANTINED = "quarantined"
 
 
+class IndexState(StrEnum):
+    """Whether the knowledge backend matches the ledger for one record."""
+
+    PENDING = "pending"
+    INDEXED = "indexed"
+    FAILED = "failed"
+    RECONCILE_REQUIRED = "reconcile_required"
+    NOT_INDEXED = "not_indexed"
+
+
+class LocationState(StrEnum):
+    """State of one physical copy of a record in one backend partition."""
+
+    WRITING = "writing"
+    INDEXED = "indexed"
+    REMOVING = "removing"
+    RECONCILE_REQUIRED = "reconcile_required"
+
+
 class SpaceState(StrEnum):
     """Lifecycle states of a public context space."""
 
@@ -250,6 +269,26 @@ class RecordStatus:
     updated_at: datetime
     # Private: the partition the record should live in, or None while quarantined or deleted.
     partition_id: str | None = None
+    source_url: str | None = None
+    index_state: IndexState = IndexState.PENDING
+    index_error: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class RecordLocation:
+    """One physical copy of a record in a backend partition; private reconciliation state."""
+
+    space_id: str
+    source_id: str
+    source_record_id: str
+    partition_id: str
+    state: LocationState
+    version: str | None
+    target_version: str | None
+    backend_ref: str | None
+    content_hash: str | None
+    parser_version: str | None
+    updated_at: datetime
 
 
 @dataclass(frozen=True, slots=True)

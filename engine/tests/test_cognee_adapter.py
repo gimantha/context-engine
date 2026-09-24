@@ -59,6 +59,12 @@ class FakeCogneeRuntime:
         self.calls.append(("list_items", binding.dataset_id))
         return list(self.items.get(binding.dataset_id, []))
 
+    async def grant_read(self, binding, reader, owner):
+        self.calls.append(("grant_read", binding.dataset_id, reader.id, owner.id))
+
+    async def revoke_read(self, binding, reader, owner):
+        self.calls.append(("revoke_read", binding.dataset_id, reader.id, owner.id))
+
     async def processing_states(self, bindings):
         self.calls.append(("processing_states", tuple(item.dataset_id for item in bindings)))
         return {
@@ -123,10 +129,11 @@ async def test_adapter_translates_native_values(record_factory):
     assert updated.backend_reference == ingested.backend_reference
     assert enriched.operation_id == "op-1"
     assert deleted.record_id == record.record_id
+    # Updates replace the item; the fake keeps one item id per record, so nothing is dropped.
     assert [call[0] for call in runtime.calls] == [
         "remember",
         "recall",
-        "update",
+        "remember",
         "improve",
         "forget",
     ]
@@ -236,3 +243,52 @@ async def test_adapter_attributes_native_processing_state_to_source_records(reco
     ) == (6, 1, 1, 1, 3)
     assert "DATASET" not in repr(progress) and "must-not-escape" not in repr(progress)
     assert scoped.value.code == BackendErrorCode.ACCESS_DENIED
+
+
+class _VersionedItemRuntime(FakeCogneeRuntime):
+    """Give every version its own native item, as the real provider does for new content."""
+
+    async def remember(self, record, binding, user):
+        result = await super().remember(record, binding, user)
+        item_id = str(uuid5(NAMESPACE_URL, f"{result.data_id}:{record.version}"))
+        return _NativeIngestion(result.dataset_id, item_id, True)
+
+
+@pytest.mark.asyncio
+async def test_update_replaces_the_item_and_drops_the_previous_one(record_factory):
+    runtime = _VersionedItemRuntime()
+    backend = CogneeBackend(runtime, resolve_user)
+    principal = PrincipalContext("engine-service", "trace-update")
+    partition = AccessPartitionRef("prt_update")
+
+    first = await backend.ingest(record_factory("doc-1", "1", "old"), principal, partition)
+    second = await backend.update(record_factory("doc-1", "2", "new"), principal, partition)
+
+    forgotten = [call for call in runtime.calls if call[0] == "forget"]
+    assert second.backend_reference != first.backend_reference
+    assert len(forgotten) == 1 and forgotten[0][2] == first.backend_reference.value.split(":")[2]
+    assert backend._state.get_record_reference(partition.value, "source-incidents", "doc-1") == (
+        second.backend_reference.value
+    )
+
+
+@pytest.mark.asyncio
+async def test_read_grants_act_as_the_owner_and_need_an_initialized_partition(record_factory):
+    runtime = FakeCogneeRuntime()
+    backend = CogneeBackend(runtime, resolve_user)
+    owner = PrincipalContext("engine-service", "trace-grant")
+    reader = PrincipalContext("prn_reader", "trace-grant")
+    partition = AccessPartitionRef("prt_grant")
+
+    with pytest.raises(BackendError) as uninitialized:
+        await backend.grant_read(partition, reader, owner)
+    await backend.ingest(record_factory("doc-1", "1", "a"), owner, partition)
+    await backend.grant_read(partition, reader, owner)
+    await backend.revoke_read(partition, reader, owner)
+
+    native = backend._bindings.resolve(partition).dataset_id
+    assert uninitialized.value.code == BackendErrorCode.NOT_FOUND
+    assert [call for call in runtime.calls if call[0] in {"grant_read", "revoke_read"}] == [
+        ("grant_read", native, "prn_reader", "engine-service"),
+        ("revoke_read", native, "prn_reader", "engine-service"),
+    ]

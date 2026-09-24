@@ -51,6 +51,7 @@ class DummyKnowledgeBackend:
         self._records: dict[str, dict[str, _StoredRecord]] = {}
         self._references: dict[str, tuple[str, str]] = {}
         self._query_cache: dict[tuple[str, tuple[str, ...], str], QueryResult] = {}
+        self._readers: dict[str, set[str]] = {}
 
     @staticmethod
     def _check_context(
@@ -221,6 +222,35 @@ class DummyKnowledgeBackend:
         self._references.pop(reference.value, None)
         self._invalidate(partition)
         return DeletionResult(record_id=record_id, deleted=True)
+
+    async def grant_read(
+        self,
+        partition: AccessPartitionRef,
+        reader: PrincipalContext,
+        principal: PrincipalContext,
+    ) -> None:
+        """Record a reader; like a real backend, an empty partition cannot be shared yet."""
+
+        self._check_context(principal, (partition,))
+        if partition.value not in self._records:
+            raise BackendError(BackendErrorCode.NOT_FOUND, "Access partition is not initialized")
+        self._readers.setdefault(partition.value, set()).add(reader.principal_id)
+
+    async def revoke_read(
+        self,
+        partition: AccessPartitionRef,
+        reader: PrincipalContext,
+        principal: PrincipalContext,
+    ) -> None:
+        """Remove a reader."""
+
+        self._check_context(principal, (partition,))
+        self._readers.get(partition.value, set()).discard(reader.principal_id)
+
+    def readers(self, partition: AccessPartitionRef) -> frozenset[str]:
+        """Return the recorded readers of a partition, for tests."""
+
+        return frozenset(self._readers.get(partition.value, set()))
 
     async def indexing_progress(
         self,
