@@ -3,6 +3,7 @@
 from .dummy import DummyKnowledgeBackend
 from .errors import BackendError, BackendErrorCode
 from .port import KnowledgeBackend
+from .state import BackendStateStore, InMemoryBackendState
 from .types import (
     AccessPartitionRef,
     BackendCapabilities,
@@ -29,6 +30,7 @@ __all__ = [
     "BackendErrorCode",
     "BackendHealth",
     "BackendReference",
+    "BackendStateStore",
     "DeletionResult",
     "EnrichmentRequest",
     "EnrichmentResult",
@@ -37,6 +39,7 @@ __all__ = [
     "DummyKnowledgeBackend",
     "IndexingProgress",
     "IndexingProgressRequest",
+    "InMemoryBackendState",
     "IngestionResult",
     "KnowledgeBackend",
     "PrincipalContext",

@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import inspect
+import json
 import os
+import secrets
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, Protocol
@@ -13,6 +15,7 @@ from uuid import UUID
 from context_engine.config import KnowledgeBackendSettings
 
 from ..errors import BackendError, BackendErrorCode
+from ..state import BackendStateStore, InMemoryBackendState
 from ..types import (
     AccessPartitionRef,
     BackendCapabilities,
@@ -80,6 +83,16 @@ class _CogneeRuntimePort(Protocol):
 
         ...
 
+    async def ensure_user(self, handle: str) -> Any:
+        """Return the native user with this deterministic handle, creating it once."""
+
+        ...
+
+    async def get_user(self, native_id: str) -> Any:
+        """Return a native user by its native identifier."""
+
+        ...
+
     async def list_items(self, binding: _CogneeBinding, user: Any) -> list[Any]:
         """List the native content items stored in one binding."""
 
@@ -97,29 +110,75 @@ class _CogneeRuntimePort(Protocol):
 
 
 class _BindingStore:
-    """Spike-only binding store; M1 replaces this with control-database persistence."""
+    """Resolve partition bindings through the engine's durable backend state."""
 
-    def __init__(self, prefix: str = "context-engine") -> None:
+    def __init__(self, state: BackendStateStore, prefix: str = "context-engine") -> None:
+        self._state = state
         self._prefix = prefix
-        self._bindings: dict[str, _CogneeBinding] = {}
 
     def resolve(self, partition: AccessPartitionRef) -> _CogneeBinding:
-        """Return or deterministically create the binding for a partition."""
+        """Return the stored binding, or the deterministic unbound one for a new partition."""
 
-        current = self._bindings.get(partition.value)
-        if current:
-            return current
+        stored = self._state.get_binding(partition.value)
+        if stored:
+            value = json.loads(stored)
+            return _CogneeBinding(dataset_name=value["name"], dataset_id=value.get("id"))
         # Hash the engine identifier so the native name discloses no caller-controlled value.
         suffix = hashlib.sha256(partition.value.encode()).hexdigest()[:20]
-        binding = _CogneeBinding(dataset_name=f"{self._prefix}-{suffix}")
-        self._bindings[partition.value] = binding
-        return binding
+        return _CogneeBinding(dataset_name=f"{self._prefix}-{suffix}")
 
     def set_dataset_id(self, partition: AccessPartitionRef, dataset_id: str) -> None:
-        """Attach the native isolation identifier learned during ingestion."""
+        """Persist the native isolation identifier learned during the first ingestion.
+
+        A partition that is already bound must never move to another native unit: that would
+        leave its earlier content behind under an identifier the engine no longer tracks.
+        """
 
         current = self.resolve(partition)
-        self._bindings[partition.value] = _CogneeBinding(current.dataset_name, dataset_id)
+        if current.dataset_id == dataset_id:
+            return
+        if current.dataset_id is not None:
+            raise BackendError(
+                BackendErrorCode.PARTIAL_WRITE,
+                "Provider bound the partition to an unexpected isolation unit",
+            )
+        encoded = json.dumps({"name": current.dataset_name, "id": dataset_id}, sort_keys=True)
+        self._state.put_binding(partition.value, encoded)
+
+
+class CogneeIdentityResolver:
+    """Map engine principals to native users durably; there is never a default user.
+
+    Each principal gets its own ordinary native account under a deterministic handle, so a
+    crash between creating the account and recording it recovers on the next call.
+    """
+
+    def __init__(self, runtime: _CogneeRuntimePort, state: BackendStateStore) -> None:
+        self._runtime = runtime
+        self._state = state
+
+    async def __call__(self, principal: PrincipalContext) -> Any:
+        """Return the native user for an engine principal."""
+
+        stored = self._state.get_identity(principal.principal_id)
+        if stored is not None:
+            return await self._runtime.get_user(stored)
+        user = await self._runtime.ensure_user(_native_handle(principal.principal_id))
+        native_id = str(getattr(user, "id", "") or "")
+        if not native_id:
+            raise BackendError(
+                BackendErrorCode.UNSUPPORTED, "Provider did not return a stable identity"
+            )
+        effective = self._state.claim_identity(principal.principal_id, native_id)
+        # A concurrent resolver may have claimed first; everyone uses the stored identity.
+        return user if effective == native_id else await self._runtime.get_user(effective)
+
+
+def _native_handle(principal_id: str) -> str:
+    """Return a deterministic native login handle that reveals nothing about the principal."""
+
+    digest = hashlib.sha256(principal_id.encode()).hexdigest()[:32]
+    return f"engine-{digest}@context-engine.invalid"
 
 
 def _native_reference(dataset_id: str, data_id: str) -> BackendReference:
@@ -141,13 +200,13 @@ class CogneeBackend:
         self,
         runtime: _CogneeRuntimePort,
         user_resolver: Callable[[PrincipalContext], Awaitable[Any]],
-        bindings: _BindingStore | None = None,
+        state: BackendStateStore | None = None,
     ) -> None:
         self._runtime = runtime
         self._user_resolver = user_resolver
-        self._bindings = bindings or _BindingStore()
-        self._record_references: dict[tuple[str, str], BackendReference] = {}
-        self._reference_records: dict[str, str] = {}
+        # Production passes the control-database store; the in-memory default serves tests.
+        self._state = state or InMemoryBackendState()
+        self._bindings = _BindingStore(self._state)
 
     @staticmethod
     def _partitions(value: tuple[AccessPartitionRef, ...]) -> None:
@@ -171,8 +230,9 @@ class CogneeBackend:
             result = await self._runtime.remember(record, self._bindings.resolve(partition), user)
             self._bindings.set_dataset_id(partition, result.dataset_id)
             reference = _native_reference(result.dataset_id, result.data_id)
-            self._record_references[(partition.value, record.record_id)] = reference
-            self._reference_records[reference.value] = record.record_id
+            self._state.put_record_reference(
+                partition.value, record.source_id, record.record_id, reference.value
+            )
             return IngestionResult(
                 record.record_id,
                 record.version,
@@ -220,9 +280,12 @@ class CogneeBackend:
         binding = self._bindings.resolve(partition)
         if binding.dataset_id is None:
             raise BackendError(BackendErrorCode.NOT_FOUND, "Access partition is not initialized")
-        reference = self._record_references.get((partition.value, record.record_id))
-        if reference is None:
+        stored = self._state.get_record_reference(
+            partition.value, record.source_id, record.record_id
+        )
+        if stored is None:
             raise BackendError(BackendErrorCode.NOT_FOUND, "Record binding is not initialized")
+        reference = BackendReference(stored)
         _, data_id = _parse_reference(reference)
         try:
             user = await self._user_resolver(principal)
@@ -272,9 +335,9 @@ class CogneeBackend:
         try:
             user = await self._user_resolver(principal)
             await self._runtime.forget(binding, data_id, user)
-            record_id = self._reference_records.pop(reference.value, "unknown")
-            if record_id != "unknown":
-                self._record_references.pop((partition.value, record_id), None)
+            location = self._state.find_record(reference.value)
+            record_id = location[2] if location and location[0] == partition.value else "unknown"
+            self._state.delete_record_reference(reference.value)
             return DeletionResult(record_id=record_id, deleted=True)
         except BackendError:
             raise
@@ -450,6 +513,35 @@ class CogneeRuntime:
             user=user,
         )
 
+    async def ensure_user(self, handle: str) -> Any:
+        """Find the ordinary native account for a handle, creating it on first use."""
+
+        self._module()
+        from cognee.modules.users.methods import create_user, get_user_by_email
+
+        existing = await get_user_by_email(handle)
+        if existing is not None:
+            return existing
+        try:
+            # The account is an internal handle; its password is never used or stored.
+            return await create_user(handle, secrets.token_urlsafe(32))
+        except Exception as exc:
+            if "alreadyexists" not in type(exc).__name__.lower():
+                raise
+            # Another process created it between the lookup and the create.
+            concurrent = await get_user_by_email(handle)
+            if concurrent is None:
+                raise
+            return concurrent
+
+    async def get_user(self, native_id: str) -> Any:
+        """Load a native account by its native identifier."""
+
+        self._module()
+        from cognee.modules.users.methods import get_user
+
+        return await get_user(UUID(native_id))
+
     async def list_items(self, binding: _CogneeBinding, user: Any) -> list[Any]:
         """List native content items in one binding with the resolved user."""
 
@@ -616,6 +708,21 @@ def assert_runtime_matches_pinned_sdk(runtime: CogneeRuntime | None = None) -> N
             raise RuntimeError(f"Pinned provider is missing {operation}")
         actual = set(inspect.signature(function).parameters)
         missing = parameters - actual
+        if missing:
+            raise RuntimeError(
+                f"Pinned provider {operation} signature is missing {sorted(missing)}"
+            )
+    from cognee.modules.users import methods as user_methods
+
+    for operation, parameters in {
+        "create_user": {"email", "password"},
+        "get_user": {"user_id"},
+        "get_user_by_email": {"user_email"},
+    }.items():
+        function = getattr(user_methods, operation, None)
+        if function is None:
+            raise RuntimeError(f"Pinned provider identity API is missing {operation}")
+        missing = parameters - set(inspect.signature(function).parameters)
         if missing:
             raise RuntimeError(
                 f"Pinned provider {operation} signature is missing {sorted(missing)}"

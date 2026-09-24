@@ -89,3 +89,7 @@ CONTEXT_ENGINE_RUN_LIVE_PROVIDER=true uv run --extra knowledge-provider pytest -
 ```
 
 Do not place credentials in this report or committed environment files.
+
+## Update (2026-09-24)
+
+The live test was rewritten for M4 slice 1. The engine's service identity now ingests every record and grants read access per reader before the isolation checks, which is how the worker will use the provider. It has still not been run: no model credentials are present in this workspace.

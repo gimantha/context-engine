@@ -26,3 +26,7 @@ M0 uses deterministic in-memory state to prove these semantics. M1 will persist 
 
 - Replay, update, conflict and cache invalidation in `engine/tests/test_backend_contract.py`.
 - Ordered fields in `contracts/schemas/ingestion-event.schema.json`.
+
+## Revision (2026-09-24, M4 slice 1)
+
+The control database now holds the backend's opaque state next to the ledger: partition bindings in `backend_bindings`, record references in `backend_record_refs`, and identities in `backend_identities`. The engine stores these values through the provider-neutral `BackendStateStore` protocol and never interprets or serializes them. The private adapter reads them on every call, so a restart loses nothing, and it refuses to move an already-bound partition to a different native unit.

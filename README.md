@@ -126,7 +126,7 @@ curl -X POST -H "Authorization: Bearer <connector token>" \
   http://127.0.0.1:8000/v1/sources/<source id>/sync-runs/<run id>/complete
 ```
 
-Indexing reports `not_collected` until provider-backed ingestion is enabled in M4.
+Indexing reports `not_collected` until provider-backed ingestion is enabled in M4. M4 slice 1 has landed: records carry durable partitions and the adapter's bindings, references, and identities live in the control database (see [the M4 report](docs/m4/implementation-report.md)).
 
 Interactive API documentation is available at `http://127.0.0.1:8000/docs`. Identity-provider integrations arrive in M6. Provider-backed execution arrives in M4.
 
@@ -151,7 +151,7 @@ set +a
 uv run pytest -m live_provider -v
 ```
 
-The test skips unless `CONTEXT_ENGINE_RUN_LIVE_PROVIDER=true` and `CONTEXT_ENGINE_MODEL_API_KEY` are present. Record verified results in [the spike report](docs/m0/spike-report.md) and update [the exit decision](docs/m0/exit-decision.md) only when the complete isolation, lifecycle, and residue checks pass.
+The test skips unless `CONTEXT_ENGINE_RUN_LIVE_PROVIDER=true` and `CONTEXT_ENGINE_MODEL_API_KEY` are present. It writes every record as the engine's service identity, `CONTEXT_ENGINE_SERVICE_PRINCIPAL_ID`, and grants read access to separate reader identities before checking isolation. Record verified results in [the spike report](docs/m0/spike-report.md) and update [the exit decision](docs/m0/exit-decision.md) only when the complete isolation, lifecycle, and residue checks pass.
 
 ## Development workflow
 
@@ -182,6 +182,7 @@ Changes to a public contract should update its examples and contract tests in th
 - The engine never fetches a supplied URL. `sourceUrl` is display provenance; bytes arrive through staged uploads delivered by a connector, whatever the source type.
 - The record ledger is authoritative. Versions compare under the source's declared ordering, an older event never replaces or resurrects a newer or deleted record, and records with an unmapped audience tag are quarantined.
 - Progress is read-only observability under `/v1/progress/`. It needs delivery or management rights on the source, and it never queries the knowledge backend on the request path; a worker collector stores indexing snapshots that the API reads (ADR 0010).
+- A partition holds the active records of one space that share exactly the same mapped audiences. A principal may read it when any of those audiences is one of its groups. The engine's service identity owns every provider unit; readers only ever receive read access.
 - Context spaces are public resources. Internal access partitions are resolved by policy and never accepted from or returned to callers.
 - Every backend data operation receives an explicit principal and explicit authorized partition scope. Missing or ambiguous scope fails closed.
 - Internal provider-backed worker code depends on the port in `engine/src/context_engine/knowledge_backend/`.
@@ -202,4 +203,5 @@ The full rationale and accepted terminology are in [ADR 0001](docs/decisions/000
 - [M1 implementation report](docs/m1/implementation-report.md)
 - [M2 implementation report](docs/m2/implementation-report.md)
 - [M3 implementation report](docs/m3/implementation-report.md)
+- [M4 implementation report](docs/m4/implementation-report.md)
 - [Coding-agent guide](AGENT.md)
