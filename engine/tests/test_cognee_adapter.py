@@ -516,6 +516,10 @@ async def test_runtime_pins_the_item_id_of_every_write(monkeypatch, record_facto
     listed[:] = [{"id": str(uuid4())}, {"id": str(pinned)}]
     written = await runtime.remember(record, binding, object())
     assert captured["data"].data_id == pinned and written.data_id == str(pinned)
+    # Content travels as an upload, never as a string the provider could read as a path.
+    upload = captured["data"].data
+    assert upload.file.read() == b"second version" and "second version" not in repr(upload)
+    assert upload.filename.startswith("<")
 
     listed[:] = [{"id": str(uuid4())}]
     with pytest.raises(BackendError) as unconfirmed:
