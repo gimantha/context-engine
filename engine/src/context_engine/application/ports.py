@@ -6,6 +6,7 @@ from datetime import datetime
 from typing import Any, Protocol
 
 from context_engine.domain import (
+    AccessPartition,
     Action,
     ContextSpace,
     Grant,
@@ -16,6 +17,7 @@ from context_engine.domain import (
     JobState,
     Principal,
     RecordCounts,
+    RecordLocation,
     RecordStatus,
     Source,
     SourceCheckpoint,
@@ -178,6 +180,32 @@ class SourceStore(Protocol):
 
     def index_snapshot(self, source_id: str) -> IndexingSnapshot:
         """Count a source's active records by index state from the ledger."""
+
+        ...
+
+    def list_partitions(self, space_id: str) -> tuple[AccessPartition, ...]:
+        """Return every partition of a space."""
+
+        ...
+
+    def indexed_partitions(self, space_id: str) -> frozenset[str]:
+        """Return the partitions of a space that hold at least one indexed copy."""
+
+        ...
+
+    def get_location(
+        self, space_id: str, source_id: str, source_record_id: str, partition_id: str
+    ) -> RecordLocation | None:
+        """Return one backend copy of a record when it exists."""
+
+        ...
+
+
+class ReadAccessResync(Protocol):
+    """Ask the worker to recompute backend read access at its next check."""
+
+    def invalidate(self) -> None:
+        """Force the next read-access check to run a full synchronization."""
 
         ...
 

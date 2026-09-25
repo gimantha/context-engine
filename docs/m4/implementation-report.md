@@ -1,10 +1,10 @@
 # M4 Knowledge-Backend Pipeline and Graph Lifecycle
 
-**Status:** Slices 1 and 2 of 3 implemented; the live-provider gate is still not run
+**Status:** All three slices implemented; the live-provider gate is still not run
 
 **Date:** 2026-09-24
 
-**Release limitation:** The provider-backed worker path is verified only against the deterministic backend. The M0 live isolation, stale-artifact, and deletion checks remain unverified, and there is no query route yet
+**Release limitation:** The provider-backed paths are verified only against the deterministic backend, and the provider's result shapes come from its pinned source rather than a live run. The M0 live isolation, stale-artifact, and deletion checks remain unverified
 
 ## Plan
 
@@ -12,7 +12,14 @@ M4 is delivered in three slices, each leaving the full non-live suite passing.
 
 1. **Foundations:** reader semantics, durable partitions, durable backend state, and the engine's service identity as owner of every provider unit. Delivered in this report.
 2. **Provider writes:** text extraction, ingest, update, and delete through the port with a visibility barrier and residue checks, partition moves on ACL changes, per-principal read grants, per-record indexing state in the ledger, deletion of staged bytes, and reconcile-required handling.
-3. **Reads:** a context-mode query endpoint with evidence translation, versioned enrichment jobs, and the indexing collector as a cross-check (ADR 0010).
+3. **Reads**, agreed on 2026-09-24:
+   - A context-mode `POST /v1/queries` that checks `context.read`, resolves the caller's partitions with the any-audience rule, queries the backend as the caller, and translates results into engine evidence. Answer mode stays in M5.
+   - A read-time visibility barrier: only records that are active and indexed at their current version and partition, per `record_locations`, may appear; passages without resolvable lineage are dropped (ADR 0008).
+   - The adapter pins its retriever and disables the provider's automatic routing before any query route exists.
+   - Enrichment jobs through `POST /v1/spaces/{spaceId}/enrichments`, run per partition as the service identity, with the job handler dispatching by operation.
+   - The indexing collector started in provider mode as a cross-check that marks disagreeing records reconcile-required (ADR 0010).
+   - The record-status route tightened to delivery or management rights.
+   - Wiring: the backend is built in the application layer through the port and factory and injected into the service, so the API package still never imports it. The API process then needs provider mode, the provider extra, and model keys.
 
 ## Slice 1 delivered
 
@@ -39,6 +46,20 @@ Migration `0005_partitions_and_backend_state.sql` adds `access_partitions`, `sou
 
 Migration `0006_provider_pipeline.sql` adds the ledger fields, `record_locations`, `backend_read_access`, and `read_access_sync`.
 
+## Slice 3 delivered
+
+- **Context queries.** `POST /v1/queries` checks `context.read`, resolves the caller's readable partitions with the any-audience rule, queries the backend as the caller, and returns engine evidence with record, source, version, passage, location, and source URL. Readers outside every audience receive an insufficient-evidence result. Answer mode is rejected until M5.
+- **Visibility barrier.** A passage is returned only when its record is active, indexed, in an allowed partition, and physically present there at its current version (ADR 0008 revision).
+- **Lineage through engine references.** The adapter resolves each retrieved chunk through the native item it names and the durable references the engine recorded. Unknown, replaced, or out-of-scope items are dropped.
+- **Pinned retriever.** The adapter uses the provider's hybrid retriever with automatic routing off.
+- **Backend refusals.** When the backend refuses a partition engine policy allows, the query falls back to one partition at a time and the worker is told to resynchronize read access.
+- **Enrichment jobs.** `POST /v1/spaces/{spaceId}/enrichments` needs `context.enrich`. The worker enriches each partition separately as the service identity and records the result on the job (ADR 0004 revision). Jobs are routed by operation; unsupported operations fail terminally.
+- **Cross-check.** The worker checks the backend against the ledger on a schedule, using the version whose content was written, and flags lost copies as reconcile-required (ADR 0010 revision).
+- **Record status tightened.** The route now needs delivery or management rights, like progress.
+- **Wiring.** The application layer builds the backend and injects it into the service; the API package still never imports it. The API process needs provider mode, the provider extra, and model keys to serve queries.
+
+Migration `0007_written_versions.sql` adds `record_locations.written_version`.
+
 ## Gate status
 
 | M4 gate item | Status | Evidence |
@@ -47,8 +68,8 @@ Migration `0006_provider_pipeline.sql` adds the ledger fields, `record_locations
 | Records map to deterministic partitions | Pass | `test_ledger_partitions.py` |
 | Bindings, references, and identities survive a restart | Pass | `test_backend_state.py` |
 | No default provider identity | Pass | Resolver tests; every principal gets its own account |
-| Query the ingested record through its context space | Slice 3 | |
-| Enrichment creates traceable derived data | Slice 3 | |
+| Query the ingested record through its context space | Pass against the deterministic backend | `test_query_api.py` |
+| Enrichment creates traceable derived data | Partly: enrichment runs per partition and is recorded on the job; the provider adapter reports no artifact lineage yet | `test_query_api.py` enrichment test |
 | Replacing a record supersedes old answers | Pass against the deterministic backend; live gate pending | `test_record_indexer.py` replacement and residue tests |
 | Deleting a record removes every searchable artifact | Pass against the deterministic backend for item-level residue; raw-file and graph residue pending the live scan | `test_record_indexer.py` deletion and residue tests |
 | Partial writes are never silently repeated | Pass | Crash-before and crash-after tests in `test_record_indexer.py` |
@@ -56,15 +77,15 @@ Migration `0006_provider_pipeline.sql` adds the ledger fields, `record_locations
 | Swapping in a test backend needs no application change | Holds so far | Dummy backend passes the shared contract tests |
 | No public payload exposes provider terms | Pass | Boundary check and contract tests |
 
-Validation performed on 2026-09-24 from `engine/`, after slice 2:
+Validation performed on 2026-09-25 from `engine/`, after slice 3:
 
 ```text
 ruff format --check: passed
 ruff check: passed
-pytest -m "not live_provider": 104 passed, 1 provider-extra check skipped, 1 live test deselected
+pytest -m "not live_provider": 116 passed, 1 provider-extra check skipped, 1 live test deselected
 context-engine-api --check: passed
 context-engine-worker --check: passed
-context-engine-migrate: applied 6 migrations to a fresh database
+context-engine-migrate: applied 7 migrations to a fresh database
 context-engine-worker --check with CONTEXT_ENGINE_KNOWLEDGE_BACKEND=provider: passed without the provider installed
 provider boundary check: passed
 ```

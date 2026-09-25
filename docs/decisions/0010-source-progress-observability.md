@@ -44,3 +44,7 @@ Reviewed on 2026-09-24 after noting that the provider reports status per native 
 ## Revision (2026-09-24, M4 slice 2)
 
 Indexing progress now comes from the ledger, as the granularity decision above anticipated. When the worker runs with the provider backend (`CONTEXT_ENGINE_KNOWLEDGE_BACKEND=provider`), each active record carries an index state (`pending`, `indexed`, `failed`, or `reconcile_required`), and the progress route counts them. With the backend disabled, indexing still reports `not_collected`. The collector snapshots remain in place for the cross-check planned in slice 3.
+
+## Revision (2026-09-25, M4 slice 3)
+
+The collector now runs in the worker as a cross-check every `CONTEXT_ENGINE_INDEXING_CHECK_SECONDS` (default 300). It asks the backend about every copy the ledger calls indexed, using the version whose content was actually written. That matters when a new version with identical content was confirmed without a rewrite and the provider's metadata still names the earlier version. When a source's counts disagree, it probes each copy and marks those that are missing or in a failed provider run as reconcile-required with `backend_mismatch`.

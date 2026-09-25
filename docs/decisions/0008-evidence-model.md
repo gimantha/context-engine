@@ -33,3 +33,11 @@ The caller-safe trace lists selected engine evidence IDs and outcome. It never i
 - `engine/tests/test_cognee_adapter.py` verifies native fields do not escape.
 - `engine/tests/test_public_boundary.py` verifies safe serialization.
 - OpenAPI evidence and trace schemas use engine identifiers only.
+
+## Revision (2026-09-25, M4 slice 3)
+
+- **Queries run as the caller.** Engine policy resolves the partitions the caller may read, then the backend is asked as the caller, so the provider's own read check applies as defense in depth. If the backend refuses a partition the engine allows, the engine asks one partition at a time, skips refusals, and makes the worker resynchronize read access.
+- **Lineage comes from the engine's own references.** The private adapter resolves each retrieved chunk through the native item it names and the durable references the engine recorded when it wrote that item. Chunks from items the engine did not write, from replaced versions whose reference is gone, or from partitions outside the request are dropped.
+- **The ledger has the last word.** Before returning, the query service keeps a passage only when its record is active, indexed, in a partition the caller may read, and physically present there at its current version. The public version always comes from the ledger. Denied readers receive an insufficient-evidence result with no hint of what exists.
+- **The retriever is pinned.** The adapter always uses the provider's hybrid retriever with automatic routing off, so no question can be routed to raw graph queries.
+- Validation: `engine/tests/test_query_api.py` and the structured-result and pinned-retriever tests in `engine/tests/test_cognee_adapter.py`. The provider's result shapes were taken from its pinned source; the live run has not confirmed them.

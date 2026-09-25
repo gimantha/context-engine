@@ -128,7 +128,17 @@ curl -X POST -H "Authorization: Bearer <connector token>" \
 
 Indexing reports `not_collected` while the worker is ledger-only.
 
-To index content into the knowledge backend, install the provider extra, copy `local/m4.env.example` to `engine/.env`, fill in the model and embedding keys, and start the worker as usual. With `CONTEXT_ENGINE_KNOWLEDGE_BACKEND=provider`, the worker extracts text from staged bytes, writes each record into its partition as the engine's service identity, replaces and moves copies as versions and audiences change, removes copies of deleted records, and grants read access that matches engine policy. Each record's `indexState` on the record-status route and the indexing section of the progress route show how far it got. See [the M4 report](docs/m4/implementation-report.md); the provider path has only been verified against the deterministic backend so far.
+To index content into the knowledge backend, install the provider extra, copy `local/m4.env.example` to `engine/.env`, fill in the model and embedding keys, and start the worker as usual. With `CONTEXT_ENGINE_KNOWLEDGE_BACKEND=provider`, the worker extracts text from staged bytes, writes each record into its partition as the engine's service identity, replaces and moves copies as versions and audiences change, removes copies of deleted records, and grants read access that matches engine policy. Each record's `indexState` on the record-status route and the indexing section of the progress route show how far it got. Run the API with the same profile to serve queries and enrichment. A member of a record's audience with `context.read` on the space can then ask for passages, and a principal with `context.enrich` can start an enrichment:
+
+```bash
+curl -H "Authorization: Bearer <reader token>" -H "Content-Type: application/json" \
+  -d '{"spaceId": "<space id>", "question": "rollback checkpoint", "mode": "context"}' \
+  http://127.0.0.1:8000/v1/queries
+curl -X POST -H "Authorization: Bearer <enricher token>" -H "Idempotency-Key: enrich-000001" \
+  http://127.0.0.1:8000/v1/spaces/<space id>/enrichments
+```
+
+See [the M4 report](docs/m4/implementation-report.md); the provider path has only been verified against the deterministic backend so far.
 
 Interactive API documentation is available at `http://127.0.0.1:8000/docs`. Identity-provider integrations arrive in M6. Provider-backed execution arrives in M4.
 
@@ -182,6 +192,7 @@ Changes to a public contract should update its examples and contract tests in th
 - Effective permissions come from grants on a resource and its ancestors. Grants on the root resource `engine` apply to every context space. A principal that holds no action on a resource receives not-found, never a hint that the resource exists.
 - A connector's delivery right is a grant of `ingest.write` on the source. The ingestion body cannot pick a space or source the credential is not bound to, and staged content must match the event's type and hash.
 - The worker converges the knowledge backend to the ledger record by record. It records each write's intent before calling the backend, checks that removed and replaced versions are gone, and marks a record reconcile-required rather than writing twice after a crash (ADR 0007).
+- Queries resolve readable partitions from engine policy, ask the backend as the caller, and return a passage only when the ledger shows its record active and indexed at its current version where the caller may read. The adapter pins its retriever and never lets the provider route a question.
 - The engine never fetches a supplied URL. `sourceUrl` is display provenance; bytes arrive through staged uploads delivered by a connector, whatever the source type.
 - The record ledger is authoritative. Versions compare under the source's declared ordering, an older event never replaces or resurrects a newer or deleted record, and records with an unmapped audience tag are quarantined.
 - Progress is read-only observability under `/v1/progress/`. It needs delivery or management rights on the source, and it never queries the knowledge backend on the request path; a worker collector stores indexing snapshots that the API reads (ADR 0010).
