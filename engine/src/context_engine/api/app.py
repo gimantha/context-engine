@@ -17,9 +17,11 @@ from context_engine.application import (
     ContextEngineService,
     NotFoundError,
     PayloadTooLargeError,
+    ServiceUnavailableError,
     UnauthenticatedError,
     UnsupportedContentTypeError,
     UploadPolicy,
+    build_query_backend,
 )
 from context_engine.config import Settings
 from context_engine.domain import JobState, SourceState, VersionOrdering
@@ -33,6 +35,7 @@ from context_engine.persistence import (
     AuthorizationRepository,
     ControlDatabase,
     ControlPlaneRepository,
+    ReadAccessRepository,
     SourceRepository,
     StagingStore,
 )
@@ -48,6 +51,8 @@ from context_engine.security.identity import (
 from .progress import build_progress_router
 from .schemas import (
     CheckpointResponse,
+    ContextQueryRequest,
+    ContextQueryResponse,
     ContextSpaceResponse,
     CreateContextSpaceRequest,
     EffectivePermissionsResponse,
@@ -93,6 +98,8 @@ def _error_status(error: ApplicationError) -> int:
         return 413
     if isinstance(error, UnsupportedContentTypeError):
         return 415
+    if isinstance(error, ServiceUnavailableError):
+        return 503
     return 400
 
 
@@ -108,8 +115,13 @@ def create_app(
     database: ControlDatabase | None = None,
     metrics: MetricsRegistry | None = None,
     verifier: TokenVerifier | None = None,
+    knowledge_backend: object | None = None,
 ) -> FastAPI:
-    """Build the REST application and wire its control-plane dependencies."""
+    """Build the REST application and wire its control-plane dependencies.
+
+    `knowledge_backend` lets tests inject a backend; it is typed opaquely because this package
+    never depends on the backend port. Otherwise the application layer builds it from settings.
+    """
 
     settings = settings or Settings.from_env()
     configure_logging(settings.log_level)
@@ -127,6 +139,7 @@ def create_app(
         content_types=frozenset(settings.upload_content_types),
     )
     if service is None:
+        backend = knowledge_backend or build_query_backend(settings, database)
         repository = ControlPlaneRepository(database)
         service = ContextEngineService(
             repository,
@@ -138,6 +151,8 @@ def create_app(
             upload_policy,
             settings.worker_max_attempts,
             indexing_enabled=settings.knowledge_backend == "provider",
+            knowledge_backend=backend,  # type: ignore[arg-type]
+            read_access=ReadAccessRepository(database),
         )
 
     app = FastAPI(title="Context Engine API", version="0.4.0")
@@ -464,6 +479,38 @@ def create_app(
     ) -> list[JobResponse]:
         jobs = service.list_source_jobs(principal, source_id, JobState(state) if state else None)
         return [JobResponse.from_domain(job) for job in jobs]
+
+    @app.post(
+        "/v1/queries",
+        response_model=ContextQueryResponse,
+        response_model_by_alias=True,
+        response_model_exclude_none=True,
+    )
+    async def query_context(
+        body: ContextQueryRequest,
+        principal: AuthenticatedPrincipal = Depends(current_principal),
+    ) -> ContextQueryResponse:
+        result = await service.query_context(
+            principal, body.space_id, body.question, body.mode, body.limit
+        )
+        return ContextQueryResponse.from_domain(result)
+
+    @app.post(
+        "/v1/spaces/{space_id}/enrichments",
+        response_model=JobAcceptedResponse,
+        response_model_by_alias=True,
+        status_code=202,
+    )
+    async def accept_enrichment(
+        space_id: ResourceId,
+        response: Response,
+        idempotency_key: IdempotencyKey,
+        principal: AuthenticatedPrincipal = Depends(current_principal),
+    ) -> JobAcceptedResponse:
+        job = service.accept_enrichment(principal, space_id, idempotency_key)
+        status_url = f"/v1/jobs/{job.id}"
+        response.headers["Location"] = status_url
+        return JobAcceptedResponse(jobId=job.id, statusUrl=status_url)
 
     @app.post(
         "/v1/ingestions",

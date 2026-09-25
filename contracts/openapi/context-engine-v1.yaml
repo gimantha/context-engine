@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Context Engine API
-  version: 0.6.0
+  version: 0.7.0
   description: Provider-neutral API draft for governed context spaces.
 servers:
   - url: /v1
@@ -239,7 +239,9 @@ paths:
   /sources/{sourceId}/records/{recordId}:
     get:
       operationId: getRecordStatus
-      description: Record lifecycle without content, audiences, or backend details.
+      description: >-
+        Record lifecycle without content, audiences, or backend details. Requires ingest.write,
+        source.manage, or space.manage on the source.
       parameters:
         - $ref: "#/components/parameters/SourceId"
         - name: recordId
@@ -417,6 +419,11 @@ paths:
   /queries:
     post:
       operationId: createQuery
+      description: >-
+        Context mode returns authorized, source-linked passages. Requires context.read on the
+        space; only records whose audiences include one of the caller's groups can appear, and
+        every passage is checked against the ledger before it is returned. Answer mode is not
+        available yet and is rejected. A deployment without the knowledge backend answers 503.
       requestBody:
         required: true
         content:
@@ -432,6 +439,16 @@ paths:
                 $ref: "#/components/schemas/QueryResponse"
         "202":
           $ref: "#/components/responses/JobAccepted"
+        "400":
+          $ref: "#/components/responses/Error"
+        "401":
+          $ref: "#/components/responses/Error"
+        "403":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
+        "503":
+          $ref: "#/components/responses/Error"
   /queries/{queryId}:
     get:
       operationId: getQuery
@@ -491,12 +508,25 @@ paths:
   /spaces/{spaceId}/enrichments:
     post:
       operationId: createContextEnrichment
+      description: >-
+        Queue a versioned enrichment of the space. Requires context.enrich. Each internal
+        isolation unit is enriched separately, so derived data never spans reader sets.
       parameters:
         - $ref: "#/components/parameters/SpaceId"
         - $ref: "#/components/parameters/IdempotencyKey"
       responses:
         "202":
           $ref: "#/components/responses/JobAccepted"
+        "401":
+          $ref: "#/components/responses/Error"
+        "403":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
+        "409":
+          $ref: "#/components/responses/Error"
+        "503":
+          $ref: "#/components/responses/Error"
   /records/{recordId}:
     delete:
       operationId: deleteRecord

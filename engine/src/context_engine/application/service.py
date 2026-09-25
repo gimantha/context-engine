@@ -9,15 +9,22 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass
+from uuid import uuid4
 
 from context_engine.domain import (
     ROOT_RESOURCE_ID,
     Action,
+    ContextQueryResult,
     ContextSpace,
     Grant,
+    IndexState,
     IngestionCommand,
     Job,
+    JobOperation,
     JobState,
+    LocationState,
+    PublicEvidence,
+    RecordState,
     RecordStatus,
     Source,
     SourceCheckpoint,
@@ -28,23 +35,43 @@ from context_engine.domain import (
     SyncRunState,
     VersionOrdering,
 )
+from context_engine.knowledge_backend import (
+    AccessPartitionRef,
+    BackendError,
+    BackendErrorCode,
+    EvidenceItem,
+    KnowledgeBackend,
+    PrincipalContext,
+    QueryRequest,
+)
 from context_engine.observability import MetricsRegistry
 from context_engine.persistence import IdempotencyConflict
 from context_engine.security.authorization import Authorizer
 from context_engine.security.identity import AuthenticatedPrincipal
+from context_engine.security.policy import PolicyInput, authorize
 
 from .errors import (
     AccessDeniedError,
     ConflictError,
     NotFoundError,
     PayloadTooLargeError,
+    ServiceUnavailableError,
     UnsupportedContentTypeError,
     ValidationError,
 )
-from .ports import ControlPlaneStore, GrantStore, SourceStore, StagedBytes, utc_now
+from .ports import (
+    ControlPlaneStore,
+    GrantStore,
+    ReadAccessResync,
+    SourceStore,
+    StagedBytes,
+    utc_now,
+)
 
 _MANAGE_SOURCES = frozenset({Action.SOURCE_MANAGE, Action.SPACE_MANAGE})
 _INSPECT_DELIVERIES = frozenset({Action.SOURCE_MANAGE, Action.SPACE_MANAGE, Action.INGEST_WRITE})
+ENRICHMENT_PIPELINE_VERSION = "enrich@1"
+_RETRY_ONE_BY_ONE = frozenset({BackendErrorCode.ACCESS_DENIED, BackendErrorCode.NOT_FOUND})
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,6 +98,8 @@ class ContextEngineService:
         max_job_attempts: int = 5,
         *,
         indexing_enabled: bool = False,
+        knowledge_backend: KnowledgeBackend | None = None,
+        read_access: ReadAccessResync | None = None,
     ) -> None:
         self._store = store
         self._grants = grants
@@ -81,6 +110,8 @@ class ContextEngineService:
         self._upload_policy = upload_policy
         self._max_job_attempts = max_job_attempts
         self._indexing_enabled = indexing_enabled
+        self._backend = knowledge_backend
+        self._read_access = read_access
 
     # Authorization helpers
 
@@ -458,10 +489,201 @@ class ContextEngineService:
         """Return a record's lifecycle state without content or backend details."""
 
         source = self._visible_source(principal, source_id)
+        # Status reveals versions and states for any record id, so readers are not enough.
+        self._require_any(principal, _INSPECT_DELIVERIES, source_id)
         record = self._sources.get_record(source.space_id, source.id, record_id)
         if record is None:
             raise NotFoundError("Record not found")
         return record
+
+    # Context queries
+
+    async def query_context(
+        self,
+        principal: AuthenticatedPrincipal,
+        space_id: str,
+        question: str,
+        mode: str,
+        limit: int,
+    ) -> ContextQueryResult:
+        """Return authorized, source-linked passages for a question in one space.
+
+        Engine policy picks the partitions first, the backend is asked as the caller so its
+        own read checks apply, and every passage then passes the visibility barrier against
+        the ledger. Nothing is persisted yet; query history and answers arrive with M5.
+        """
+
+        self.get_context_space(principal, space_id)
+        self._require(principal, Action.CONTEXT_READ, space_id)
+        if mode != "context":
+            raise ValidationError("Answer mode is not available yet; use context mode")
+        if not question.strip():
+            raise ValidationError("Question is required")
+        if self._backend is None:
+            raise ServiceUnavailableError("Context queries need the knowledge backend")
+        query_id = f"qry_{uuid4().hex}"
+        partitions = self._readable_partitions(principal, space_id)
+        self._metrics.increment("context_engine_queries_total")
+        if not partitions:
+            # No hint about what exists outside the caller's audiences.
+            return ContextQueryResult(query_id, (), True, principal.trace_id)
+        caller = PrincipalContext(principal.principal_id, principal.trace_id)
+        retrieved = await self._retrieve(QueryRequest(question, limit), caller, partitions)
+        evidence = self._visible_evidence(space_id, partitions, retrieved)[:limit]
+        return ContextQueryResult(query_id, evidence, not evidence, principal.trace_id)
+
+    def _readable_partitions(
+        self, principal: AuthenticatedPrincipal, space_id: str
+    ) -> tuple[AccessPartitionRef, ...]:
+        indexed = self._sources.indexed_partitions(space_id)
+        candidates = tuple(
+            (AccessPartitionRef(item.id), frozenset(item.audiences))
+            for item in self._sources.list_partitions(space_id)
+            if item.id in indexed
+        )
+        actions = self._authorizer.effective_actions(
+            principal.principal_id, principal.groups, space_id
+        )
+        decision = authorize(
+            PolicyInput(
+                principal_id=principal.principal_id,
+                action=Action.CONTEXT_READ,
+                space_id=space_id,
+                granted_actions=actions or frozenset(),
+                principal_audiences=principal.groups,
+                partition_audiences=candidates,
+                policy_version=str(self._authorizer.policy_version()),
+            )
+        )
+        return decision.partitions if decision.allowed else ()
+
+    async def _retrieve(
+        self,
+        request: QueryRequest,
+        caller: PrincipalContext,
+        partitions: tuple[AccessPartitionRef, ...],
+    ) -> tuple[EvidenceItem, ...]:
+        """Ask the backend; if it refuses a partition the engine allows, ask one at a time."""
+
+        assert self._backend is not None
+        try:
+            return (await self._backend.query(request, caller, partitions)).evidence
+        except BackendError as exc:
+            if exc.code not in _RETRY_ONE_BY_ONE:
+                raise ServiceUnavailableError("Context retrieval failed") from exc
+        # The backend's read access lags engine policy; have the worker resynchronize it.
+        self._metrics.increment("context_engine_query_backend_refusals_total")
+        if self._read_access is not None:
+            self._read_access.invalidate()
+        collected: list[EvidenceItem] = []
+        for partition in partitions:
+            try:
+                collected.extend(
+                    (await self._backend.query(request, caller, (partition,))).evidence
+                )
+            except BackendError as exc:
+                if exc.code not in _RETRY_ONE_BY_ONE:
+                    raise ServiceUnavailableError("Context retrieval failed") from exc
+        return tuple(collected)
+
+    def _visible_evidence(
+        self,
+        space_id: str,
+        partitions: tuple[AccessPartitionRef, ...],
+        retrieved: tuple[EvidenceItem, ...],
+    ) -> tuple[PublicEvidence, ...]:
+        """Keep only passages of records that are live and indexed where the caller may read.
+
+        This is the visibility barrier (ADR 0007, ADR 0008): the ledger, not the backend,
+        decides what may be shown, so leftovers, stale versions, and records mid-move stay out.
+        """
+
+        allowed = {item.value for item in partitions}
+        visible: dict[str, PublicEvidence] = {}
+        dropped = 0
+        for item in retrieved:
+            record = self._sources.get_record(space_id, item.source_id, item.record_id)
+            location = (
+                self._sources.get_location(
+                    space_id, item.source_id, item.record_id, record.partition_id
+                )
+                if record is not None and record.partition_id
+                else None
+            )
+            if (
+                record is None
+                or location is None
+                or record.state is not RecordState.ACTIVE
+                or record.index_state is not IndexState.INDEXED
+                or record.partition_id not in allowed
+                or location.state is not LocationState.INDEXED
+                or location.version != record.current_version
+                or (
+                    item.source_version
+                    and item.source_version
+                    not in {record.current_version, location.written_version}
+                )
+                or not item.passage.strip()
+            ):
+                dropped += 1
+                continue
+            digest = hashlib.sha256(
+                "\0".join(
+                    (
+                        space_id,
+                        item.source_id,
+                        item.record_id,
+                        record.current_version,
+                        item.location or "",
+                        item.passage,
+                    )
+                ).encode()
+            ).hexdigest()[:24]
+            evidence_id = f"evi_{digest}"
+            visible.setdefault(
+                evidence_id,
+                PublicEvidence(
+                    id=evidence_id,
+                    record_id=item.record_id,
+                    source_id=item.source_id,
+                    source_version=record.current_version,
+                    passage=item.passage,
+                    location=item.location,
+                    source_url=record.source_url,
+                ),
+            )
+        if dropped:
+            self._metrics.increment("context_engine_evidence_suppressed_total", dropped)
+        return tuple(visible.values())
+
+    # Enrichment
+
+    def accept_enrichment(
+        self, principal: AuthenticatedPrincipal, space_id: str, idempotency_key: str
+    ) -> Job:
+        """Queue a versioned enrichment of a space for a principal holding context.enrich."""
+
+        self.get_context_space(principal, space_id)
+        self._require(principal, Action.CONTEXT_ENRICH, space_id)
+        if not self._indexing_enabled:
+            raise ServiceUnavailableError("Enrichment needs the knowledge backend")
+        try:
+            job, created = self._store.enqueue_job(
+                JobOperation.ENRICHMENT,
+                idempotency_key,
+                {"spaceId": space_id, "pipelineVersion": ENRICHMENT_PIPELINE_VERSION},
+                principal.trace_id,
+                self._max_job_attempts,
+                principal.principal_id,
+            )
+        except IdempotencyConflict as exc:
+            raise ConflictError("Idempotency key is already bound to another request") from exc
+        self._metrics.increment(
+            "context_engine_enrichments_accepted_total"
+            if created
+            else "context_engine_jobs_replayed_total"
+        )
+        return job
 
     # Grants
 

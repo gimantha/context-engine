@@ -289,6 +289,8 @@ class RecordLocation:
     content_hash: str | None
     parser_version: str | None
     updated_at: datetime
+    # The version whose content the backend holds; see migration 0007.
+    written_version: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -394,6 +396,29 @@ class SourceProgress:
     jobs: JobCounts
     records: RecordCounts
     indexing: IndexingSnapshot | None
+
+
+@dataclass(frozen=True, slots=True)
+class PublicEvidence:
+    """Authorized, source-linked passage that has passed the read-time visibility barrier."""
+
+    id: str
+    record_id: str
+    source_id: str
+    source_version: str
+    passage: str
+    location: str | None
+    source_url: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class ContextQueryResult:
+    """Outcome of one context-mode query; answers arrive with M5."""
+
+    query_id: str
+    evidence: tuple[PublicEvidence, ...]
+    insufficient_evidence: bool
+    trace_id: str
 
 
 @dataclass(frozen=True, slots=True)

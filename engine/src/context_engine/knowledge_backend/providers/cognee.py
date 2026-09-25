@@ -262,14 +262,70 @@ class CogneeBackend:
         try:
             user = await self._user_resolver(principal)
             native_results = await self._runtime.recall(request, bindings, user)
-            evidence = tuple(
-                _translate_evidence(item, index) for index, item in enumerate(native_results)
-            )
+            units = {
+                binding.dataset_id: partition.value
+                for binding, partition in zip(bindings, authorized_partitions, strict=True)
+                if binding.dataset_id
+            }
+            evidence = self._translate_results(native_results, units)
             return QueryResult(evidence[: request.limit], insufficient_evidence=not evidence)
         except BackendError:
             raise
         except Exception as exc:
             raise _translate_error(exc) from exc
+
+    def _translate_results(
+        self, native_results: list[Any], units: dict[str, str]
+    ) -> tuple[EvidenceItem, ...]:
+        """Turn retrieved native chunks into engine evidence through durable references.
+
+        Every chunk names the native item it came from. Only items the engine wrote, whose
+        reference is still recorded, and that sit in an authorized partition become evidence;
+        anything else, including leftovers of replaced versions, stays out (ADR 0008). The
+        version is left to the engine, which takes it from the ledger.
+        """
+
+        evidence: dict[str, EvidenceItem] = {}
+        single_unit = next(iter(units)) if len(units) == 1 else None
+        for index, native in enumerate(native_results):
+            entry = _as_mapping(native)
+            chunks = _native_chunks(entry)
+            if not chunks:
+                legacy = _translate_evidence(native, index)
+                if not legacy.record_id.startswith("unresolved"):
+                    evidence.setdefault(legacy.evidence_id, legacy)
+                continue
+            raw = _as_mapping(entry.get("raw"))
+            unit = str(entry.get("dataset_id") or raw.get("dataset_id") or single_unit or "")
+            partition = units.get(unit)
+            if partition is None:
+                continue
+            for chunk in chunks:
+                payload = _as_mapping(chunk.get("payload")) or chunk
+                item_id = payload.get("document_id")
+                passage = str(payload.get("text") or "").strip()
+                if not item_id or not passage:
+                    continue
+                location = self._state.find_record(_native_reference(unit, str(item_id)).value)
+                if location is None or location[0] != partition:
+                    continue
+                _, source_id, record_id = location
+                chunk_id = str(chunk.get("id") or payload.get("id") or "")
+                digest = hashlib.sha256(
+                    f"{partition}\0{source_id}\0{record_id}\0{chunk_id}\0{passage}".encode()
+                ).hexdigest()[:24]
+                chunk_index = payload.get("chunk_index")
+                item = EvidenceItem(
+                    evidence_id=f"evi_{digest}",
+                    record_id=record_id,
+                    source_id=source_id,
+                    source_version="",
+                    passage=passage,
+                    score=float(chunk.get("score") or 0.0),
+                    location=f"chunk:{chunk_index}" if chunk_index is not None else None,
+                )
+                evidence.setdefault(item.evidence_id, item)
+        return tuple(evidence.values())
 
     async def update(
         self,
@@ -529,12 +585,18 @@ class CogneeRuntime:
     async def recall(
         self, request: QueryRequest, bindings: tuple[_CogneeBinding, ...], user: Any
     ) -> list[Any]:
-        """Invoke native retrieval with explicit binding identifiers."""
+        """Invoke native retrieval with the pinned retriever and explicit binding identifiers."""
 
         cognee = self._module()
+        from cognee.modules.search.types import SearchType
+
         ids = [UUID(item.dataset_id) for item in bindings if item.dataset_id]
+        # A fixed retriever keeps result shapes stable, and turning routing off means no
+        # question can be routed to raw graph queries however it is phrased.
         return await cognee.recall(
             query_text=request.text,
+            query_type=SearchType.HYBRID_COMPLETION,
+            auto_route=False,
             dataset_ids=ids,
             top_k=request.limit,
             only_context=True,
@@ -678,6 +740,30 @@ def _translate_evidence(value: Any, index: int) -> EvidenceItem:
 _PROCESSING_PIPELINE = "cognify_pipeline"
 
 
+def _as_mapping(value: Any) -> dict[str, Any]:
+    """Return a plain mapping for a native model, mapping, or anything else."""
+
+    if value is None:
+        return {}
+    if hasattr(value, "model_dump"):
+        dumped = value.model_dump()
+        return dumped if isinstance(dumped, dict) else {}
+    if isinstance(value, Mapping):
+        return dict(value)
+    return {}
+
+
+def _native_chunks(entry: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Return the retrieved chunks of one native search entry, wherever the SDK put them."""
+
+    raw = _as_mapping(entry.get("raw"))
+    for container in (raw.get("result_object"), entry.get("result_object"), raw):
+        chunks = _as_mapping(container).get("chunks")
+        if isinstance(chunks, list):
+            return [_as_mapping(chunk) for chunk in chunks]
+    return []
+
+
 def _item_metadata(entry: Any) -> Mapping[str, Any]:
     """Return the engine metadata attached to a native content item."""
 
@@ -766,7 +852,16 @@ def assert_runtime_matches_pinned_sdk(runtime: CogneeRuntime | None = None) -> N
     cognee = (runtime or CogneeRuntime())._module()
     required = {
         "remember": {"data", "dataset_name", "dataset_id", "self_improvement"},
-        "recall": {"query_text", "dataset_ids", "top_k", "user"},
+        "recall": {
+            "query_text",
+            "query_type",
+            "auto_route",
+            "dataset_ids",
+            "top_k",
+            "only_context",
+            "include_references",
+            "user",
+        },
         "forget": {"data_id", "dataset_id", "user"},
         "improve": {"dataset"},
     }
@@ -810,6 +905,10 @@ def assert_runtime_matches_pinned_sdk(runtime: CogneeRuntime | None = None) -> N
             raise RuntimeError(
                 f"Pinned provider {operation} signature is missing {sorted(missing)}"
             )
+    from cognee.modules.search.types import SearchType
+
+    if not hasattr(SearchType, "HYBRID_COMPLETION"):
+        raise RuntimeError("Pinned provider no longer offers the hybrid retriever")
     status_api = getattr(cognee, "datasets", None)
     for operation, parameters in {
         "get_progress": {"dataset_ids", "pipeline_names"},

@@ -9,11 +9,13 @@ from pydantic import AnyUrl, BaseModel, ConfigDict, Field, model_validator
 
 from context_engine.domain import (
     Action,
+    ContextQueryResult,
     ContextSpace,
     Grant,
     IndexingSnapshot,
     IngestionCommand,
     Job,
+    PublicEvidence,
     RecordStatus,
     Source,
     SourceCheckpoint,
@@ -550,3 +552,60 @@ class SpaceProgressResponse(_ApiModel):
 
     space_id: str = Field(alias="spaceId")
     sources: list[SourceProgressResponse]
+
+
+class ContextQueryRequest(_ApiModel):
+    """Validate a context query; the caller's identity comes from the credential."""
+
+    space_id: Annotated[str, Field(min_length=1, max_length=200)] = Field(alias="spaceId")
+    question: Annotated[str, Field(min_length=1, max_length=10000)]
+    mode: Literal["context", "answer"]
+    limit: Annotated[int, Field(ge=1, le=100)] = 10
+
+
+class EvidenceResponse(_ApiModel):
+    """One authorized passage with engine lineage and no backend identifiers."""
+
+    id: str
+    record_id: str = Field(alias="recordId")
+    source_id: str = Field(alias="sourceId")
+    source_version: str = Field(alias="sourceVersion")
+    passage: str
+    location: str | None = None
+    source_url: str | None = Field(default=None, alias="sourceUrl")
+
+    @classmethod
+    def from_domain(cls, value: PublicEvidence) -> EvidenceResponse:
+        """Translate public evidence into its REST representation."""
+
+        return cls(
+            id=value.id,
+            recordId=value.record_id,
+            sourceId=value.source_id,
+            sourceVersion=value.source_version,
+            passage=value.passage,
+            location=value.location,
+            sourceUrl=value.source_url,
+        )
+
+
+class ContextQueryResponse(_ApiModel):
+    """Evidence for a question, or an explicit insufficient-evidence state."""
+
+    query_id: str = Field(alias="queryId")
+    state: Literal["completed", "insufficient_evidence"]
+    evidence: list[EvidenceResponse]
+    insufficient_evidence: bool = Field(alias="insufficientEvidence")
+    trace_id: str = Field(alias="traceId")
+
+    @classmethod
+    def from_domain(cls, value: ContextQueryResult) -> ContextQueryResponse:
+        """Translate a query result into its REST representation."""
+
+        return cls(
+            queryId=value.query_id,
+            state="insufficient_evidence" if value.insufficient_evidence else "completed",
+            evidence=[EvidenceResponse.from_domain(item) for item in value.evidence],
+            insufficientEvidence=value.insufficient_evidence,
+            traceId=value.trace_id,
+        )

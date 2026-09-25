@@ -28,6 +28,7 @@ from context_engine.security.partitions import partition_for
 from context_engine.worker import (
     InjectedWorkerCrash,
     LifecycleJobHandler,
+    OperationDispatcher,
     RecordIndexer,
     TerminalJobError,
 )
@@ -172,6 +173,8 @@ async def test_identical_content_under_a_new_version_is_not_rewritten(tmp_path):
 
     assert spy.writes == ["ingest"]
     assert harness.locations("doc-a")[0].version == "2"
+    # The backend still holds the first version's content and metadata.
+    assert harness.locations("doc-a")[0].written_version == "1"
     assert harness.record("doc-a").index_state is IndexState.INDEXED
 
 
@@ -372,3 +375,16 @@ async def test_ledger_only_mode_releases_superseded_bytes_without_indexing(tmp_p
     assert harness.staging.exists(harness.record("doc-a").content_ref)
     nothing = await harness.backend.query(QueryRequest("two"), READER, (harness.partition("team"),))
     assert nothing.insufficient_evidence
+
+
+async def test_unsupported_operations_fail_terminally(tmp_path):
+    harness = _Harness(tmp_path)
+    dispatcher = OperationDispatcher({JobOperation.INGESTION: harness.handler})
+    job, _ = harness.repository.enqueue_job(
+        JobOperation.SPACE_DELETION, "space-delete-1", {"spaceId": harness.space.id}, "t", 3, "p"
+    )
+
+    with pytest.raises(TerminalJobError) as error:
+        await dispatcher.handle(job)
+
+    assert error.value.code == "unsupported_operation"

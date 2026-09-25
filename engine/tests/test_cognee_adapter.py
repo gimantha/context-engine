@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import enum
 import os
+import sys
+import types
 from dataclasses import dataclass
 from importlib.util import find_spec
-from uuid import NAMESPACE_URL, uuid5
+from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 import pytest
 
@@ -22,7 +25,9 @@ from context_engine.knowledge_backend import (
 )
 from context_engine.knowledge_backend.providers.cognee import (
     CogneeBackend,
+    CogneeRuntime,
     _apply_native_environment,
+    _CogneeBinding,
     _NativeIngestion,
     assert_runtime_matches_pinned_sdk,
 )
@@ -292,3 +297,90 @@ async def test_read_grants_act_as_the_owner_and_need_an_initialized_partition(re
         ("grant_read", native, "prn_reader", "engine-service"),
         ("revoke_read", native, "prn_reader", "engine-service"),
     ]
+
+
+class _StructuredRuntime(FakeCogneeRuntime):
+    """Return search entries shaped like the provider's normalized graph results."""
+
+    def __init__(self):
+        super().__init__()
+        self.entries = []
+
+    async def recall(self, request, bindings, user):
+        self.calls.append(("recall", request, bindings, user))
+        return self.entries
+
+
+@pytest.mark.asyncio
+async def test_structured_results_resolve_through_recorded_references(record_factory):
+    runtime = _StructuredRuntime()
+    backend = CogneeBackend(runtime, resolve_user)
+    principal = PrincipalContext("prn_reader", "trace-structured")
+    partition = AccessPartitionRef("prt_structured")
+    ingested = await backend.ingest(record_factory("doc-1", "1", "content"), principal, partition)
+    _, unit, item = ingested.backend_reference.value.split(":")
+
+    def chunk(chunk_id, text, item_id, index=None):
+        payload = {"text": text, "document_id": item_id}
+        if index is not None:
+            payload["chunk_index"] = index
+        return {"id": chunk_id, "score": 0.5, "payload": payload}
+
+    runtime.entries = [
+        {
+            "kind": "hybrid",
+            "text": "rendered context",
+            "dataset_id": unit,
+            "raw": {
+                "result_object": {
+                    "chunks": [
+                        chunk("c1", "resolved passage", item, 3),
+                        chunk("c2", "orphan passage", "item-the-engine-never-wrote"),
+                    ]
+                }
+            },
+        },
+        {
+            "kind": "hybrid",
+            "text": "other unit",
+            "dataset_id": "unit-outside-the-request",
+            "raw": {"result_object": {"chunks": [chunk("c3", "foreign passage", item)]}},
+        },
+    ]
+
+    result = await backend.query(QueryRequest("passage"), principal, (partition,))
+
+    [evidence] = result.evidence
+    assert (evidence.record_id, evidence.source_id) == ("doc-1", "source-incidents")
+    assert (evidence.passage, evidence.location) == ("resolved passage", "chunk:3")
+    assert unit not in repr(result) and item not in repr(result)
+
+
+@pytest.mark.asyncio
+async def test_runtime_pins_the_retriever_and_disables_routing(monkeypatch):
+    captured = {}
+
+    class SearchType(enum.Enum):
+        HYBRID_COMPLETION = "HYBRID_COMPLETION"
+
+    async def recall(**kwargs):
+        captured.update(kwargs)
+        return []
+
+    fake = types.ModuleType("cognee")
+    fake.recall = recall
+    for name in ("cognee", "cognee.modules", "cognee.modules.search"):
+        monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
+    search_types = types.ModuleType("cognee.modules.search.types")
+    search_types.SearchType = SearchType
+    monkeypatch.setitem(sys.modules, "cognee.modules.search.types", search_types)
+    runtime = CogneeRuntime(KnowledgeBackendSettings())
+    monkeypatch.setattr(runtime, "_module", lambda: fake)
+    unit = str(uuid4())
+
+    await runtime.recall(QueryRequest("question", 5), (_CogneeBinding("n", unit),), object())
+
+    assert captured["query_type"] is SearchType.HYBRID_COMPLETION
+    assert captured["auto_route"] is False
+    assert captured["only_context"] is True and captured["include_references"] is True
+    assert captured["dataset_ids"] == [UUID(unit)] and captured["top_k"] == 5

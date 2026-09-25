@@ -110,6 +110,7 @@ def _location(row: Row) -> RecordLocation:
         content_hash=row["content_hash"],
         parser_version=row["parser_version"],
         updated_at=datetime.fromisoformat(row["updated_at"]),
+        written_version=row["written_version"],
     )
 
 
@@ -896,16 +897,23 @@ class SourceRepository:
         backend_ref: str,
         content_hash: str,
         parser_version: str | None,
+        *,
+        written: bool = True,
     ) -> None:
-        """Record that the backend now holds this version in this partition."""
+        """Record that the backend now holds this version in this partition.
+
+        `written` is False when an identical-content version is confirmed without a rewrite;
+        the written version then stays on the earlier version the backend's metadata carries.
+        """
 
         with self.database.transaction() as connection:
             connection.execute(
                 """
                 INSERT INTO record_locations(
                     space_id, source_id, source_record_id, partition_id, state, version,
-                    target_version, backend_ref, content_hash, parser_version, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)
+                    target_version, backend_ref, content_hash, parser_version, updated_at,
+                    written_version
+                ) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?)
                 ON CONFLICT(space_id, source_id, source_record_id, partition_id) DO UPDATE SET
                     state = excluded.state,
                     version = excluded.version,
@@ -913,7 +921,8 @@ class SourceRepository:
                     backend_ref = excluded.backend_ref,
                     content_hash = excluded.content_hash,
                     parser_version = COALESCE(excluded.parser_version, parser_version),
-                    updated_at = excluded.updated_at
+                    updated_at = excluded.updated_at,
+                    written_version = COALESCE(excluded.written_version, written_version)
                 """,
                 (
                     space_id,
@@ -926,8 +935,50 @@ class SourceRepository:
                     content_hash,
                     parser_version,
                     _timestamp(),
+                    version if written else None,
                 ),
             )
+
+    def get_location(
+        self, space_id: str, source_id: str, source_record_id: str, partition_id: str
+    ) -> RecordLocation | None:
+        """Return one backend copy of a record when it exists."""
+
+        with self.database.connection() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM record_locations
+                WHERE space_id = ? AND source_id = ? AND source_record_id = ? AND partition_id = ?
+                """,
+                (space_id, source_id, source_record_id, partition_id),
+            ).fetchone()
+        return _location(row) if row else None
+
+    def indexed_partitions(self, space_id: str) -> frozenset[str]:
+        """Return the partitions of a space that hold at least one indexed copy."""
+
+        with self.database.connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT DISTINCT partition_id FROM record_locations
+                WHERE space_id = ? AND state = ?
+                """,
+                (space_id, LocationState.INDEXED.value),
+            ).fetchall()
+        return frozenset(row["partition_id"] for row in rows)
+
+    def list_indexed_locations(self, source_id: str) -> tuple[RecordLocation, ...]:
+        """Return a source's copies the engine believes the backend holds."""
+
+        with self.database.connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM record_locations WHERE source_id = ? AND state = ?
+                ORDER BY source_record_id, partition_id
+                """,
+                (source_id, LocationState.INDEXED.value),
+            ).fetchall()
+        return tuple(_location(row) for row in rows)
 
     def set_location_state(
         self,

@@ -273,7 +273,7 @@ async def test_checkpoints_record_status_and_dead_letters(tmp_path):
             f"/v1/sources/{source['id']}/checkpoints", headers=_auth(READER)
         )
         before_worker = client.get(
-            f"/v1/sources/{source['id']}/records/runbook-84", headers=_auth(READER)
+            f"/v1/sources/{source['id']}/records/runbook-84", headers=_auth(SERVICE)
         )
 
         # Move the source to another space so the queued job fails terminally as source_unknown.
@@ -304,11 +304,16 @@ async def test_checkpoints_record_status_and_dead_letters(tmp_path):
             json=second,
         )
         assert await _drain(tmp_path) == 1
-        status = client.get(f"/v1/sources/{source['id']}/records/runbook-90", headers=_auth(READER))
+        status = client.get(
+            f"/v1/sources/{source['id']}/records/runbook-90", headers=_auth(SERVICE)
+        )
+        reader_status = client.get(
+            f"/v1/sources/{source['id']}/records/runbook-90", headers=_auth(READER)
+        )
         member_status = client.get(
             f"/v1/sources/{source['id']}/records/runbook-90", headers=_auth(MEMBER)
         )
-        unknown = client.get(f"/v1/sources/{source['id']}/records/nope", headers=_auth(READER))
+        unknown = client.get(f"/v1/sources/{source['id']}/records/nope", headers=_auth(SERVICE))
 
     assert put_checkpoint.json()["cursor"] == "page-3"
     assert reader_put.status_code == 403
@@ -320,6 +325,7 @@ async def test_checkpoints_record_status_and_dead_letters(tmp_path):
     assert status.status_code == 200
     assert status.json()["state"] == "active" and status.json()["currentVersion"] == "84"
     assert status.json()["indexState"] == "pending"
+    assert reader_status.status_code == 403
     assert "audience" not in status.json() and "contentRef" not in status.json()
     assert member_status.status_code == 404
     assert unknown.status_code == 404
