@@ -2,7 +2,7 @@
 
 Devant Context Engine is a standalone service for ingesting governed source records and returning authorized, source-linked context. Its public contracts use engine-owned concepts such as context spaces, sources, evidence, enrichments, and jobs. Knowledge-provider details stay behind a private Python adapter.
 
-The repository contains the Milestone 0 architecture spike, the Milestone 1 runnable control plane, the Milestone 2 identity and grants slice, and the engine half of Milestone 3: source registration, staged uploads, connector checkpoints, and the authoritative record ledger with version ordering, deletion tombstones, and audience quarantine. The Ballerina file-source connector is developed separately; an end-to-end test plays the connector's role. Live-provider isolation and deletion verification remains an open release gate recorded in [the M0 exit decision](docs/m0/exit-decision.md).
+The repository contains the Milestone 0 architecture spike, the Milestone 1 runnable control plane, the Milestone 2 identity and grants slice, and the engine half of Milestone 3: source registration, staged uploads, connector checkpoints, and the authoritative record ledger with version ordering, deletion tombstones, and audience quarantine. The Ballerina file-source connector is developed separately; an end-to-end test plays the connector's role. The live-provider isolation, lifecycle, and residue checks passed on 2026-09-25; the open items are recorded in [the M0 exit decision](docs/m0/exit-decision.md).
 
 ## Repository layout
 
@@ -128,7 +128,7 @@ curl -X POST -H "Authorization: Bearer <connector token>" \
 
 Indexing reports `not_collected` while the worker is ledger-only.
 
-To index content into the knowledge backend, install the provider extra, copy `local/m4.env.example` to `engine/.env`, fill in the model and embedding keys, and start the worker as usual. With `CONTEXT_ENGINE_KNOWLEDGE_BACKEND=provider`, the worker extracts text from staged bytes, writes each record into its partition as the engine's service identity, replaces and moves copies as versions and audiences change, removes copies of deleted records, and grants read access that matches engine policy. Each record's `indexState` on the record-status route and the indexing section of the progress route show how far it got. Run the API with the same profile to serve queries and enrichment. A member of a record's audience with `context.read` on the space can then ask for passages, and a principal with `context.enrich` can start an enrichment:
+To index content into the knowledge backend, install the provider extra, copy `local/m4.env.example` to `engine/.env`, fill in the model and embedding keys, and start the worker as usual. With `CONTEXT_ENGINE_KNOWLEDGE_BACKEND=provider`, the worker extracts text from staged bytes, writes each record into its partition as the engine's service identity, replaces and moves copies as versions and audiences change, removes copies of deleted records, and grants read access that matches engine policy. Each record's `indexState` on the record-status route and the indexing section of the progress route show how far it got. Run the API with the same profile to serve queries and enrichment. With the local embedded stores, only one process can open the provider's graph store, so queries fail as unavailable while a separate worker process holds it (ADR 0002 revision). The live end-to-end test runs the API and the worker in one process. A member of a record's audience with `context.read` on the space can then ask for passages, and a principal with `context.enrich` can start an enrichment:
 
 ```bash
 curl -H "Authorization: Bearer <reader token>" -H "Content-Type: application/json" \
@@ -138,9 +138,9 @@ curl -X POST -H "Authorization: Bearer <enricher token>" -H "Idempotency-Key: en
   http://127.0.0.1:8000/v1/spaces/<space id>/enrichments
 ```
 
-See [the M4 report](docs/m4/implementation-report.md); the provider path has only been verified against the deterministic backend so far.
+See [the M4 report](docs/m4/implementation-report.md) for the live verification and its open items.
 
-Interactive API documentation is available at `http://127.0.0.1:8000/docs`. Identity-provider integrations arrive in M6. Provider-backed execution arrives in M4.
+Interactive API documentation is available at `http://127.0.0.1:8000/docs`. Identity-provider integrations arrive in M6.
 
 ## Run the live-provider verification
 
@@ -163,7 +163,7 @@ set +a
 uv run pytest -m live_provider -v
 ```
 
-The test skips unless `CONTEXT_ENGINE_RUN_LIVE_PROVIDER=true` and `CONTEXT_ENGINE_MODEL_API_KEY` are present. It writes every record as the engine's service identity, `CONTEXT_ENGINE_SERVICE_PRINCIPAL_ID`, and grants read access to separate reader identities before checking isolation. Record verified results in [the spike report](docs/m0/spike-report.md) and update [the exit decision](docs/m0/exit-decision.md) only when the complete isolation, lifecycle, and residue checks pass.
+The tests skip unless `CONTEXT_ENGINE_RUN_LIVE_PROVIDER=true` and `CONTEXT_ENGINE_MODEL_API_KEY` are present. The lifecycle test writes every record as the engine's service identity, `CONTEXT_ENGINE_SERVICE_PRINCIPAL_ID`, grants read access to separate reader identities, checks isolation, replacement, and deletion, and scans the provider's live stores for residue. The end-to-end test drives the REST API and the worker in one process. A run takes about three minutes and calls the configured models. Record verified results in [the spike report](docs/m0/spike-report.md) and update [the exit decision](docs/m0/exit-decision.md) only when the complete isolation, lifecycle, and residue checks pass.
 
 ## Development workflow
 

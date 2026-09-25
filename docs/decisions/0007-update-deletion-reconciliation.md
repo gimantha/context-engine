@@ -1,6 +1,6 @@
 # ADR 0007: Update, deletion and reconciliation semantics
 
-**Status:** Conditional — real provider residue scan pending
+**Status:** Conditional — live stores verified clean on 2026-09-25; provider search history and physical compaction remain open
 
 **Date:** 2026-09-18
 
@@ -39,3 +39,19 @@ The API returns an asynchronous job for destructive lifecycle work. No public de
 - **Unindexable versions leave nothing older behind.** If the current version cannot be read or extracted, every older copy is removed and the record is marked failed with a stable code.
 - **Staged bytes are released when no live record needs them:** every version of a deleted record, and superseded versions of a live one. The current version of a quarantined record is kept.
 - Validation: `engine/tests/test_record_indexer.py` and `engine/tests/test_extraction.py`.
+
+## Revision (2026-09-25, live verification)
+
+The first runs against the pinned provider found two defects that the deterministic backend could not show. Both are fixed.
+
+- **Every write now names its own item.** The provider's write result lists every item its run touched in the unit, not only the one just written. The adapter took the first entry. In a unit that already held other records, an update therefore kept the old item, recorded the old id as current, and skipped removing it. A later delete then removed the old item and left the new copy searchable but untracked. The adapter now pins the item id, derived from the binding, record, version, and content hash. It fails the write as a partial write unless the provider's result includes that id. A retried write lands on the same item instead of creating a second one.
+- **The presence check reads real items.** The provider lists items as stored rows, not mappings or models, so the adapter read no engine metadata from them. Every absence check after a removal passed without evidence, and the scheduled cross-check reported every indexed record as lost. The adapter now reads the metadata from the rows, and the test double returns rows.
+- **Content is handed over as an upload.** The provider keeps the string form of its input in its run history, which deletion never clears. Record text now travels as an upload whose string form carries no content (ADR 0002 revision).
+- **Live residue scan.** After an update and a delete, the live test checks that no trace of the replaced or deleted version remains in live provider state. It checks the raw files, the provider's relational rows, every vector table, and the unit's graph. It first proves the scan can see a record that still exists. The scan passed on 2026-09-25.
+
+Two retention items remain open. Neither is reachable through any engine read path.
+
+- **Physical residue until compaction.** Deleted text stays in the bytes of vector-store data fragments and graph-store pages until those stores compact. Live rows and graph nodes no longer hold it. An erasure guarantee needs scheduled compaction or a rebuild of the partition. Owner: Operations, M7.
+- **Provider search history.** Every provider query records the question and the passages it returned, per isolation unit, and deletion does not clear either. Question text and passages of deleted records therefore persist in the provider's relational store. The fix is either to purge the history the engine's queries create, or to call the provider's retrieval below the layer that records it. Both depend on provider internals, so the choice is open (threat model T19). Owner: Backend owner.
+
+Validation: `engine/tests/test_live_cognee_provider.py`, run with explicit model and embedding credentials, and the pinned-id, row-listing, and upload tests in `engine/tests/test_cognee_adapter.py`.
