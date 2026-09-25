@@ -31,6 +31,20 @@ _ALLOWED_FIELDS = frozenset(
 )
 
 
+# Libraries may put content such as query text into ordinary messages, so only their warnings
+# and errors are kept. The engine's own records and the server's lifecycle records pass.
+_ENGINE_LOGGERS = ("context_engine", "uvicorn")
+
+
+class _EngineRecordFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        """Pass engine records and third-party warnings; drop third-party chatter."""
+
+        name = record.name
+        engine = any(name == item or name.startswith(f"{item}.") for item in _ENGINE_LOGGERS)
+        return engine or record.levelno >= logging.WARNING
+
+
 class _JsonFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
         """Serialize one record with only allowlisted structured fields."""
@@ -55,6 +69,7 @@ def configure_logging(level: str = "INFO") -> None:
         return
     handler = logging.StreamHandler()
     handler.setFormatter(_JsonFormatter())
+    handler.addFilter(_EngineRecordFilter())
     handler._context_engine = True  # type: ignore[attr-defined]
     root.addHandler(handler)
 

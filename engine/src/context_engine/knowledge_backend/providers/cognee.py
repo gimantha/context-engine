@@ -6,9 +6,11 @@ import asyncio
 import hashlib
 import inspect
 import json
+import logging
 import os
 import secrets
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Protocol
 from uuid import UUID
@@ -559,7 +561,8 @@ class CogneeRuntime:
 
         _apply_native_environment(self._settings)
         try:
-            import cognee
+            with _keep_process_logging():
+                import cognee
         except ImportError as exc:
             raise BackendError(
                 BackendErrorCode.UNAVAILABLE,
@@ -805,6 +808,30 @@ def _native_bool(value: bool) -> str:
     """Format an engine boolean for the native provider environment."""
 
     return "true" if value else "false"
+
+
+@contextmanager
+def _keep_process_logging() -> Iterator[None]:
+    """Keep the engine's log handlers across the provider's import.
+
+    Importing the SDK replaces every root handler with its own console handler, which would
+    drop the engine's allowlisted fields, including those of audit events. Its file handler,
+    added only when the engine enables provider file logging, is kept.
+    """
+
+    root = logging.getLogger()
+    handlers, level = list(root.handlers), root.level
+    try:
+        yield
+    finally:
+        added = [handler for handler in root.handlers if handler not in handlers]
+        for handler in added:
+            if not isinstance(handler, logging.FileHandler):
+                root.removeHandler(handler)
+        for handler in handlers:
+            if handler not in root.handlers:
+                root.addHandler(handler)
+        root.setLevel(level)
 
 
 def _apply_native_environment(settings: KnowledgeBackendSettings) -> None:
