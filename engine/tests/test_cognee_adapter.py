@@ -31,6 +31,7 @@ from context_engine.knowledge_backend.providers.cognee import (
     _apply_native_environment,
     _CogneeBinding,
     _keep_process_logging,
+    _native_item_id,
     _NativeIngestion,
     assert_runtime_matches_pinned_sdk,
 )
@@ -477,3 +478,51 @@ def test_provider_import_cannot_replace_the_engines_log_handlers(tmp_path):
 
     assert handlers == [provider_file, engine]
     assert level == logging.INFO
+
+
+@pytest.mark.asyncio
+async def test_runtime_pins_the_item_id_of_every_write(monkeypatch, record_factory):
+    captured = {}
+    listed = []
+
+    @dataclass
+    class DataItem:
+        data: object
+        data_id: object = None
+        label: object = None
+        external_metadata: object = None
+
+    async def remember(**kwargs):
+        captured.update(kwargs)
+        return types.SimpleNamespace(
+            status="completed", dataset_id=str(uuid4()), items=list(listed)
+        )
+
+    fake = types.ModuleType("cognee")
+    fake.remember = remember
+    for name in ("cognee", "cognee.tasks", "cognee.tasks.ingestion"):
+        monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
+    data_item = types.ModuleType("cognee.tasks.ingestion.data_item")
+    data_item.DataItem = DataItem
+    monkeypatch.setitem(sys.modules, "cognee.tasks.ingestion.data_item", data_item)
+    runtime = CogneeRuntime(KnowledgeBackendSettings())
+    monkeypatch.setattr(runtime, "_module", lambda: fake)
+    monkeypatch.setattr(runtime, "_prepared", True)
+    binding = _CogneeBinding("context-engine-unit", str(uuid4()))
+    record = record_factory("doc", "2", "second version")
+    pinned = _native_item_id(binding, record)
+
+    # The provider lists every item its run touched; an older item comes first here.
+    listed[:] = [{"id": str(uuid4())}, {"id": str(pinned)}]
+    written = await runtime.remember(record, binding, object())
+    assert captured["data"].data_id == pinned and written.data_id == str(pinned)
+
+    listed[:] = [{"id": str(uuid4())}]
+    with pytest.raises(BackendError) as unconfirmed:
+        await runtime.remember(record, binding, object())
+    assert unconfirmed.value.code == BackendErrorCode.PARTIAL_WRITE
+
+    # Each version gets its own item; retrying the same version reuses it.
+    older = record_factory("doc", "1", "second version")
+    assert _native_item_id(binding, older) != pinned
+    assert _native_item_id(binding, record) == pinned
