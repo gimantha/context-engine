@@ -21,7 +21,7 @@ import context_engine_connectors.salesforce;
 configurable string engineBaseUrl = "http://127.0.0.1:8000";
 
 # Optional bearer token for authenticated engine deployments.
-configurable string? engineToken = ();
+configurable string? engineToken = "replace-me-admin-0123456789abcdef";
 
 # Environment variable holding the JSON array of connector instance configs.
 configurable string configEnvVar = "CONNECTOR_CONFIGS";

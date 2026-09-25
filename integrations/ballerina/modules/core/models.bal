@@ -7,8 +7,12 @@
 public type SourceRecord record {|
     # Stable logical identity of the record within its source.
     string recordId;
-    # Normalized textual content of the record.
-    string content;
+    # Normalized textual content of the record. Provide this or `contentBytes`.
+    # The framework stages it (as UTF-8 bytes) to the engine before ingesting.
+    string content?;
+    # Raw binary content, for non-text sources (e.g. file uploads). Provide this
+    # or `content`. Staged to the engine as-is under `contentType`, byte-for-byte.
+    byte[] contentBytes?;
     # Source-provided monotonic version of this record state; defaults to the
     # content hash when omitted. Sent to the engine as `sourceVersion`.
     string sourceVersion?;

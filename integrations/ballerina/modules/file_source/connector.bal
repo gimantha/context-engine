@@ -8,10 +8,10 @@
 // named in the path. Only the space comes from the request — audience and ACL
 // version stay server-controlled.
 //
-// Files are passed through unmodified: each upload is base64-encoded with its
-// declared content type and submitted to the engine. Extraction (including PDF)
-// happens on the engine side via the knowledge backend (M4) — the connector does
-// no extraction itself, so any file type is accepted.
+// Files are passed through unmodified: each upload's raw bytes are staged with the
+// engine under its declared content type (the sink handles staging). Extraction
+// (including PDF) happens on the engine side via the knowledge backend (M4) — the
+// connector does no extraction itself, so any file type is accepted.
 
 import ballerina/http;
 import ballerina/lang.runtime;
@@ -62,9 +62,10 @@ service class UploadService {
     # Ingest one or more uploaded files into the space named in the path.
     #
     # Accepts `multipart/form-data`; each part is a file whose name is its record id.
-    # Each part is passed through as base64 content with its declared content type —
-    # no extraction here; the engine's knowledge backend extracts per type. Only the
-    # target space comes from the request; audience and ACL version are server-controlled.
+    # Each part's raw bytes are passed through with its declared content type (the
+    # sink stages them) — no extraction here; the engine's knowledge backend extracts
+    # per type. Only the target space comes from the request; audience and ACL version
+    # are server-controlled.
     #
     # + spaceId - target context space (from the path)
     # + request - the multipart HTTP request carrying the uploaded files
@@ -86,7 +87,7 @@ service class UploadService {
             byte[] data = check part.getByteArray();
             core:SourceRecord sourceRecord = {
                 recordId: fileName,
-                content: data.toBase64(),
+                contentBytes: data,
                 contentType: contentType != "" ? contentType : "application/octet-stream",
                 title: fileName
             };

@@ -26,28 +26,44 @@ public client class RecordSink {
     # + sourceRecord - the normalized record to ingest
     # + return - the accepted job handle, or an error
     remote function ingest(SourceRecord sourceRecord) returns JobAccepted|error {
-        // A content-addressed hash gives a stable version and lets the engine
-        // verify the inline content it stores.
-        byte[] digest = crypto:hashSha256(sourceRecord.content.toBytes());
+        // The engine no longer accepts inline content: an upsert stages the content
+        // bytes first, then references the staged object. Text content is staged as
+        // UTF-8; binary sources (e.g. file uploads) supply raw `contentBytes`.
+        byte[]? rawBytes = sourceRecord?.contentBytes;
+        string? text = sourceRecord?.content;
+        byte[] bytes;
+        if rawBytes is byte[] {
+            bytes = rawBytes;
+        } else if text is string {
+            bytes = text.toBytes();
+        } else {
+            return error("source record has neither content nor contentBytes");
+        }
+        // A content-addressed hash gives a stable version when the source has none.
+        byte[] digest = crypto:hashSha256(bytes);
         string hashHex = digest.toBase16().toLowerAscii();
-        string contentHash = string `sha256:${hashHex}`;
         string sourceVersion = sourceRecord?.sourceVersion ?: hashHex;
         string[] audience = sourceRecord?.audience ?: self.destination.audience;
+        string key = idempotencyKey(self.destination.spaceId, self.destination.sourceId,
+                sourceRecord.recordId, sourceVersion);
 
+        // Stage the content, then echo the engine's own contentRef/hash/type so the
+        // event verifies against the staged object exactly.
+        StagedUpload upload = check self.engineClient->stageUpload(self.destination.sourceId,
+                sourceRecord.contentType, bytes, key);
         IngestionEvent ingestionEvent = {
             spaceId: self.destination.spaceId,
             sourceId: self.destination.sourceId,
             sourceRecordId: sourceRecord.recordId,
             sourceVersion: sourceVersion,
             operation: "upsert",
-            contentType: sourceRecord.contentType,
-            content: sourceRecord.content,
-            contentHash: contentHash,
+            contentType: upload.contentType,
+            contentRef: upload.uploadId,
+            contentHash: upload.contentHash,
             sourceObservedAt: sourceRecord?.sourceObservedAt ?: time:utcToString(time:utcNow()),
             audience: audience,
             sourceAclVersion: self.destination.sourceAclVersion,
-            idempotencyKey: idempotencyKey(self.destination.spaceId, self.destination.sourceId,
-                    sourceRecord.recordId, sourceVersion)
+            idempotencyKey: key
         };
         string? title = sourceRecord?.title;
         if title is string {
