@@ -7,7 +7,9 @@ which is how the worker uses the provider. Run it with real model credentials; s
 from __future__ import annotations
 
 import hashlib
+import sqlite3
 from dataclasses import replace
+from pathlib import Path
 from uuid import UUID, uuid4
 
 import pytest
@@ -31,6 +33,53 @@ from context_engine.knowledge_backend.providers.cognee import (
 )
 
 pytestmark = pytest.mark.live_provider
+
+
+# The provider's search history keeps every question and the passages it returned, and
+# deletion never clears it. That is a recorded retention gap (ADR 0007), so the scan below
+# leaves it out; every store that deletion is meant to clear is checked.
+_HISTORY_TABLES = {"queries", "results"}
+
+
+def _live_residue(storage: Path, canary: str) -> list[str]:
+    """Name every live provider store under the storage root that still holds the canary."""
+
+    found = []
+    needle = canary.encode()
+    for path in (storage / "data").rglob("*"):
+        if path.is_file() and needle in path.read_bytes():
+            found.append(f"raw file {path.name}")
+    database = sqlite3.connect(storage / "system/databases/cognee_db")
+    try:
+        tables = database.execute("select name from sqlite_master where type = 'table'")
+        for (table,) in tables.fetchall():
+            if table in _HISTORY_TABLES:
+                continue
+            columns = [row[1] for row in database.execute(f'pragma table_info("{table}")')]
+            clause = " or ".join(f'cast("{column}" as text) like ?' for column in columns)
+            query = f'select count(*) from "{table}" where {clause}'
+            if database.execute(query, [f"%{canary}%"] * len(columns)).fetchone()[0]:
+                found.append(f"relational table {table}")
+    finally:
+        database.close()
+    import lancedb
+
+    for directory in (storage / "system/databases").rglob("*.lance.db"):
+        connection = lancedb.connect(str(directory))
+        listed = connection.list_tables()
+        for table in getattr(listed, "tables", listed):
+            rows = connection.open_table(table).to_arrow().to_pylist()
+            if any(canary in repr(row) for row in rows):
+                found.append(f"vector table {table}")
+    return found
+
+
+async def _graph_holds(unit: UUID, owner, canary: str) -> bool:
+    """Report whether the unit's live graph still names the canary."""
+
+    from cognee.modules.graph.methods.get_formatted_graph_data import get_formatted_graph_data
+
+    return canary in repr(await get_formatted_graph_data(unit, owner))
 
 
 def _live_enabled() -> bool:
@@ -129,9 +178,22 @@ async def test_live_provider_two_audience_lifecycle(tmp_path):
     assert alpha_canary not in repr(stale)
     assert replacement_canary in repr(current)
 
+    # The scan must see what is still there before it can prove what is gone.
+    assert _live_residue(tmp_path, beta_canary)
+    assert await _graph_holds(native_unit(beta_result), service_user, beta_canary)
+
     assert (await backend.delete(updated.backend_reference, service, alpha_partition)).deleted
     after_delete = await backend.query(QueryRequest(replacement_canary), alpha, (alpha_partition,))
     assert replacement_canary not in repr(after_delete)
 
     await backend.delete(beta_result.backend_reference, service, beta_partition)
     await backend.delete(shared_result.backend_reference, service, shared_partition)
+
+    # Nothing of a replaced or deleted version stays in any live provider store.
+    for canary, result in (
+        (alpha_canary, alpha_result),
+        (replacement_canary, alpha_result),
+        (beta_canary, beta_result),
+    ):
+        assert _live_residue(tmp_path, canary) == []
+        assert not await _graph_holds(native_unit(result), service_user, canary)
