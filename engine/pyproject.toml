@@ -15,6 +15,7 @@ dependencies = [
 [project.scripts]
 context-engine-api = "context_engine.api.main:main"
 context-engine-migrate = "context_engine.persistence.migrate:main"
+context-engine-serve = "context_engine.serve:main"
 context-engine-worker = "context_engine.worker.main:main"
 
 [project.optional-dependencies]

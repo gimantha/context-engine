@@ -79,6 +79,14 @@ Start the worker independently in the second terminal:
 uv run context-engine-worker
 ```
 
+In provider mode, run the API and the worker as one process instead. The local knowledge-backend stores can be opened by only one process at a time, so queries fail while a separate worker process holds them (ADR 0002 revision). This command serves the API and runs the worker loop in the same process, and readiness reports unavailable while that loop is failing:
+
+```bash
+uv run context-engine-serve --host 127.0.0.1 --port 8000
+```
+
+On shutdown it lets the current job finish for up to the worker lease period, `CONTEXT_ENGINE_WORKER_LEASE_SECONDS`, before stopping it; an interrupted job is retried on the next start.
+
 Verify the API. Health routes are open; every other route needs a bearer token from the static file:
 
 ```bash
@@ -128,7 +136,7 @@ curl -X POST -H "Authorization: Bearer <connector token>" \
 
 Indexing reports `not_collected` while the worker is ledger-only.
 
-To index content into the knowledge backend, install the provider extra, copy `local/m4.env.example` to `engine/.env`, fill in the model and embedding keys, and start the worker as usual. With `CONTEXT_ENGINE_KNOWLEDGE_BACKEND=provider`, the worker extracts text from staged bytes, writes each record into its partition as the engine's service identity, replaces and moves copies as versions and audiences change, removes copies of deleted records, and grants read access that matches engine policy. Each record's `indexState` on the record-status route and the indexing section of the progress route show how far it got. Run the API with the same profile to serve queries and enrichment. With the local embedded stores, only one process can open the provider's graph store, so queries fail as unavailable while a separate worker process holds it (ADR 0002 revision). The live end-to-end test runs the API and the worker in one process. A member of a record's audience with `context.read` on the space can then ask for passages, and a principal with `context.enrich` can start an enrichment:
+To index content into the knowledge backend, install the provider extra, copy `local/m4.env.example` to `engine/.env`, fill in the model and embedding keys, and start the worker as usual. With `CONTEXT_ENGINE_KNOWLEDGE_BACKEND=provider`, the worker extracts text from staged bytes, writes each record into its partition as the engine's service identity, replaces and moves copies as versions and audiences change, removes copies of deleted records, and grants read access that matches engine policy. Each record's `indexState` on the record-status route and the indexing section of the progress route show how far it got. Serve queries and enrichment with `uv run context-engine-serve`, which runs the API and the worker in one process with the same profile. A separate API process cannot query while a separate worker process holds the local stores (ADR 0002 revision). A member of a record's audience with `context.read` on the space can then ask for passages, and a principal with `context.enrich` can start an enrichment:
 
 ```bash
 curl -H "Authorization: Bearer <reader token>" -H "Content-Type: application/json" \
