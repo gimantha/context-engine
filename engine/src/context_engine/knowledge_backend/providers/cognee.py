@@ -825,7 +825,14 @@ def _apply_native_environment(settings: KnowledgeBackendSettings) -> None:
         "CACHING": _native_bool(settings.query_cache_enabled),
         "ENABLE_BACKEND_ACCESS_CONTROL": _native_bool(settings.access_control_required),
         "REQUIRE_AUTHENTICATION": _native_bool(settings.access_control_required),
-        "ACCEPT_LOCAL_FILE_PATH": _native_bool(settings.local_content_access_enabled),
+        # The provider stores text in its own data directory and reads it back through its
+        # local-file loader, so local paths must be accepted. Confining them to the provider's
+        # own storage keeps every other path unreadable: a document whose content looks like a
+        # path is ingested as text. Wider local reads happen only if the engine allows them.
+        "ACCEPT_LOCAL_FILE_PATH": "true",
+        "COGNEE_ALLOWED_LOCAL_FILE_ROOTS": ""
+        if settings.local_content_access_enabled
+        else str(storage / "data"),
         "ALLOW_HTTP_REQUESTS": _native_bool(settings.remote_content_access_enabled),
         "ALLOW_CYPHER_QUERY": _native_bool(settings.raw_graph_query_enabled),
         "DB_PROVIDER": settings.relational_store,

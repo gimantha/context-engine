@@ -195,6 +195,26 @@ def test_engine_settings_override_native_environment(monkeypatch, tmp_path):
     assert os.environ["VECTOR_DB_PROVIDER"] == "engine-vector"
     assert os.environ["EMBEDDING_DIMENSIONS"] == "42"
     assert os.environ["SYSTEM_ROOT_DIRECTORY"] == str(tmp_path / "system")
+    # Local reads stay confined to the provider's own storage.
+    assert os.environ["ACCEPT_LOCAL_FILE_PATH"] == "true"
+    assert os.environ["COGNEE_ALLOWED_LOCAL_FILE_ROOTS"] == str(tmp_path / "data")
+
+
+def test_provider_refuses_local_paths_outside_its_storage(tmp_path):
+    if find_spec("cognee") is None:
+        pytest.skip("private provider dependency is not installed")
+    snapshot = dict(os.environ)
+    try:
+        _apply_native_environment(KnowledgeBackendSettings(storage_path=tmp_path / "knowledge"))
+        from cognee.infrastructure.files.utils.local_path_safety import resolve_local_path
+
+        outside = tmp_path / "outside.txt"
+        outside.write_text("must never be read")
+        with pytest.raises(ValueError):
+            resolve_local_path(outside, must_exist=True)
+    finally:
+        os.environ.clear()
+        os.environ.update(snapshot)
 
 
 class _NativeStatus:
