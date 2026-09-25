@@ -530,3 +530,13 @@ async def test_runtime_pins_the_item_id_of_every_write(monkeypatch, record_facto
     older = record_factory("doc", "1", "second version")
     assert _native_item_id(binding, older) != pinned
     assert _native_item_id(binding, record) == pinned
+
+
+def test_runtime_refuses_a_second_storage_root_in_one_process(monkeypatch, tmp_path):
+    import context_engine.knowledge_backend.providers.cognee as adapter
+
+    monkeypatch.setattr(adapter, "_loaded_storage", (tmp_path / "first").resolve())
+    runtime = CogneeRuntime(KnowledgeBackendSettings(storage_path=tmp_path / "second"))
+    with pytest.raises(BackendError) as refused:
+        runtime._module()
+    assert refused.value.code == BackendErrorCode.UNSUPPORTED

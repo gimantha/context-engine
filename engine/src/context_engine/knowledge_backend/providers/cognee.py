@@ -13,6 +13,7 @@ import secrets
 from collections.abc import Awaitable, Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Protocol
 from uuid import NAMESPACE_URL, UUID, uuid5
 
@@ -570,6 +571,10 @@ class CogneeBackend:
             return BackendHealth(False, f"provider unavailable: {type(exc).__name__}")
 
 
+# The storage root the SDK was first loaded with in this process.
+_loaded_storage: Path | None = None
+
+
 class CogneeRuntime:
     """Lazy SDK wrapper. All Cognee imports and native calls stay in this module."""
 
@@ -601,6 +606,15 @@ class CogneeRuntime:
     def _module(self) -> Any:
         """Load the SDK only after applying the engine-owned configuration."""
 
+        global _loaded_storage
+        storage = self._settings.storage_path.resolve()
+        # The SDK reads its storage roots once per process, so a second root would silently
+        # share the first one's stores.
+        if _loaded_storage is not None and storage != _loaded_storage:
+            raise BackendError(
+                BackendErrorCode.UNSUPPORTED,
+                "The knowledge provider is already bound to another storage root in this process",
+            )
         _apply_native_environment(self._settings)
         try:
             with _keep_process_logging():
@@ -610,6 +624,7 @@ class CogneeRuntime:
                 BackendErrorCode.UNAVAILABLE,
                 "The private provider dependency is not installed",
             ) from exc
+        _loaded_storage = storage
         return cognee
 
     async def remember(
