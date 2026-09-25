@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import enum
+import logging
 import os
 import sys
 import types
@@ -29,6 +30,7 @@ from context_engine.knowledge_backend.providers.cognee import (
     CogneeRuntime,
     _apply_native_environment,
     _CogneeBinding,
+    _keep_process_logging,
     _NativeIngestion,
     assert_runtime_matches_pinned_sdk,
 )
@@ -450,3 +452,27 @@ async def test_runtime_pins_the_retriever_and_disables_routing(monkeypatch):
     # Context-only mode would merge chunks into one rendered string without item ids.
     assert captured["only_context"] is False
     assert captured["dataset_ids"] == [UUID(unit)] and captured["top_k"] == 5
+
+
+def test_provider_import_cannot_replace_the_engines_log_handlers(tmp_path):
+    root = logging.getLogger()
+    before = list(root.handlers), root.level
+    engine = logging.StreamHandler()
+    try:
+        root.handlers[:] = [engine]
+        root.setLevel(logging.INFO)
+        provider_file = logging.FileHandler(tmp_path / "provider.log")
+        with _keep_process_logging():
+            # What the provider does on import.
+            root.handlers.clear()
+            root.addHandler(logging.StreamHandler())
+            root.addHandler(provider_file)
+            root.setLevel(logging.NOTSET)
+        handlers, level = list(root.handlers), root.level
+    finally:
+        provider_file.close()
+        root.handlers[:] = before[0]
+        root.setLevel(before[1])
+
+    assert handlers == [provider_file, engine]
+    assert level == logging.INFO
