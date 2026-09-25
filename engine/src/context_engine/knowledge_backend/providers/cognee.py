@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import inspect
 import json
@@ -530,6 +531,28 @@ class CogneeRuntime:
 
     def __init__(self, settings: KnowledgeBackendSettings | None = None) -> None:
         self._settings = settings or KnowledgeBackendSettings.from_env()
+        self._prepared = False
+        self._preparing: asyncio.Lock | None = None
+
+    async def _ready(self) -> Any:
+        """Load the SDK and create the provider's own stores once per process.
+
+        The provider does not create its relational store on first use, so every operation
+        waits for this. Creating it is idempotent, which keeps separate processes safe.
+        """
+
+        cognee = self._module()
+        if self._prepared:
+            return cognee
+        if self._preparing is None:
+            self._preparing = asyncio.Lock()
+        async with self._preparing:
+            if not self._prepared:
+                from cognee.modules.engine.operations.setup import setup
+
+                await setup()
+                self._prepared = True
+        return cognee
 
     def _module(self) -> Any:
         """Load the SDK only after applying the engine-owned configuration."""
@@ -549,7 +572,7 @@ class CogneeRuntime:
     ) -> _NativeIngestion:
         """Create the native content item and invoke native ingestion."""
 
-        cognee = self._module()
+        cognee = await self._ready()
         from cognee.tasks.ingestion.data_item import DataItem
 
         native_record = DataItem(
@@ -591,7 +614,7 @@ class CogneeRuntime:
     ) -> list[Any]:
         """Invoke native retrieval with the pinned retriever and explicit binding identifiers."""
 
-        cognee = self._module()
+        cognee = await self._ready()
         from cognee.modules.search.types import SearchType
 
         ids = [UUID(item.dataset_id) for item in bindings if item.dataset_id]
@@ -614,7 +637,7 @@ class CogneeRuntime:
     async def grant_read(self, binding: _CogneeBinding, reader: Any, owner: Any) -> None:
         """Give read permission on one binding through the native sharing API."""
 
-        self._module()
+        await self._ready()
         from cognee.modules.users.permissions.methods import (
             authorized_give_permission_on_datasets,
         )
@@ -626,7 +649,7 @@ class CogneeRuntime:
     async def revoke_read(self, binding: _CogneeBinding, reader: Any, owner: Any) -> None:
         """Remove read permission on one binding through the native sharing API."""
 
-        self._module()
+        await self._ready()
         from cognee.modules.users.permissions.methods import (
             authorized_revoke_permission_on_datasets,
         )
@@ -638,13 +661,13 @@ class CogneeRuntime:
     async def improve(self, binding: _CogneeBinding, user: Any) -> Any:
         """Invoke explicit native enrichment for one binding."""
 
-        cognee = self._module()
+        cognee = await self._ready()
         return await cognee.improve(dataset=UUID(binding.dataset_id), user=user)
 
     async def forget(self, binding: _CogneeBinding, data_id: str, user: Any) -> Any:
         """Invoke native deletion for one explicitly bound record."""
 
-        cognee = self._module()
+        cognee = await self._ready()
         return await cognee.forget(
             data_id=UUID(data_id),
             dataset_id=UUID(binding.dataset_id),
@@ -654,7 +677,7 @@ class CogneeRuntime:
     async def ensure_user(self, handle: str) -> Any:
         """Find the ordinary native account for a handle, creating it on first use."""
 
-        self._module()
+        await self._ready()
         from cognee.modules.users.methods import create_user, get_user_by_email
 
         existing = await get_user_by_email(handle)
@@ -675,7 +698,7 @@ class CogneeRuntime:
     async def get_user(self, native_id: str) -> Any:
         """Load a native account by its native identifier."""
 
-        self._module()
+        await self._ready()
         from cognee.modules.users.methods import get_user
 
         return await get_user(UUID(native_id))
@@ -683,13 +706,13 @@ class CogneeRuntime:
     async def list_items(self, binding: _CogneeBinding, user: Any) -> list[Any]:
         """List native content items in one binding with the resolved user."""
 
-        cognee = self._module()
+        cognee = await self._ready()
         return list(await cognee.datasets.list_data(UUID(binding.dataset_id), user=user))
 
     async def processing_states(self, bindings: tuple[_CogneeBinding, ...]) -> dict[str, Any]:
         """Read the latest processing-run state per binding from the native status API."""
 
-        cognee = self._module()
+        cognee = await self._ready()
         ids = [UUID(item.dataset_id) for item in bindings if item.dataset_id]
         # With no pipeline names the SDK returns a flat map for its processing pipeline.
         result = await cognee.datasets.get_progress(ids)
@@ -698,7 +721,7 @@ class CogneeRuntime:
     async def health(self) -> tuple[bool, str]:
         """Load the pinned SDK and return an engine-owned readiness detail."""
 
-        self._module()
+        await self._ready()
         return True, "knowledge provider ready"
 
 
