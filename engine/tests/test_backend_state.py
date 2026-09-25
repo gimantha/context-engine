@@ -141,7 +141,7 @@ async def test_identity_resolver_maps_each_principal_once_and_durably(tmp_path):
 
     assert first.id == after_restart.id != other.id
     assert len(runtime.created) == 2
-    assert "prn_alpha" not in first.handle and first.handle.endswith("@context-engine.invalid")
+    assert "prn_alpha" not in first.handle and first.handle.endswith("@context-engine.internal")
     assert state.get_identity("prn_alpha") == first.id
 
 
@@ -159,3 +159,16 @@ async def test_identity_resolver_uses_the_identity_claimed_first():
     user = await CogneeIdentityResolver(runtime, _RacingState())(PrincipalContext("prn_a", "t"))
 
     assert user.id == "native-claimed-first"
+
+
+def test_native_handles_pass_the_providers_email_validation():
+    pytest.importorskip("email_validator")
+    from pydantic import BaseModel, EmailStr
+
+    from context_engine.knowledge_backend.providers.cognee import _native_handle
+
+    class _Account(BaseModel):
+        email: EmailStr
+
+    for principal_id in ("context-engine-service", "prn_0123abcd", "odd id / with spaces"):
+        assert _Account(email=_native_handle(principal_id)).email
