@@ -13,7 +13,7 @@ from collections.abc import Awaitable, Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Protocol
-from uuid import UUID
+from uuid import NAMESPACE_URL, UUID, uuid5
 
 from context_engine.config import KnowledgeBackendSettings
 
@@ -187,6 +187,28 @@ def _native_handle(principal_id: str) -> str:
     # The provider validates handles as email addresses and rejects special-use domains such as
     # `.invalid`; `.internal` is reserved for private use and never delegated. No mail is sent.
     return f"engine-{digest}@context-engine.internal"
+
+
+def _native_item_id(binding: _CogneeBinding, record: SourceRecord) -> UUID:
+    """Choose the native item id of one record version in one binding.
+
+    The engine pins the id so every write names its own item: without a pin the provider
+    reuses any item with the same content, and its results cannot tell which item a call
+    added. The id is derived from the binding, record, version, and content, so a retried
+    write lands on the same item instead of leaving an untracked one behind.
+    """
+
+    seed = "\0".join(
+        (
+            "context-engine-item",
+            binding.dataset_name,
+            record.source_id,
+            record.record_id,
+            record.version,
+            record.content_hash,
+        )
+    )
+    return uuid5(NAMESPACE_URL, seed)
 
 
 def _native_reference(dataset_id: str, data_id: str) -> BackendReference:
@@ -578,8 +600,10 @@ class CogneeRuntime:
         cognee = await self._ready()
         from cognee.tasks.ingestion.data_item import DataItem
 
+        item_id = _native_item_id(binding, record)
         native_record = DataItem(
             data=record.content,
+            data_id=item_id,
             label=record.title,
             external_metadata={
                 "record_id": record.record_id,
@@ -603,14 +627,19 @@ class CogneeRuntime:
         if getattr(result, "status", None) == "errored":
             raise BackendError(BackendErrorCode.PARTIAL_WRITE, "Provider ingestion failed")
         dataset_id = getattr(result, "dataset_id", None)
-        items = getattr(result, "items", None) or []
-        data_id = next((item.get("id") for item in items if item.get("id")), None)
-        if not dataset_id or not data_id:
+        if not dataset_id:
             raise BackendError(
                 BackendErrorCode.UNSUPPORTED,
-                "Provider did not return stable dataset and record identifiers",
+                "Provider did not return a stable isolation identifier",
             )
-        return _NativeIngestion(str(dataset_id), str(data_id), created=True)
+        # The result lists every item the unit's run touched, not only the one written here,
+        # so the pinned id is what identifies this write; it must be among them.
+        written = {str(item.get("id")) for item in getattr(result, "items", None) or []}
+        if str(item_id) not in written:
+            raise BackendError(
+                BackendErrorCode.PARTIAL_WRITE, "Provider did not confirm the written item"
+            )
+        return _NativeIngestion(str(dataset_id), str(item_id), created=True)
 
     async def recall(
         self, request: QueryRequest, bindings: tuple[_CogneeBinding, ...], user: Any
