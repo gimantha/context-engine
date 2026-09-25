@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import inspect
+import io
 import json
 import logging
 import os
@@ -187,6 +188,25 @@ def _native_handle(principal_id: str) -> str:
     # The provider validates handles as email addresses and rejects special-use domains such as
     # `.invalid`; `.internal` is reserved for private use and never delegated. No mail is sent.
     return f"engine-{digest}@context-engine.internal"
+
+
+class _RecordUpload:
+    """Hand one record's text to the provider as an upload.
+
+    The provider reads a plain string as a local path, web address, or object-store key when
+    it looks like one, and keeps the string form of its input in its run history, which
+    deletion never clears. An upload is stored exactly as given, and its string form carries
+    no content.
+    """
+
+    # The provider records a source location for uploads unless the name is in angle brackets.
+    filename = "<engine-record>.txt"
+
+    def __init__(self, text: str) -> None:
+        self.file = io.BytesIO(text.encode("utf-8"))
+
+    def __repr__(self) -> str:
+        return "<engine record>"
 
 
 def _native_item_id(binding: _CogneeBinding, record: SourceRecord) -> UUID:
@@ -602,7 +622,7 @@ class CogneeRuntime:
 
         item_id = _native_item_id(binding, record)
         native_record = DataItem(
-            data=record.content,
+            data=_RecordUpload(record.content),
             data_id=item_id,
             label=record.title,
             external_metadata={
@@ -885,10 +905,10 @@ def _apply_native_environment(settings: KnowledgeBackendSettings) -> None:
         "CACHING": _native_bool(settings.query_cache_enabled),
         "ENABLE_BACKEND_ACCESS_CONTROL": _native_bool(settings.access_control_required),
         "REQUIRE_AUTHENTICATION": _native_bool(settings.access_control_required),
-        # The provider stores text in its own data directory and reads it back through its
-        # local-file loader, so local paths must be accepted. Confining them to the provider's
-        # own storage keeps every other path unreadable: a document whose content looks like a
-        # path is ingested as text. Wider local reads happen only if the engine allows them.
+        # The provider stores each upload in its own data directory and reads it back through
+        # its local-file loader, so local paths must be accepted. The engine never passes a
+        # path, and confining local reads to the provider's data directory keeps any other
+        # file unreadable. Wider local reads happen only if the engine allows them.
         "ACCEPT_LOCAL_FILE_PATH": "true",
         "COGNEE_ALLOWED_LOCAL_FILE_ROOTS": ""
         if settings.local_content_access_enabled
