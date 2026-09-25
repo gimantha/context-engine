@@ -42,6 +42,7 @@ class FakeCogneeRuntime:
     def __init__(self):
         self.calls = []
         self.items = {}
+        self.written = {}
         self.states = {}
 
     async def remember(self, record, binding, user):
@@ -58,6 +59,7 @@ class FakeCogneeRuntime:
             }
         )
         item_id = str(uuid5(NAMESPACE_URL, f"{native_id}:{record.source_id}:{record.record_id}"))
+        self.written.setdefault(native_id, []).append(item_id)
         return _NativeIngestion(native_id, item_id, True)
 
     async def list_items(self, binding, user):
@@ -80,17 +82,19 @@ class FakeCogneeRuntime:
 
     async def recall(self, request, bindings, user):
         self.calls.append(("recall", request, bindings, user))
+        # The live-verified shape of the pinned chunk retriever: one entry per chunk.
         return [
+            _chunk_entry(binding.dataset_id, item_id, "authorized passage", 0)
+            for binding in bindings
+            for item_id in self.written.get(binding.dataset_id, [])
+        ] + [
             {
-                "text": "authorized passage",
-                "score": 0.8,
-                "metadata": {
-                    "record_id": "record-1",
-                    "source_id": "source-1",
-                    "source_version": "1",
-                    "location": "page:1",
-                },
-                "dataset_id": "must-not-escape",
+                # A record id supplied by the provider is never trusted.
+                "kind": "graph_completion",
+                "text": "rendered context",
+                "metadata": {"record_id": "record-1", "source_id": "source-1"},
+                "dataset_id": bindings[0].dataset_id,
+                "raw": {"value": "rendered context"},
             }
         ]
 
@@ -105,6 +109,25 @@ class FakeCogneeRuntime:
 
     async def health(self):
         return True, "fake Cognee runtime"
+
+
+def _chunk_entry(unit, item_id, text, index=None, chunk_id="chunk-1"):
+    metadata = {"data_id": item_id, "chunk_id": chunk_id}
+    raw = {"id": chunk_id, "text": text, "document_id": item_id}
+    if index is not None:
+        metadata["chunk_index"] = index
+        raw["chunk_index"] = index
+    return {
+        "kind": "chunk",
+        "search_type": "CHUNKS",
+        "text": text,
+        "score": None,
+        "dataset_id": unit,
+        "dataset_name": "must-not-escape",
+        "metadata": metadata,
+        "raw": raw,
+        "source": "graph",
+    }
 
 
 async def resolve_user(principal):
@@ -129,8 +152,9 @@ async def test_adapter_translates_native_values(record_factory):
     deleted = await backend.delete(ingested.backend_reference, principal, partition)
 
     assert ingested.record_id == record.record_id
-    assert queried.evidence[0].passage == "authorized passage"
-    assert "must-not-escape" not in repr(queried)
+    [evidence] = queried.evidence
+    assert (evidence.passage, evidence.record_id) == ("authorized passage", record.record_id)
+    assert "must-not-escape" not in repr(queried) and "record-1" not in repr(queried)
     assert updated.backend_reference == ingested.backend_reference
     assert enriched.operation_id == "op-1"
     assert deleted.record_id == record.record_id
@@ -340,32 +364,11 @@ async def test_structured_results_resolve_through_recorded_references(record_fac
     ingested = await backend.ingest(record_factory("doc-1", "1", "content"), principal, partition)
     _, unit, item = ingested.backend_reference.value.split(":")
 
-    def chunk(chunk_id, text, item_id, index=None):
-        payload = {"text": text, "document_id": item_id}
-        if index is not None:
-            payload["chunk_index"] = index
-        return {"id": chunk_id, "score": 0.5, "payload": payload}
-
     runtime.entries = [
-        {
-            "kind": "hybrid",
-            "text": "rendered context",
-            "dataset_id": unit,
-            "raw": {
-                "result_object": {
-                    "chunks": [
-                        chunk("c1", "resolved passage", item, 3),
-                        chunk("c2", "orphan passage", "item-the-engine-never-wrote"),
-                    ]
-                }
-            },
-        },
-        {
-            "kind": "hybrid",
-            "text": "other unit",
-            "dataset_id": "unit-outside-the-request",
-            "raw": {"result_object": {"chunks": [chunk("c3", "foreign passage", item)]}},
-        },
+        _chunk_entry(unit, item, "resolved passage", 3, "c1"),
+        _chunk_entry(unit, "item-the-engine-never-wrote", "orphan passage", None, "c2"),
+        _chunk_entry("unit-outside-the-request", item, "foreign passage", None, "c3"),
+        {**_chunk_entry(unit, item, "unknown kind", None, "c4"), "kind": "graph_completion"},
     ]
 
     result = await backend.query(QueryRequest("passage"), principal, (partition,))
@@ -377,11 +380,30 @@ async def test_structured_results_resolve_through_recorded_references(record_fac
 
 
 @pytest.mark.asyncio
+async def test_partitions_interleave_by_rank(record_factory):
+    runtime = _StructuredRuntime()
+    backend = CogneeBackend(runtime, resolve_user)
+    principal = PrincipalContext("prn_reader", "trace-interleave")
+    first, second = AccessPartitionRef("prt_first"), AccessPartitionRef("prt_second")
+    refs = {}
+    for partition, record_id in ((first, "a"), (first, "b"), (second, "c"), (second, "d")):
+        ingested = await backend.ingest(record_factory(record_id, "1", "x"), principal, partition)
+        refs[record_id] = ingested.backend_reference.value.split(":")[1:]
+    runtime.entries = [
+        _chunk_entry(*refs[name], f"passage {name}", 0, f"chunk-{name}") for name in "abcd"
+    ]
+
+    result = await backend.query(QueryRequest("passage", limit=3), principal, (first, second))
+
+    assert [item.record_id for item in result.evidence] == ["a", "c", "b"]
+
+
+@pytest.mark.asyncio
 async def test_runtime_pins_the_retriever_and_disables_routing(monkeypatch):
     captured = {}
 
     class SearchType(enum.Enum):
-        HYBRID_COMPLETION = "HYBRID_COMPLETION"
+        CHUNKS = "CHUNKS"
 
     async def recall(**kwargs):
         captured.update(kwargs)
@@ -400,7 +422,8 @@ async def test_runtime_pins_the_retriever_and_disables_routing(monkeypatch):
 
     await runtime.recall(QueryRequest("question", 5), (_CogneeBinding("n", unit),), object())
 
-    assert captured["query_type"] is SearchType.HYBRID_COMPLETION
+    assert captured["query_type"] is SearchType.CHUNKS
     assert captured["auto_route"] is False
-    assert captured["only_context"] is True and captured["include_references"] is True
+    # Context-only mode would merge chunks into one rendered string without item ids.
+    assert captured["only_context"] is False
     assert captured["dataset_ids"] == [UUID(unit)] and captured["top_k"] == 5

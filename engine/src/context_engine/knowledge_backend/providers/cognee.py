@@ -281,53 +281,55 @@ class CogneeBackend:
     ) -> tuple[EvidenceItem, ...]:
         """Turn retrieved native chunks into engine evidence through durable references.
 
-        Every chunk names the native item it came from. Only items the engine wrote, whose
-        reference is still recorded, and that sit in an authorized partition become evidence;
-        anything else, including leftovers of replaced versions, stays out (ADR 0008). The
-        version is left to the engine, which takes it from the ledger.
+        Each native entry is one retrieved chunk that names the item it came from. Only items
+        the engine wrote, whose reference is still recorded, and that sit in an authorized
+        partition become evidence; anything else, including leftovers of replaced versions and
+        any entry of another shape, stays out (ADR 0008). The version is left to the engine,
+        which takes it from the ledger.
+
+        The provider returns chunks in rank order within each unit but no comparable score, so
+        units are interleaved by rank and the score is derived from that rank.
         """
 
-        evidence: dict[str, EvidenceItem] = {}
+        ranked: list[tuple[int, int, EvidenceItem]] = []
+        seen: set[str] = set()
+        unit_order = {unit: position for position, unit in enumerate(units)}
+        unit_ranks: dict[str, int] = {}
         single_unit = next(iter(units)) if len(units) == 1 else None
-        for index, native in enumerate(native_results):
+        for native in native_results:
             entry = _as_mapping(native)
-            chunks = _native_chunks(entry)
-            if not chunks:
-                legacy = _translate_evidence(native, index)
-                if not legacy.record_id.startswith("unresolved"):
-                    evidence.setdefault(legacy.evidence_id, legacy)
+            chunk = _native_chunk(entry)
+            if chunk is None:
                 continue
-            raw = _as_mapping(entry.get("raw"))
-            unit = str(entry.get("dataset_id") or raw.get("dataset_id") or single_unit or "")
+            item_id, chunk_id, passage, chunk_index = chunk
+            unit = str(entry.get("dataset_id") or single_unit or "")
             partition = units.get(unit)
             if partition is None:
                 continue
-            for chunk in chunks:
-                payload = _as_mapping(chunk.get("payload")) or chunk
-                item_id = payload.get("document_id")
-                passage = str(payload.get("text") or "").strip()
-                if not item_id or not passage:
-                    continue
-                location = self._state.find_record(_native_reference(unit, str(item_id)).value)
-                if location is None or location[0] != partition:
-                    continue
-                _, source_id, record_id = location
-                chunk_id = str(chunk.get("id") or payload.get("id") or "")
-                digest = hashlib.sha256(
-                    f"{partition}\0{source_id}\0{record_id}\0{chunk_id}\0{passage}".encode()
-                ).hexdigest()[:24]
-                chunk_index = payload.get("chunk_index")
-                item = EvidenceItem(
-                    evidence_id=f"evi_{digest}",
-                    record_id=record_id,
-                    source_id=source_id,
-                    source_version="",
-                    passage=passage,
-                    score=float(chunk.get("score") or 0.0),
-                    location=f"chunk:{chunk_index}" if chunk_index is not None else None,
-                )
-                evidence.setdefault(item.evidence_id, item)
-        return tuple(evidence.values())
+            rank = unit_ranks.get(unit, 0)
+            unit_ranks[unit] = rank + 1
+            location = self._state.find_record(_native_reference(unit, item_id).value)
+            if location is None or location[0] != partition:
+                continue
+            _, source_id, record_id = location
+            digest = hashlib.sha256(
+                f"{partition}\0{source_id}\0{record_id}\0{chunk_id}\0{passage}".encode()
+            ).hexdigest()[:24]
+            item = EvidenceItem(
+                evidence_id=f"evi_{digest}",
+                record_id=record_id,
+                source_id=source_id,
+                source_version="",
+                passage=passage,
+                score=1.0 / (rank + 1),
+                location=f"chunk:{chunk_index}" if chunk_index is not None else None,
+            )
+            if item.evidence_id in seen:
+                continue
+            seen.add(item.evidence_id)
+            ranked.append((rank, unit_order[unit], item))
+        ranked.sort(key=lambda value: (value[0], value[1]))
+        return tuple(item for _, _, item in ranked)
 
     async def update(
         self,
@@ -594,15 +596,18 @@ class CogneeRuntime:
 
         ids = [UUID(item.dataset_id) for item in bindings if item.dataset_id]
         # A fixed retriever keeps result shapes stable, and turning routing off means no
-        # question can be routed to raw graph queries however it is phrased.
+        # question can be routed to raw graph queries however it is phrased. The chunk
+        # retriever is the one whose results name the item each chunk came from; graph and
+        # completion retrievers return rendered context that cannot be traced to a record.
+        # Leaving context-only mode off is what keeps chunks separate; this retriever never
+        # calls a model to produce them.
         return await cognee.recall(
             query_text=request.text,
-            query_type=SearchType.HYBRID_COMPLETION,
+            query_type=SearchType.CHUNKS,
             auto_route=False,
             dataset_ids=ids,
             top_k=request.limit,
-            only_context=True,
-            include_references=True,
+            only_context=False,
             user=user,
         )
 
@@ -697,48 +702,6 @@ class CogneeRuntime:
         return True, "knowledge provider ready"
 
 
-def _translate_evidence(value: Any, index: int) -> EvidenceItem:
-    if hasattr(value, "model_dump"):
-        raw = value.model_dump()
-    elif isinstance(value, Mapping):
-        raw = dict(value)
-    else:
-        raw = {"text": str(value)}
-
-    passage = str(raw.get("text") or raw.get("content") or raw.get("result") or "")
-    metadata = raw.get("metadata") if isinstance(raw.get("metadata"), Mapping) else {}
-    external_metadata = (
-        metadata.get("external_metadata")
-        if isinstance(metadata.get("external_metadata"), Mapping)
-        else raw.get("external_metadata")
-        if isinstance(raw.get("external_metadata"), Mapping)
-        else {}
-    )
-    metadata = {**metadata, **external_metadata}
-    record_id = str(
-        metadata.get("record_id")
-        or metadata.get("source_record_id")
-        or raw.get("record_id")
-        or f"unresolved-{index}"
-    )
-    source_id = str(metadata.get("source_id") or raw.get("source_id") or "unresolved")
-    source_version = str(
-        metadata.get("source_version") or raw.get("source_version") or "unresolved"
-    )
-    digest = hashlib.sha256(
-        f"{record_id}\0{source_version}\0{index}\0{passage}".encode()
-    ).hexdigest()[:24]
-    return EvidenceItem(
-        evidence_id=f"evi_{digest}",
-        record_id=record_id,
-        source_id=source_id,
-        source_version=source_version,
-        passage=passage,
-        score=float(raw.get("score") or 0.0),
-        location=str(metadata.get("location")) if metadata.get("location") else None,
-    )
-
-
 _PROCESSING_PIPELINE = "cognify_pipeline"
 
 
@@ -755,15 +718,22 @@ def _as_mapping(value: Any) -> dict[str, Any]:
     return {}
 
 
-def _native_chunks(entry: Mapping[str, Any]) -> list[dict[str, Any]]:
-    """Return the retrieved chunks of one native search entry, wherever the SDK put them."""
+def _native_chunk(entry: Mapping[str, Any]) -> tuple[str, str, str, int | None] | None:
+    """Return the item id, chunk id, passage, and chunk index of one native chunk entry."""
 
+    if entry.get("kind") != "chunk":
+        return None
+    metadata = _as_mapping(entry.get("metadata"))
     raw = _as_mapping(entry.get("raw"))
-    for container in (raw.get("result_object"), entry.get("result_object"), raw):
-        chunks = _as_mapping(container).get("chunks")
-        if isinstance(chunks, list):
-            return [_as_mapping(chunk) for chunk in chunks]
-    return []
+    item_id = str(metadata.get("data_id") or raw.get("document_id") or "")
+    passage = str(raw.get("text") or entry.get("text") or "").strip()
+    if not item_id or not passage:
+        return None
+    chunk_id = str(metadata.get("chunk_id") or raw.get("id") or "")
+    chunk_index = metadata.get("chunk_index", raw.get("chunk_index"))
+    if isinstance(chunk_index, bool) or not isinstance(chunk_index, int):
+        chunk_index = None
+    return item_id, chunk_id, passage, chunk_index
 
 
 def _item_metadata(entry: Any) -> Mapping[str, Any]:
@@ -868,7 +838,6 @@ def assert_runtime_matches_pinned_sdk(runtime: CogneeRuntime | None = None) -> N
             "dataset_ids",
             "top_k",
             "only_context",
-            "include_references",
             "user",
         },
         "forget": {"data_id", "dataset_id", "user"},
@@ -916,8 +885,8 @@ def assert_runtime_matches_pinned_sdk(runtime: CogneeRuntime | None = None) -> N
             )
     from cognee.modules.search.types import SearchType
 
-    if not hasattr(SearchType, "HYBRID_COMPLETION"):
-        raise RuntimeError("Pinned provider no longer offers the hybrid retriever")
+    if not hasattr(SearchType, "CHUNKS"):
+        raise RuntimeError("Pinned provider no longer offers the chunk retriever")
     status_api = getattr(cognee, "datasets", None)
     for operation, parameters in {
         "get_progress": {"dataset_ids", "pipeline_names"},
