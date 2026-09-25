@@ -67,7 +67,8 @@ class FakeCogneeRuntime:
 
     async def list_items(self, binding, user):
         self.calls.append(("list_items", binding.dataset_id))
-        return list(self.items.get(binding.dataset_id, []))
+        # The live listing returns stored rows with attributes, not mappings or models.
+        return [types.SimpleNamespace(**item) for item in self.items.get(binding.dataset_id, [])]
 
     async def grant_read(self, binding, reader, owner):
         self.calls.append(("grant_read", binding.dataset_id, reader.id, owner.id))
