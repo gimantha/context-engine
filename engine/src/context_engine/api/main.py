@@ -12,6 +12,17 @@ from context_engine.security.identity import is_loopback_host
 from .app import create_app
 
 
+def refuse_static_auth_off_loopback(settings: Settings, host: str) -> None:
+    """Stop before serving static pre-shared tokens on an address other hosts can reach."""
+
+    # Static pre-shared tokens are a local development mode; never expose them off-host.
+    if settings.auth_mode == "static" and not is_loopback_host(host):
+        raise SystemExit(
+            "Static authentication mode only serves loopback addresses; "
+            "use --host 127.0.0.1 or configure a provider-backed mode."
+        )
+
+
 def main() -> None:
     """Run the REST server or perform a startup-only validation."""
 
@@ -21,12 +32,8 @@ def main() -> None:
     parser.add_argument("--check", action="store_true", help="Migrate and validate startup")
     args = parser.parse_args()
     settings = Settings.from_env()
-    # Static pre-shared tokens are a local development mode; never expose them off-host.
-    if not args.check and settings.auth_mode == "static" and not is_loopback_host(args.host):
-        raise SystemExit(
-            "Static authentication mode only serves loopback addresses; "
-            "use --host 127.0.0.1 or configure a provider-backed mode."
-        )
+    if not args.check:
+        refuse_static_auth_off_loopback(settings, args.host)
     app = create_app(settings)
     if args.check:
         print("Context Engine API startup check passed.")

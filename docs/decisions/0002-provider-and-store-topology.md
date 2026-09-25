@@ -51,3 +51,10 @@ The live two-audience and lifecycle matrix passed against this topology on 2026-
 - **The engine owns process logging.** Importing the provider replaced every root log handler, which dropped the fields of the engine's audit events. Its console output also carried query text. The adapter restores the engine's handlers after import, and the engine keeps third-party records only at warning level and above.
 
 Validation: `engine/tests/test_live_cognee_provider.py` and `tests/end-to-end/test_live_provider_path.py`, run with `pytest -m live_provider`, plus the upload, setup, storage-root, and logging tests in `engine/tests/test_cognee_adapter.py` and `engine/tests/test_logging.py`.
+
+## Revision (2026-09-25, single-process server)
+
+- **Provider mode runs as one process.** `context-engine-serve` serves the REST API and runs the worker loop as a background task on the same event loop. The API and the worker share one knowledge backend and one metrics registry. Readiness reports unavailable while the loop is failing, and the loop restarts on its own. On shutdown the current job gets up to the worker lease period to finish; an interrupted job is retried on the next start.
+- **The separate commands stay.** `context-engine-api` and `context-engine-worker` remain for ledger-only mode and for a later topology that allows separate processes.
+- **The topology choice is still open.** A server graph store, or provider reads served by the worker process, must be chosen before the M6 gate (`docs/TODO.md`).
+- Validation: `engine/tests/test_serve.py`, and a live run of `context-engine-serve` against the pinned provider on 2026-09-25. With the worker loop running in the same process, both readers' queries returned only their own evidence, where the same scenario with separate processes failed every query.

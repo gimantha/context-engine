@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Callable, Sequence
 from typing import Annotated
 from uuid import uuid4
 
@@ -116,11 +117,14 @@ def create_app(
     metrics: MetricsRegistry | None = None,
     verifier: TokenVerifier | None = None,
     knowledge_backend: object | None = None,
+    readiness_checks: Sequence[Callable[[], bool]] = (),
 ) -> FastAPI:
     """Build the REST application and wire its control-plane dependencies.
 
     `knowledge_backend` lets tests inject a backend; it is typed opaquely because this package
     never depends on the backend port. Otherwise the application layer builds it from settings.
+    `readiness_checks` lets the process that serves the app add conditions to readiness, such
+    as a worker loop running in the same process.
     """
 
     settings = settings or Settings.from_env()
@@ -229,7 +233,7 @@ def create_app(
 
     @app.get("/v1/health/ready", response_model=HealthResponse)
     async def readiness(response: Response) -> HealthResponse:
-        ready = database.ping()
+        ready = database.ping() and all(check() for check in readiness_checks)
         if not ready:
             response.status_code = 503
         return HealthResponse(status="ok" if ready else "unavailable")

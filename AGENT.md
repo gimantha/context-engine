@@ -31,6 +31,7 @@ Milestone 1 has a runnable REST API and independent worker backed by a migrated 
 | `engine/src/context_engine/domain/` | Provider-neutral control-plane models |
 | `engine/src/context_engine/persistence/` | SQLite migrations and durable repositories |
 | `engine/src/context_engine/worker/` | Transactional-outbox dispatch and leased job execution |
+| `engine/src/context_engine/serve.py` | Single-process entrypoint that serves the API and runs the worker loop |
 | `engine/src/context_engine/observability/` | Secret-safe structured logs and metrics |
 | `engine/src/context_engine/knowledge_backend/` | Engine-owned backend port and immutable types |
 | `engine/src/context_engine/knowledge_backend/providers/` | Private native-provider integration and translation |
@@ -42,7 +43,7 @@ Milestone 1 has a runnable REST API and independent worker backed by a migrated 
 | `tests/end-to-end/` | Reference-connector lifecycle tests against the REST API and worker |
 | `scripts/check_provider_boundary.py` | Automated public-boundary enforcement |
 
-The dependency flow is `REST API → application service → domain/persistence`. Client applications use the REST API only. The API and MCP packages must never import the knowledge-backend port or a provider implementation. Asynchronous provider work belongs in a worker handler, which may depend on the provider-neutral port. Only modules below `knowledge_backend/providers/` may import a native provider package or manipulate its native objects. Translate all native output, errors, and identifiers into engine-owned values before returning from an adapter.
+The dependency flow is `REST API → application service → domain/persistence`. Client applications use the REST API only. The API and MCP packages must never import the knowledge-backend port or a provider implementation. Asynchronous provider work belongs in a worker handler, which may depend on the provider-neutral port. The API and worker packages never import each other; `serve.py` composes them for provider mode, where the local stores allow one process only. Only modules below `knowledge_backend/providers/` may import a native provider package or manipulate its native objects. Translate all native output, errors, and identifiers into engine-owned values before returning from an adapter.
 
 Do not bypass the port with raw graph, vector, relational, cache, or provider calls. Do not add a broad default identity or scope. Every ingest, query, update, enrichment, and deletion must carry an explicit `PrincipalContext` and explicit access partition input resolved by engine policy.
 
@@ -113,6 +114,7 @@ uv run ruff check src tests ../tests
 uv run pytest -m "not live_provider"
 uv run context-engine-api --check
 uv run context-engine-worker --check
+uv run context-engine-serve --check
 cd ..
 python3 scripts/check_provider_boundary.py
 ```
