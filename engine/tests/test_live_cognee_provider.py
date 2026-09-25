@@ -45,11 +45,10 @@ async def test_live_provider_two_audience_lifecycle(tmp_path):
     runtime = CogneeRuntime(settings)
     runtime._module()
 
-    from cognee.modules.engine.operations.setup import setup
     from cognee.modules.users.permissions.methods import authorized_give_permission_on_datasets
 
+    # No manual provider setup: the runtime must prepare its own stores, as in the worker.
     assert_runtime_matches_pinned_sdk(runtime)
-    await setup()
 
     state = InMemoryBackendState()
     resolver = CogneeIdentityResolver(runtime, state)

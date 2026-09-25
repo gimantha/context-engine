@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import enum
 import os
 import sys
@@ -409,18 +410,40 @@ async def test_runtime_pins_the_retriever_and_disables_routing(monkeypatch):
         captured.update(kwargs)
         return []
 
+    setups = []
+
+    async def setup():
+        setups.append(True)
+        await asyncio.sleep(0)
+
     fake = types.ModuleType("cognee")
     fake.recall = recall
-    for name in ("cognee", "cognee.modules", "cognee.modules.search"):
+    for name in (
+        "cognee",
+        "cognee.modules",
+        "cognee.modules.search",
+        "cognee.modules.engine",
+        "cognee.modules.engine.operations",
+    ):
         monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
     search_types = types.ModuleType("cognee.modules.search.types")
     search_types.SearchType = SearchType
     monkeypatch.setitem(sys.modules, "cognee.modules.search.types", search_types)
+    setup_module = types.ModuleType("cognee.modules.engine.operations.setup")
+    setup_module.setup = setup
+    monkeypatch.setitem(sys.modules, "cognee.modules.engine.operations.setup", setup_module)
     runtime = CogneeRuntime(KnowledgeBackendSettings())
     monkeypatch.setattr(runtime, "_module", lambda: fake)
     unit = str(uuid4())
+    bindings = (_CogneeBinding("n", unit),)
 
-    await runtime.recall(QueryRequest("question", 5), (_CogneeBinding("n", unit),), object())
+    await asyncio.gather(
+        runtime.recall(QueryRequest("question", 5), bindings, object()),
+        runtime.recall(QueryRequest("question", 5), bindings, object()),
+    )
+
+    # The provider's own stores are created once per process, before the first operation.
+    assert setups == [True]
 
     assert captured["query_type"] is SearchType.CHUNKS
     assert captured["auto_route"] is False
