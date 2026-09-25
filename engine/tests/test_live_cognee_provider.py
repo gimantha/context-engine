@@ -122,13 +122,15 @@ async def test_live_provider_two_audience_lifecycle(tmp_path):
         record_id=alpha_record.record_id,
         version="2",
     )
-    await backend.update(replacement, service, alpha_partition)
+    updated = await backend.update(replacement, service, alpha_partition)
+    # A replacement is a new native item, so later work must use the reference it returned.
+    assert updated.backend_reference != alpha_result.backend_reference
     stale = await backend.query(QueryRequest(alpha_canary), alpha, (alpha_partition,))
     current = await backend.query(QueryRequest(replacement_canary), alpha, (alpha_partition,))
     assert alpha_canary not in repr(stale)
     assert replacement_canary in repr(current)
 
-    assert (await backend.delete(alpha_result.backend_reference, service, alpha_partition)).deleted
+    assert (await backend.delete(updated.backend_reference, service, alpha_partition)).deleted
     after_delete = await backend.query(QueryRequest(replacement_canary), alpha, (alpha_partition,))
     assert replacement_canary not in repr(after_delete)
 
