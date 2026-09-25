@@ -763,12 +763,23 @@ def _native_chunk(entry: Mapping[str, Any]) -> tuple[str, str, str, int | None] 
 
 
 def _item_metadata(entry: Any) -> Mapping[str, Any]:
-    """Return the engine metadata attached to a native content item."""
+    """Return the engine metadata attached to a native content item.
 
-    raw = entry.model_dump() if hasattr(entry, "model_dump") else entry
-    if not isinstance(raw, Mapping):
-        return {}
-    metadata = raw.get("external_metadata")
+    The native listing returns stored rows rather than serializable models, so the metadata
+    is read as an attribute unless the entry is a mapping or a model.
+    """
+
+    if isinstance(entry, Mapping):
+        metadata = entry.get("external_metadata")
+    elif hasattr(entry, "model_dump"):
+        metadata = _as_mapping(entry).get("external_metadata")
+    else:
+        metadata = getattr(entry, "external_metadata", None)
+    if isinstance(metadata, str):
+        try:
+            metadata = json.loads(metadata)
+        except ValueError:
+            return {}
     return metadata if isinstance(metadata, Mapping) else {}
 
 
