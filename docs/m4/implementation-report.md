@@ -1,10 +1,10 @@
 # M4 Knowledge-Backend Pipeline and Graph Lifecycle
 
-**Status:** All three slices implemented; the live-provider gate is still not run
+**Status:** All three slices implemented; the live-provider gate passed on 2026-09-25
 
-**Date:** 2026-09-24
+**Date:** 2026-09-25
 
-**Release limitation:** The provider-backed paths are verified only against the deterministic backend, and the provider's result shapes come from its pinned source rather than a live run. The M0 live isolation, stale-artifact, and deletion checks remain unverified
+**Release limitation:** With the local embedded stores, the API and the worker must run in one process; separate processes cannot share the graph store (ADR 0002 revision). Provider search history keeps questions and passages after deletion (threat model T19), and live concurrency and partial-write injection have not been run
 
 ## Plan
 
@@ -51,7 +51,7 @@ Migration `0006_provider_pipeline.sql` adds the ledger fields, `record_locations
 - **Context queries.** `POST /v1/queries` checks `context.read`, resolves the caller's readable partitions with the any-audience rule, queries the backend as the caller, and returns engine evidence with record, source, version, passage, location, and source URL. Readers outside every audience receive an insufficient-evidence result. Answer mode is rejected until M5.
 - **Visibility barrier.** A passage is returned only when its record is active, indexed, in an allowed partition, and physically present there at its current version (ADR 0008 revision).
 - **Lineage through engine references.** The adapter resolves each retrieved chunk through the native item it names and the durable references the engine recorded. Unknown, replaced, or out-of-scope items are dropped.
-- **Pinned retriever.** The adapter uses the provider's hybrid retriever with automatic routing off.
+- **Pinned retriever.** The adapter uses the provider's chunk retriever with automatic routing off. The hybrid retriever was replaced after the live run showed it returns no chunk lineage (ADR 0008 revision).
 - **Backend refusals.** When the backend refuses a partition engine policy allows, the query falls back to one partition at a time and the worker is told to resynchronize read access.
 - **Enrichment jobs.** `POST /v1/spaces/{spaceId}/enrichments` needs `context.enrich`. The worker enriches each partition separately as the service identity and records the result on the job (ADR 0004 revision). Jobs are routed by operation; unsupported operations fail terminally.
 - **Cross-check.** The worker checks the backend against the ledger on a schedule, using the version whose content was written, and flags lost copies as reconcile-required (ADR 0010 revision).
@@ -64,32 +64,52 @@ Migration `0007_written_versions.sql` adds `record_locations.written_version`.
 
 | M4 gate item | Status | Evidence |
 | --- | --- | --- |
-| Live isolation, update, and deletion checks against real stores | **Not run** | Needs model and embedding credentials; the test is rewritten for the service-owner model |
+| Live isolation, update, and deletion checks against real stores | Pass on 2026-09-25 | `test_live_cognee_provider.py` with residue scan; `tests/end-to-end/test_live_provider_path.py` |
 | Records map to deterministic partitions | Pass | `test_ledger_partitions.py` |
 | Bindings, references, and identities survive a restart | Pass | `test_backend_state.py` |
 | No default provider identity | Pass | Resolver tests; every principal gets its own account |
-| Query the ingested record through its context space | Pass against the deterministic backend | `test_query_api.py` |
-| Enrichment creates traceable derived data | Partly: enrichment runs per partition and is recorded on the job; the provider adapter reports no artifact lineage yet | `test_query_api.py` enrichment test |
-| Replacing a record supersedes old answers | Pass against the deterministic backend; live gate pending | `test_record_indexer.py` replacement and residue tests |
-| Deleting a record removes every searchable artifact | Pass against the deterministic backend for item-level residue; raw-file and graph residue pending the live scan | `test_record_indexer.py` deletion and residue tests |
+| Query the ingested record through its context space | Pass, live in one process | `test_query_api.py`; live end-to-end test |
+| Enrichment creates traceable derived data | Partly: enrichment runs per partition live and is recorded on the job; the provider adapter reports no artifact lineage yet | `test_query_api.py` enrichment test; live end-to-end test |
+| Replacing a record supersedes old answers | Pass, live | `test_record_indexer.py`; both live tests |
+| Deleting a record removes every searchable artifact | Pass, live, for every live store; bytes remain in uncompacted storage and provider search history (ADR 0007 revision) | `test_record_indexer.py`; live residue scan |
 | Partial writes are never silently repeated | Pass | Crash-before and crash-after tests in `test_record_indexer.py` |
-| Backend read access follows engine policy | Pass against the deterministic backend | `test_read_access.py` |
+| Backend read access follows engine policy | Pass, live | `test_read_access.py`; live tests grant and query per reader |
 | Swapping in a test backend needs no application change | Holds so far | Dummy backend passes the shared contract tests |
 | No public payload exposes provider terms | Pass | Boundary check and contract tests |
 
-Validation performed on 2026-09-25 from `engine/`, after slice 3:
+Validation performed on 2026-09-25 from `engine/`, after the live fixes, with the provider extra installed:
 
 ```text
 ruff format --check: passed
 ruff check: passed
-pytest -m "not live_provider": 116 passed, 1 provider-extra check skipped, 1 live test deselected
-context-engine-api --check: passed
-context-engine-worker --check: passed
+pytest -m "not live_provider": 124 passed, 2 live tests skipped
+pytest -m live_provider with model credentials: 2 passed
 context-engine-migrate: applied 7 migrations to a fresh database
-context-engine-worker --check with CONTEXT_ENGINE_KNOWLEDGE_BACKEND=provider: passed without the provider installed
+context-engine-api --check and context-engine-worker --check in provider mode: passed
 provider boundary check: passed
 ```
 
+## Live verification (2026-09-25)
+
+The first live runs exposed defects that the deterministic backend could not show. All are fixed and covered by tests. The spike report lists them in order.
+
+- **Chunk retriever.** The hybrid retriever returned rendered context with no chunk lineage, so every query failed safe as insufficient evidence. The adapter now pins the chunk retriever (ADR 0008 revision).
+- **Pinned item ids.** The provider's write result lists every item of the unit, so updates in a shared partition kept the old item and deletes removed the wrong one. Each write now pins a derived item id, and the result must confirm it (ADR 0007 revision).
+- **Row listing.** Items come back as stored rows, so the absence checks and the scheduled cross-check read no metadata. The cross-check marked every record reconcile-required, and every later change to those records failed. Fixed (ADR 0007 revision).
+- **Uploads, not strings.** The provider reads a string that looks like a path or address as one. Record text now travels as an upload, and provider local reads are confined to its data directory (ADR 0002 revision, T13).
+- **Provider setup and storage.** The runtime creates the provider's stores before the first operation, and it refuses a second storage root in one process.
+- **Logging.** Importing the provider replaced the engine's log handlers. They are restored, and third-party records below warning are dropped (T14).
+
+Open after the live run:
+
+- **One process only.** With the local embedded stores, the API and the worker cannot run as separate processes: the worker's graph-store lock makes every API query fail. Choosing a multi-process topology is open (ADR 0002 revision).
+- **Provider search history.** It keeps every question and the passages returned, and deletion does not clear them (T19).
+- **Physical erasure.** Deleted text stays in uncompacted vector and graph storage until compaction (ADR 0007 revision).
+- **Live concurrency and partial-write injection.** Neither has been run.
+
 ## Running the live gate
 
-Follow the README live-provider section with explicit model and embedding credentials. The test ingests three records as the service identity, grants read access to two reader identities, and checks cross-reader isolation, provider-side denial, update supersession, and post-delete absence. It does not yet inspect the raw text files and derived stores directly; that residue scan arrives with the slice 2 delete path.
+Follow the README live-provider section with explicit model and embedding credentials, then run `pytest -m live_provider` from `engine/`. Two tests run:
+
+- **Two-audience lifecycle.** It ingests three records as the service identity and grants read access to two readers. It then checks isolation, provider-side denial, update supersession, and post-delete absence, and scans the provider's live stores for residue of replaced and deleted versions.
+- **End to end.** It drives the REST API and the worker in one process through delivery, indexing, queries, replacement, an audience move, deletion, enrichment, the cross-check, and progress.
