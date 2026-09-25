@@ -181,7 +181,9 @@ def _native_handle(principal_id: str) -> str:
     """Return a deterministic native login handle that reveals nothing about the principal."""
 
     digest = hashlib.sha256(principal_id.encode()).hexdigest()[:32]
-    return f"engine-{digest}@context-engine.invalid"
+    # The provider validates handles as email addresses and rejects special-use domains such as
+    # `.invalid`; `.internal` is reserved for private use and never delegated. No mail is sent.
+    return f"engine-{digest}@context-engine.internal"
 
 
 def _native_reference(dataset_id: str, data_id: str) -> BackendReference:
