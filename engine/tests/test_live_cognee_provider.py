@@ -89,8 +89,10 @@ def _live_enabled() -> bool:
 
 @pytest.mark.skipif(not _live_enabled(), reason="live provider credentials are not configured")
 @pytest.mark.asyncio
-async def test_live_provider_two_audience_lifecycle(tmp_path):
-    settings = replace(KnowledgeBackendSettings.from_env(), storage_path=tmp_path)
+async def test_live_provider_two_audience_lifecycle(tmp_path_factory):
+    # The provider binds one storage root per process, so live tests share one per session.
+    storage = tmp_path_factory.getbasetemp() / "live-provider-store"
+    settings = replace(KnowledgeBackendSettings.from_env(), storage_path=storage)
     runtime = CogneeRuntime(settings)
     runtime._module()
 
@@ -179,7 +181,7 @@ async def test_live_provider_two_audience_lifecycle(tmp_path):
     assert replacement_canary in repr(current)
 
     # The scan must see what is still there before it can prove what is gone.
-    assert _live_residue(tmp_path, beta_canary)
+    assert _live_residue(storage, beta_canary)
     assert await _graph_holds(native_unit(beta_result), service_user, beta_canary)
 
     assert (await backend.delete(updated.backend_reference, service, alpha_partition)).deleted
@@ -195,5 +197,5 @@ async def test_live_provider_two_audience_lifecycle(tmp_path):
         (replacement_canary, alpha_result),
         (beta_canary, beta_result),
     ):
-        assert _live_residue(tmp_path, canary) == []
+        assert _live_residue(storage, canary) == []
         assert not await _graph_holds(native_unit(result), service_user, canary)
