@@ -104,7 +104,7 @@ Open after the live run:
 
 - **One process only.** With the local embedded stores, the API and the worker cannot run as separate processes: the worker's graph-store lock makes every API query fail. Choosing a multi-process topology is open (ADR 0002 revision).
 - **Provider search history.** It keeps every question and the passages returned, and deletion does not clear them (T19).
-- **Physical erasure.** Deleted text stays in uncompacted vector and graph storage until compaction (ADR 0007 revision).
+- **Physical erasure.** Deleted text stays in uncompacted vector, relational, and graph storage. Compaction and graph rebuilds are planned for M7 (ADR 0007 revision).
 - **Live concurrency and partial-write injection.** Neither has been run.
 
 ## Running the live gate

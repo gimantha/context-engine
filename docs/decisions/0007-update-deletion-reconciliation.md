@@ -51,7 +51,10 @@ The first runs against the pinned provider found two defects that the determinis
 
 Two retention items remain open. Neither is reachable through any engine read path.
 
-- **Physical residue until compaction.** Deleted text stays in the bytes of vector-store data fragments and graph-store pages until those stores compact. Live rows and graph nodes no longer hold it. An erasure guarantee needs scheduled compaction or a rebuild of the partition. Owner: Operations, M7.
+- **Physical residue until compaction.** Deleted text stays in the bytes of vector-store data fragments and graph-store pages until those stores compact. Live rows and graph nodes no longer hold it. Nothing compacts today, so the bytes stay until later writes happen to reuse the space. Physical erasure is planned for M7. Owner: Operations. What each store needs, as found on 2026-09-25:
+  - **Vector store.** A delete only records which rows are gone. The data files are rewritten when the store's optimize step runs, and old versions are removed only with a zero retention period; the default keeps seven days. The provider runs this step only during one internal migration.
+  - **Relational store.** Deleted rows stay in free pages because secure delete is off. A vacuum removes them; on a copy of the test store, it did.
+  - **Graph store.** Checkpoints only make pending writes durable, and the pinned graph engine offers no vacuum or compaction. A guarantee needs the partition's graph rebuilt from its live data, as in the deletion fallback above.
 - **Provider search history.** Every provider query records the question and the passages it returned, per isolation unit, and deletion does not clear either. Question text and passages of deleted records therefore persist in the provider's relational store. The fix is either to purge the history the engine's queries create, or to call the provider's retrieval below the layer that records it. Both depend on provider internals, so the choice is open (threat model T19). Owner: Backend owner.
 
 Validation: `engine/tests/test_live_cognee_provider.py`, run with explicit model and embedding credentials, and the pinned-id, row-listing, and upload tests in `engine/tests/test_cognee_adapter.py`.
