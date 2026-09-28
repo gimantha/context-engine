@@ -17,11 +17,13 @@ import context_engine_connectors.core;
 # `settings` is the type-specific bag (credentials, channels, folder ids, ...)
 # that the registered connector type's factory decodes into its own typed record.
 public type ConnectorInstanceConfig record {|
-    # Unique identity of this configuration, used in logs and (later) leasing.
+    # Unique identity of this configuration, used in logs and (later) leasing. Two
+    # instances may not share an id.
     string instanceId;
     # Registry key of the connector type to run, e.g. "salesforce", "file-source".
     string connectorType;
-    # The engine-side space/source this instance writes to.
+    # The engine-side space and source this instance writes to. Each instance needs its
+    # own source.
     core:Destination destination;
     # Delay between polls, in seconds; used only by poll modality.
     decimal pollIntervalSeconds = 30;
@@ -58,11 +60,14 @@ public class EnvConfigProvider {
 
     # Decode and return the configured connector instances.
     #
-    # + return - the parsed instances, or an error if the variable is unset or malformed
+    # An unset or empty variable means no managed connectors, not an error, so a host
+    # that only serves file uploads starts without one.
+    #
+    # + return - the parsed instances, or an error if the variable is malformed
     public function provide() returns ConnectorInstanceConfig[]|error {
         string raw = os:getEnv(self.envVar);
         if raw.trim() == "" {
-            return error(string `connector configuration environment variable '${self.envVar}' is not set`);
+            return [];
         }
         json parsed = check raw.fromJsonString();
         return parsed.cloneWithType();
