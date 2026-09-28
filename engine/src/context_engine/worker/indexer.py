@@ -197,6 +197,7 @@ class RecordIndexer:
                 target.backend_ref or "",
                 record.content_hash or "",
                 None,
+                written=False,
             )
             return
         try:

@@ -78,6 +78,11 @@ class Authorizer:
         self._store = store
         self._metrics = metrics
 
+    def policy_version(self) -> int:
+        """Return the current policy version."""
+
+        return self._store.policy_version()
+
     def effective_actions(
         self, principal_id: str, groups: frozenset[str], resource_id: str
     ) -> frozenset[Action] | None:

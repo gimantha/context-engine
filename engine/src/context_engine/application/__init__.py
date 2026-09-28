@@ -6,11 +6,13 @@ from .errors import (
     ConflictError,
     NotFoundError,
     PayloadTooLargeError,
+    ServiceUnavailableError,
     UnauthenticatedError,
     UnsupportedContentTypeError,
     ValidationError,
 )
 from .service import ContextEngineService, UploadPolicy
+from .wiring import build_query_backend
 
 __all__ = [
     "AccessDeniedError",
@@ -19,8 +21,10 @@ __all__ = [
     "ContextEngineService",
     "NotFoundError",
     "PayloadTooLargeError",
+    "ServiceUnavailableError",
     "UnauthenticatedError",
     "UnsupportedContentTypeError",
     "UploadPolicy",
     "ValidationError",
+    "build_query_backend",
 ]

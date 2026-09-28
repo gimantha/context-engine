@@ -419,6 +419,30 @@ class ControlPlaneRepository:
             ).fetchall()
         return tuple(_job(row) for row in rows)
 
+    def find_source_job(
+        self, source_id: str, idempotency_key: str, operations: tuple[JobOperation, ...]
+    ) -> Job | None:
+        """Return the newest job one source's delivery created under an idempotency key.
+
+        Keys are unique per operation, so a connector that reused a key across operations
+        gets its most recent delivery.
+        """
+
+        if not operations:
+            return None
+        placeholders = ", ".join("?" for _ in operations)
+        with self.database.connection() as connection:
+            row = connection.execute(
+                f"""
+                SELECT * FROM jobs
+                WHERE idempotency_key = ? AND operation IN ({placeholders})
+                  AND json_extract(payload_json, '$.sourceId') = ?
+                ORDER BY created_at DESC, id LIMIT 1
+                """,
+                (idempotency_key, *(item.value for item in operations), source_id),
+            ).fetchone()
+        return _job(row) if row else None
+
     def count_source_effects(self) -> int:
         """Return the number of durable source-record effects."""
 

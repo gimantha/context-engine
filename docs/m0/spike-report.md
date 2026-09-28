@@ -1,6 +1,6 @@
 # M0 Spike Report
 
-**Status:** Engine spike implemented; live provider execution pending credentials
+**Status:** Engine spike implemented; live provider matrix passed on 2026-09-25
 
 **Date:** 2026-09-18
 
@@ -55,9 +55,9 @@ This table is updated by the implementation run:
 | Unit and contract tests | Pass | 18 passed; live-provider test deselected |
 | Provider-boundary lint | Pass | No private provider term in public contracts and no forbidden import |
 | Cognee 1.5.4 SDK signature compatibility | Pass | Installed package reports 1.5.4 and all mapped signatures match |
-| Live ingest/query/delete | Blocked | No engine model credential or configured local model endpoint was present |
-| Live two-audience graph isolation | Blocked | Requires configured model and embedding providers |
-| Live partial-write/update residue scan | Blocked | Requires configured model and embedding providers |
+| Live ingest/query/delete | Pass on 2026-09-25 | `test_live_cognee_provider.py` and `tests/end-to-end/test_live_provider_path.py`; see the update below |
+| Live two-audience graph isolation | Pass on 2026-09-25 | Each reader retrieved only its own and shared records; the provider refused an ungranted partition; each partition has its own graph unit |
+| Live partial-write/update residue scan | Update and deletion residue pass; partial-write injection not run live | Live stores hold no trace of replaced or deleted versions; bytes remain in uncompacted storage and in provider search history |
 
 ## Known findings
 
@@ -93,3 +93,28 @@ Do not place credentials in this report or committed environment files.
 ## Update (2026-09-24)
 
 The live test was rewritten for M4 slice 1. The engine's service identity now ingests every record and grants read access per reader before the isolation checks, which is how the worker will use the provider. It has still not been run: no model credentials are present in this workspace.
+
+## Update (2026-09-25, live run)
+
+The live matrix ran with OpenAI `gpt-5-mini` for extraction and `text-embedding-3-small` at 1536 dimensions, configured explicitly through engine settings. Credentials stayed in the ignored local profile.
+
+Final results, from `engine/` with the profile loaded:
+
+```text
+pytest -m live_provider: 2 passed
+  tests/test_live_cognee_provider.py: two-audience lifecycle with residue scan
+  tests/end-to-end/test_live_provider_path.py: REST API and worker, in one process
+pytest -m "not live_provider": 124 passed, 2 live tests skipped
+```
+
+The first runs failed in ways the deterministic backend could not show. Each was fixed and is covered by a test.
+
+1. **Local files refused.** The provider stores text and reads it back as a local file, so refusing all local paths failed every ingestion. Local reads are now confined to the provider's data directory, and record text is handed over as an upload (ADR 0002 revision).
+2. **Retriever without lineage.** The hybrid retriever returns rendered context without the chunks it used, so no passage could be traced to a record, and every query returned insufficient evidence. The adapter now pins the chunk retriever (ADR 0008 revision).
+3. **Wrong item on update.** The provider's write result lists every item of the unit, and the adapter took the first. Updates in a shared partition kept the old item, and deletes then removed the wrong one. The adapter now pins each item's id (ADR 0007 revision).
+4. **Presence check without evidence.** Items are listed as stored rows, so no engine metadata was read. Absence checks passed without evidence, and the scheduled cross-check marked every record reconcile-required. Fixed (ADR 0007 revision).
+5. **Provider stores not created.** The worker failed every job because the provider's relational store did not exist yet. The runtime now runs the provider's setup once per process.
+6. **Engine logging replaced.** Importing the provider removed the engine's log handlers and printed query text. The engine's handlers are restored, and third-party chatter is dropped.
+7. **Two processes cannot share the stores.** The embedded graph store is locked by one process, so the API cannot query while the worker runs. This is an open topology decision (ADR 0002 revision).
+
+Open items: live concurrent-request isolation and partial-write injection, compaction for physical erasure, provider search-history retention (threat model T19), and a multi-process topology.

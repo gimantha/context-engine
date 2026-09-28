@@ -9,12 +9,14 @@ description = "Governed context engine API and durable control plane"
 requires-python = ">=3.12,<3.13"
 dependencies = [
   "fastapi==0.141.1",
+  "python-multipart==0.0.32",
   "uvicorn==0.53.0",
 ]
 
 [project.scripts]
 context-engine-api = "context_engine.api.main:main"
 context-engine-migrate = "context_engine.persistence.migrate:main"
+context-engine-serve = "context_engine.serve:main"
 context-engine-worker = "context_engine.worker.main:main"
 
 [project.optional-dependencies]

@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Callable, Sequence
 from typing import Annotated
 from uuid import uuid4
 
 from fastapi import Depends, FastAPI, Header, Path, Query, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, PlainTextResponse
+from pydantic import ValidationError as SchemaValidationError
 
 from context_engine.application import (
     AccessDeniedError,
@@ -17,12 +19,15 @@ from context_engine.application import (
     ContextEngineService,
     NotFoundError,
     PayloadTooLargeError,
+    ServiceUnavailableError,
     UnauthenticatedError,
     UnsupportedContentTypeError,
     UploadPolicy,
+    ValidationError,
+    build_query_backend,
 )
 from context_engine.config import Settings
-from context_engine.domain import JobState, SourceState, VersionOrdering
+from context_engine.domain import IngestionCommand, JobState, SourceState, VersionOrdering
 from context_engine.observability import (
     MetricsRegistry,
     configure_logging,
@@ -33,6 +38,7 @@ from context_engine.persistence import (
     AuthorizationRepository,
     ControlDatabase,
     ControlPlaneRepository,
+    ReadAccessRepository,
     SourceRepository,
     StagingStore,
 )
@@ -45,11 +51,15 @@ from context_engine.security.identity import (
     provision_static_identities,
 )
 
+from .multipart import read_ingestion_parts
 from .progress import build_progress_router
 from .schemas import (
     CheckpointResponse,
+    ContextQueryRequest,
+    ContextQueryResponse,
     ContextSpaceResponse,
     CreateContextSpaceRequest,
+    DirectIngestionEvent,
     EffectivePermissionsResponse,
     ErrorResponse,
     GrantResponse,
@@ -74,6 +84,7 @@ ResourceId = Annotated[str, Path(min_length=1, max_length=200)]
 GrantId = Annotated[str, Path(pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")]
 RecordId = Annotated[str, Path(min_length=1, max_length=500)]
 IdempotencyKey = Annotated[str, Header(alias="Idempotency-Key", min_length=8, max_length=200)]
+DeliveryKey = Annotated[str, Path(min_length=8, max_length=200)]
 
 
 def _trace_id(request: Request) -> str:
@@ -93,6 +104,8 @@ def _error_status(error: ApplicationError) -> int:
         return 413
     if isinstance(error, UnsupportedContentTypeError):
         return 415
+    if isinstance(error, ServiceUnavailableError):
+        return 503
     return 400
 
 
@@ -108,8 +121,16 @@ def create_app(
     database: ControlDatabase | None = None,
     metrics: MetricsRegistry | None = None,
     verifier: TokenVerifier | None = None,
+    knowledge_backend: object | None = None,
+    readiness_checks: Sequence[Callable[[], bool]] = (),
 ) -> FastAPI:
-    """Build the REST application and wire its control-plane dependencies."""
+    """Build the REST application and wire its control-plane dependencies.
+
+    `knowledge_backend` lets tests inject a backend; it is typed opaquely because this package
+    never depends on the backend port. Otherwise the application layer builds it from settings.
+    `readiness_checks` lets the process that serves the app add conditions to readiness, such
+    as a worker loop running in the same process.
+    """
 
     settings = settings or Settings.from_env()
     configure_logging(settings.log_level)
@@ -127,6 +148,7 @@ def create_app(
         content_types=frozenset(settings.upload_content_types),
     )
     if service is None:
+        backend = knowledge_backend or build_query_backend(settings, database)
         repository = ControlPlaneRepository(database)
         service = ContextEngineService(
             repository,
@@ -138,6 +160,8 @@ def create_app(
             upload_policy,
             settings.worker_max_attempts,
             indexing_enabled=settings.knowledge_backend == "provider",
+            knowledge_backend=backend,  # type: ignore[arg-type]
+            read_access=ReadAccessRepository(database),
         )
 
     app = FastAPI(title="Context Engine API", version="0.4.0")
@@ -214,7 +238,7 @@ def create_app(
 
     @app.get("/v1/health/ready", response_model=HealthResponse)
     async def readiness(response: Response) -> HealthResponse:
-        ready = database.ping()
+        ready = database.ping() and all(check() for check in readiness_checks)
         if not ready:
             response.status_code = 503
         return HealthResponse(status="ok" if ready else "unavailable")
@@ -466,6 +490,38 @@ def create_app(
         return [JobResponse.from_domain(job) for job in jobs]
 
     @app.post(
+        "/v1/queries",
+        response_model=ContextQueryResponse,
+        response_model_by_alias=True,
+        response_model_exclude_none=True,
+    )
+    async def query_context(
+        body: ContextQueryRequest,
+        principal: AuthenticatedPrincipal = Depends(current_principal),
+    ) -> ContextQueryResponse:
+        result = await service.query_context(
+            principal, body.space_id, body.question, body.mode, body.limit
+        )
+        return ContextQueryResponse.from_domain(result)
+
+    @app.post(
+        "/v1/spaces/{space_id}/enrichments",
+        response_model=JobAcceptedResponse,
+        response_model_by_alias=True,
+        status_code=202,
+    )
+    async def accept_enrichment(
+        space_id: ResourceId,
+        response: Response,
+        idempotency_key: IdempotencyKey,
+        principal: AuthenticatedPrincipal = Depends(current_principal),
+    ) -> JobAcceptedResponse:
+        job = service.accept_enrichment(principal, space_id, idempotency_key)
+        status_url = f"/v1/jobs/{job.id}"
+        response.headers["Location"] = status_url
+        return JobAcceptedResponse(jobId=job.id, statusUrl=status_url)
+
+    @app.post(
         "/v1/ingestions",
         response_model=JobAcceptedResponse,
         response_model_by_alias=True,
@@ -478,6 +534,84 @@ def create_app(
         principal: AuthenticatedPrincipal = Depends(current_principal),
     ) -> JobAcceptedResponse:
         job = service.accept_ingestion(principal, body.to_command(), idempotency_key)
+        status_url = f"/v1/jobs/{job.id}"
+        response.headers["Location"] = status_url
+        return JobAcceptedResponse(jobId=job.id, statusUrl=status_url)
+
+    @app.post(
+        "/v1/sources/{source_id}/ingestions",
+        response_model=JobAcceptedResponse,
+        response_model_by_alias=True,
+        status_code=202,
+        openapi_extra={
+            "requestBody": {
+                "required": True,
+                "content": {
+                    "multipart/form-data": {
+                        "schema": {
+                            "type": "object",
+                            "required": ["event"],
+                            "properties": {
+                                "event": {"type": "string", "format": "json"},
+                                "content": {"type": "string", "format": "binary"},
+                            },
+                        },
+                        "encoding": {"event": {"contentType": "application/json"}},
+                    }
+                },
+            }
+        },
+    )
+    async def accept_direct_ingestion(
+        source_id: ResourceId,
+        request: Request,
+        response: Response,
+        idempotency_key: IdempotencyKey,
+        principal: AuthenticatedPrincipal = Depends(current_principal),
+    ) -> JobAcceptedResponse:
+        # Authorize before reading the body so an unbound caller cannot occupy the size budget.
+        service.authorize_upload(principal, source_id)
+
+        def parse_event(raw: bytes) -> IngestionCommand:
+            try:
+                event = DirectIngestionEvent.model_validate_json(raw)
+            except SchemaValidationError as exc:
+                raise ValidationError("Ingestion event is invalid") from exc
+            if event.source_id != source_id:
+                raise ValidationError("Event source must match the request path")
+            return event.to_command()
+
+        parts = await read_ingestion_parts(
+            request.headers.get("content-type", ""),
+            request.stream(),
+            parse_event,
+            upload_policy.max_bytes,
+        )
+        job = service.accept_direct_ingestion(
+            principal,
+            source_id,
+            parts.event,
+            parts.content,
+            parts.content_type,
+            idempotency_key,
+        )
+        status_url = f"/v1/jobs/{job.id}"
+        response.headers["Location"] = status_url
+        return JobAcceptedResponse(jobId=job.id, statusUrl=status_url)
+
+    @app.get(
+        "/v1/sources/{source_id}/ingestions/{idempotency_key}",
+        response_model=JobAcceptedResponse,
+        response_model_by_alias=True,
+    )
+    async def find_ingestion(
+        source_id: ResourceId,
+        idempotency_key: DeliveryKey,
+        response: Response,
+        principal: AuthenticatedPrincipal = Depends(current_principal),
+    ) -> JobAcceptedResponse:
+        # A connector that lost the reply finds its job here instead of resending the content.
+        job = service.find_ingestion(principal, source_id, idempotency_key)
         status_url = f"/v1/jobs/{job.id}"
         response.headers["Location"] = status_url
         return JobAcceptedResponse(jobId=job.id, statusUrl=status_url)

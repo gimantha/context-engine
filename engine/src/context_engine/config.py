@@ -40,6 +40,8 @@ class Settings:
     static_tokens_path: Path = Path(".context-engine/static-tokens.json")
     # "none" keeps the worker ledger-only; "provider" converges the knowledge backend (M4).
     knowledge_backend: str = "none"
+    # How often the worker cross-checks the backend against the ledger in provider mode.
+    indexing_check_seconds: float = 300.0
     staging_path: Path = Path(".context-engine/staging")
     upload_max_bytes: int = 25 * 1024 * 1024
     upload_ttl_seconds: int = 24 * 60 * 60
@@ -72,6 +74,7 @@ class Settings:
                 os.getenv("CONTEXT_ENGINE_STATIC_TOKENS_PATH", ".context-engine/static-tokens.json")
             ).expanduser(),
             knowledge_backend=os.getenv("CONTEXT_ENGINE_KNOWLEDGE_BACKEND", "none").strip().lower(),
+            indexing_check_seconds=float(os.getenv("CONTEXT_ENGINE_INDEXING_CHECK_SECONDS", "300")),
             staging_path=Path(
                 os.getenv("CONTEXT_ENGINE_STAGING_PATH", ".context-engine/staging")
             ).expanduser(),

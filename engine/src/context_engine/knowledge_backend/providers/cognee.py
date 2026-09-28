@@ -2,15 +2,20 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import inspect
+import io
 import json
+import logging
 import os
 import secrets
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Protocol
-from uuid import UUID
+from uuid import NAMESPACE_URL, UUID, uuid5
 
 from context_engine.config import KnowledgeBackendSettings
 
@@ -181,7 +186,50 @@ def _native_handle(principal_id: str) -> str:
     """Return a deterministic native login handle that reveals nothing about the principal."""
 
     digest = hashlib.sha256(principal_id.encode()).hexdigest()[:32]
-    return f"engine-{digest}@context-engine.invalid"
+    # The provider validates handles as email addresses and rejects special-use domains such as
+    # `.invalid`; `.internal` is reserved for private use and never delegated. No mail is sent.
+    return f"engine-{digest}@context-engine.internal"
+
+
+class _RecordUpload:
+    """Hand one record's text to the provider as an upload.
+
+    The provider reads a plain string as a local path, web address, or object-store key when
+    it looks like one, and keeps the string form of its input in its run history, which
+    deletion never clears. An upload is stored exactly as given, and its string form carries
+    no content.
+    """
+
+    # The provider records a source location for uploads unless the name is in angle brackets.
+    filename = "<engine-record>.txt"
+
+    def __init__(self, text: str) -> None:
+        self.file = io.BytesIO(text.encode("utf-8"))
+
+    def __repr__(self) -> str:
+        return "<engine record>"
+
+
+def _native_item_id(binding: _CogneeBinding, record: SourceRecord) -> UUID:
+    """Choose the native item id of one record version in one binding.
+
+    The engine pins the id so every write names its own item: without a pin the provider
+    reuses any item with the same content, and its results cannot tell which item a call
+    added. The id is derived from the binding, record, version, and content, so a retried
+    write lands on the same item instead of leaving an untracked one behind.
+    """
+
+    seed = "\0".join(
+        (
+            "context-engine-item",
+            binding.dataset_name,
+            record.source_id,
+            record.record_id,
+            record.version,
+            record.content_hash,
+        )
+    )
+    return uuid5(NAMESPACE_URL, seed)
 
 
 def _native_reference(dataset_id: str, data_id: str) -> BackendReference:
@@ -262,14 +310,72 @@ class CogneeBackend:
         try:
             user = await self._user_resolver(principal)
             native_results = await self._runtime.recall(request, bindings, user)
-            evidence = tuple(
-                _translate_evidence(item, index) for index, item in enumerate(native_results)
-            )
+            units = {
+                binding.dataset_id: partition.value
+                for binding, partition in zip(bindings, authorized_partitions, strict=True)
+                if binding.dataset_id
+            }
+            evidence = self._translate_results(native_results, units)
             return QueryResult(evidence[: request.limit], insufficient_evidence=not evidence)
         except BackendError:
             raise
         except Exception as exc:
             raise _translate_error(exc) from exc
+
+    def _translate_results(
+        self, native_results: list[Any], units: dict[str, str]
+    ) -> tuple[EvidenceItem, ...]:
+        """Turn retrieved native chunks into engine evidence through durable references.
+
+        Each native entry is one retrieved chunk that names the item it came from. Only items
+        the engine wrote, whose reference is still recorded, and that sit in an authorized
+        partition become evidence; anything else, including leftovers of replaced versions and
+        any entry of another shape, stays out (ADR 0008). The version is left to the engine,
+        which takes it from the ledger.
+
+        The provider returns chunks in rank order within each unit but no comparable score, so
+        units are interleaved by rank and the score is derived from that rank.
+        """
+
+        ranked: list[tuple[int, int, EvidenceItem]] = []
+        seen: set[str] = set()
+        unit_order = {unit: position for position, unit in enumerate(units)}
+        unit_ranks: dict[str, int] = {}
+        single_unit = next(iter(units)) if len(units) == 1 else None
+        for native in native_results:
+            entry = _as_mapping(native)
+            chunk = _native_chunk(entry)
+            if chunk is None:
+                continue
+            item_id, chunk_id, passage, chunk_index = chunk
+            unit = str(entry.get("dataset_id") or single_unit or "")
+            partition = units.get(unit)
+            if partition is None:
+                continue
+            rank = unit_ranks.get(unit, 0)
+            unit_ranks[unit] = rank + 1
+            location = self._state.find_record(_native_reference(unit, item_id).value)
+            if location is None or location[0] != partition:
+                continue
+            _, source_id, record_id = location
+            digest = hashlib.sha256(
+                f"{partition}\0{source_id}\0{record_id}\0{chunk_id}\0{passage}".encode()
+            ).hexdigest()[:24]
+            item = EvidenceItem(
+                evidence_id=f"evi_{digest}",
+                record_id=record_id,
+                source_id=source_id,
+                source_version="",
+                passage=passage,
+                score=1.0 / (rank + 1),
+                location=f"chunk:{chunk_index}" if chunk_index is not None else None,
+            )
+            if item.evidence_id in seen:
+                continue
+            seen.add(item.evidence_id)
+            ranked.append((rank, unit_order[unit], item))
+        ranked.sort(key=lambda value: (value[0], value[1]))
+        return tuple(item for _, _, item in ranked)
 
     async def update(
         self,
@@ -465,23 +571,60 @@ class CogneeBackend:
             return BackendHealth(False, f"provider unavailable: {type(exc).__name__}")
 
 
+# The storage root the SDK was first loaded with in this process.
+_loaded_storage: Path | None = None
+
+
 class CogneeRuntime:
     """Lazy SDK wrapper. All Cognee imports and native calls stay in this module."""
 
     def __init__(self, settings: KnowledgeBackendSettings | None = None) -> None:
         self._settings = settings or KnowledgeBackendSettings.from_env()
+        self._prepared = False
+        self._preparing: asyncio.Lock | None = None
+
+    async def _ready(self) -> Any:
+        """Load the SDK and create the provider's own stores once per process.
+
+        The provider does not create its relational store on first use, so every operation
+        waits for this. Creating it is idempotent, which keeps separate processes safe.
+        """
+
+        cognee = self._module()
+        if self._prepared:
+            return cognee
+        if self._preparing is None:
+            self._preparing = asyncio.Lock()
+        async with self._preparing:
+            if not self._prepared:
+                from cognee.modules.engine.operations.setup import setup
+
+                await setup()
+                self._prepared = True
+        return cognee
 
     def _module(self) -> Any:
         """Load the SDK only after applying the engine-owned configuration."""
 
+        global _loaded_storage
+        storage = self._settings.storage_path.resolve()
+        # The SDK reads its storage roots once per process, so a second root would silently
+        # share the first one's stores.
+        if _loaded_storage is not None and storage != _loaded_storage:
+            raise BackendError(
+                BackendErrorCode.UNSUPPORTED,
+                "The knowledge provider is already bound to another storage root in this process",
+            )
         _apply_native_environment(self._settings)
         try:
-            import cognee
+            with _keep_process_logging():
+                import cognee
         except ImportError as exc:
             raise BackendError(
                 BackendErrorCode.UNAVAILABLE,
                 "The private provider dependency is not installed",
             ) from exc
+        _loaded_storage = storage
         return cognee
 
     async def remember(
@@ -489,11 +632,13 @@ class CogneeRuntime:
     ) -> _NativeIngestion:
         """Create the native content item and invoke native ingestion."""
 
-        cognee = self._module()
+        cognee = await self._ready()
         from cognee.tasks.ingestion.data_item import DataItem
 
+        item_id = _native_item_id(binding, record)
         native_record = DataItem(
-            data=record.content,
+            data=_RecordUpload(record.content),
+            data_id=item_id,
             label=record.title,
             external_metadata={
                 "record_id": record.record_id,
@@ -517,35 +662,49 @@ class CogneeRuntime:
         if getattr(result, "status", None) == "errored":
             raise BackendError(BackendErrorCode.PARTIAL_WRITE, "Provider ingestion failed")
         dataset_id = getattr(result, "dataset_id", None)
-        items = getattr(result, "items", None) or []
-        data_id = next((item.get("id") for item in items if item.get("id")), None)
-        if not dataset_id or not data_id:
+        if not dataset_id:
             raise BackendError(
                 BackendErrorCode.UNSUPPORTED,
-                "Provider did not return stable dataset and record identifiers",
+                "Provider did not return a stable isolation identifier",
             )
-        return _NativeIngestion(str(dataset_id), str(data_id), created=True)
+        # The result lists every item the unit's run touched, not only the one written here,
+        # so the pinned id is what identifies this write; it must be among them.
+        written = {str(item.get("id")) for item in getattr(result, "items", None) or []}
+        if str(item_id) not in written:
+            raise BackendError(
+                BackendErrorCode.PARTIAL_WRITE, "Provider did not confirm the written item"
+            )
+        return _NativeIngestion(str(dataset_id), str(item_id), created=True)
 
     async def recall(
         self, request: QueryRequest, bindings: tuple[_CogneeBinding, ...], user: Any
     ) -> list[Any]:
-        """Invoke native retrieval with explicit binding identifiers."""
+        """Invoke native retrieval with the pinned retriever and explicit binding identifiers."""
 
-        cognee = self._module()
+        cognee = await self._ready()
+        from cognee.modules.search.types import SearchType
+
         ids = [UUID(item.dataset_id) for item in bindings if item.dataset_id]
+        # A fixed retriever keeps result shapes stable, and turning routing off means no
+        # question can be routed to raw graph queries however it is phrased. The chunk
+        # retriever is the one whose results name the item each chunk came from; graph and
+        # completion retrievers return rendered context that cannot be traced to a record.
+        # Leaving context-only mode off is what keeps chunks separate; this retriever never
+        # calls a model to produce them.
         return await cognee.recall(
             query_text=request.text,
+            query_type=SearchType.CHUNKS,
+            auto_route=False,
             dataset_ids=ids,
             top_k=request.limit,
-            only_context=True,
-            include_references=True,
+            only_context=False,
             user=user,
         )
 
     async def grant_read(self, binding: _CogneeBinding, reader: Any, owner: Any) -> None:
         """Give read permission on one binding through the native sharing API."""
 
-        self._module()
+        await self._ready()
         from cognee.modules.users.permissions.methods import (
             authorized_give_permission_on_datasets,
         )
@@ -557,7 +716,7 @@ class CogneeRuntime:
     async def revoke_read(self, binding: _CogneeBinding, reader: Any, owner: Any) -> None:
         """Remove read permission on one binding through the native sharing API."""
 
-        self._module()
+        await self._ready()
         from cognee.modules.users.permissions.methods import (
             authorized_revoke_permission_on_datasets,
         )
@@ -569,13 +728,13 @@ class CogneeRuntime:
     async def improve(self, binding: _CogneeBinding, user: Any) -> Any:
         """Invoke explicit native enrichment for one binding."""
 
-        cognee = self._module()
+        cognee = await self._ready()
         return await cognee.improve(dataset=UUID(binding.dataset_id), user=user)
 
     async def forget(self, binding: _CogneeBinding, data_id: str, user: Any) -> Any:
         """Invoke native deletion for one explicitly bound record."""
 
-        cognee = self._module()
+        cognee = await self._ready()
         return await cognee.forget(
             data_id=UUID(data_id),
             dataset_id=UUID(binding.dataset_id),
@@ -585,7 +744,7 @@ class CogneeRuntime:
     async def ensure_user(self, handle: str) -> Any:
         """Find the ordinary native account for a handle, creating it on first use."""
 
-        self._module()
+        await self._ready()
         from cognee.modules.users.methods import create_user, get_user_by_email
 
         existing = await get_user_by_email(handle)
@@ -606,7 +765,7 @@ class CogneeRuntime:
     async def get_user(self, native_id: str) -> Any:
         """Load a native account by its native identifier."""
 
-        self._module()
+        await self._ready()
         from cognee.modules.users.methods import get_user
 
         return await get_user(UUID(native_id))
@@ -614,13 +773,13 @@ class CogneeRuntime:
     async def list_items(self, binding: _CogneeBinding, user: Any) -> list[Any]:
         """List native content items in one binding with the resolved user."""
 
-        cognee = self._module()
+        cognee = await self._ready()
         return list(await cognee.datasets.list_data(UUID(binding.dataset_id), user=user))
 
     async def processing_states(self, bindings: tuple[_CogneeBinding, ...]) -> dict[str, Any]:
         """Read the latest processing-run state per binding from the native status API."""
 
-        cognee = self._module()
+        cognee = await self._ready()
         ids = [UUID(item.dataset_id) for item in bindings if item.dataset_id]
         # With no pipeline names the SDK returns a flat map for its processing pipeline.
         result = await cognee.datasets.get_progress(ids)
@@ -629,62 +788,62 @@ class CogneeRuntime:
     async def health(self) -> tuple[bool, str]:
         """Load the pinned SDK and return an engine-owned readiness detail."""
 
-        self._module()
+        await self._ready()
         return True, "knowledge provider ready"
-
-
-def _translate_evidence(value: Any, index: int) -> EvidenceItem:
-    if hasattr(value, "model_dump"):
-        raw = value.model_dump()
-    elif isinstance(value, Mapping):
-        raw = dict(value)
-    else:
-        raw = {"text": str(value)}
-
-    passage = str(raw.get("text") or raw.get("content") or raw.get("result") or "")
-    metadata = raw.get("metadata") if isinstance(raw.get("metadata"), Mapping) else {}
-    external_metadata = (
-        metadata.get("external_metadata")
-        if isinstance(metadata.get("external_metadata"), Mapping)
-        else raw.get("external_metadata")
-        if isinstance(raw.get("external_metadata"), Mapping)
-        else {}
-    )
-    metadata = {**metadata, **external_metadata}
-    record_id = str(
-        metadata.get("record_id")
-        or metadata.get("source_record_id")
-        or raw.get("record_id")
-        or f"unresolved-{index}"
-    )
-    source_id = str(metadata.get("source_id") or raw.get("source_id") or "unresolved")
-    source_version = str(
-        metadata.get("source_version") or raw.get("source_version") or "unresolved"
-    )
-    digest = hashlib.sha256(
-        f"{record_id}\0{source_version}\0{index}\0{passage}".encode()
-    ).hexdigest()[:24]
-    return EvidenceItem(
-        evidence_id=f"evi_{digest}",
-        record_id=record_id,
-        source_id=source_id,
-        source_version=source_version,
-        passage=passage,
-        score=float(raw.get("score") or 0.0),
-        location=str(metadata.get("location")) if metadata.get("location") else None,
-    )
 
 
 _PROCESSING_PIPELINE = "cognify_pipeline"
 
 
-def _item_metadata(entry: Any) -> Mapping[str, Any]:
-    """Return the engine metadata attached to a native content item."""
+def _as_mapping(value: Any) -> dict[str, Any]:
+    """Return a plain mapping for a native model, mapping, or anything else."""
 
-    raw = entry.model_dump() if hasattr(entry, "model_dump") else entry
-    if not isinstance(raw, Mapping):
+    if value is None:
         return {}
-    metadata = raw.get("external_metadata")
+    if hasattr(value, "model_dump"):
+        dumped = value.model_dump()
+        return dumped if isinstance(dumped, dict) else {}
+    if isinstance(value, Mapping):
+        return dict(value)
+    return {}
+
+
+def _native_chunk(entry: Mapping[str, Any]) -> tuple[str, str, str, int | None] | None:
+    """Return the item id, chunk id, passage, and chunk index of one native chunk entry."""
+
+    if entry.get("kind") != "chunk":
+        return None
+    metadata = _as_mapping(entry.get("metadata"))
+    raw = _as_mapping(entry.get("raw"))
+    item_id = str(metadata.get("data_id") or raw.get("document_id") or "")
+    passage = str(raw.get("text") or entry.get("text") or "").strip()
+    if not item_id or not passage:
+        return None
+    chunk_id = str(metadata.get("chunk_id") or raw.get("id") or "")
+    chunk_index = metadata.get("chunk_index", raw.get("chunk_index"))
+    if isinstance(chunk_index, bool) or not isinstance(chunk_index, int):
+        chunk_index = None
+    return item_id, chunk_id, passage, chunk_index
+
+
+def _item_metadata(entry: Any) -> Mapping[str, Any]:
+    """Return the engine metadata attached to a native content item.
+
+    The native listing returns stored rows rather than serializable models, so the metadata
+    is read as an attribute unless the entry is a mapping or a model.
+    """
+
+    if isinstance(entry, Mapping):
+        metadata = entry.get("external_metadata")
+    elif hasattr(entry, "model_dump"):
+        metadata = _as_mapping(entry).get("external_metadata")
+    else:
+        metadata = getattr(entry, "external_metadata", None)
+    if isinstance(metadata, str):
+        try:
+            metadata = json.loads(metadata)
+        except ValueError:
+            return {}
     return metadata if isinstance(metadata, Mapping) else {}
 
 
@@ -726,6 +885,30 @@ def _native_bool(value: bool) -> str:
     return "true" if value else "false"
 
 
+@contextmanager
+def _keep_process_logging() -> Iterator[None]:
+    """Keep the engine's log handlers across the provider's import.
+
+    Importing the SDK replaces every root handler with its own console handler, which would
+    drop the engine's allowlisted fields, including those of audit events. Its file handler,
+    added only when the engine enables provider file logging, is kept.
+    """
+
+    root = logging.getLogger()
+    handlers, level = list(root.handlers), root.level
+    try:
+        yield
+    finally:
+        added = [handler for handler in root.handlers if handler not in handlers]
+        for handler in added:
+            if not isinstance(handler, logging.FileHandler):
+                root.removeHandler(handler)
+        for handler in handlers:
+            if handler not in root.handlers:
+                root.addHandler(handler)
+        root.setLevel(level)
+
+
 def _apply_native_environment(settings: KnowledgeBackendSettings) -> None:
     """Translate engine settings into native names inside the private boundary."""
 
@@ -737,7 +920,14 @@ def _apply_native_environment(settings: KnowledgeBackendSettings) -> None:
         "CACHING": _native_bool(settings.query_cache_enabled),
         "ENABLE_BACKEND_ACCESS_CONTROL": _native_bool(settings.access_control_required),
         "REQUIRE_AUTHENTICATION": _native_bool(settings.access_control_required),
-        "ACCEPT_LOCAL_FILE_PATH": _native_bool(settings.local_content_access_enabled),
+        # The provider stores each upload in its own data directory and reads it back through
+        # its local-file loader, so local paths must be accepted. The engine never passes a
+        # path, and confining local reads to the provider's data directory keeps any other
+        # file unreadable. Wider local reads happen only if the engine allows them.
+        "ACCEPT_LOCAL_FILE_PATH": "true",
+        "COGNEE_ALLOWED_LOCAL_FILE_ROOTS": ""
+        if settings.local_content_access_enabled
+        else str(storage / "data"),
         "ALLOW_HTTP_REQUESTS": _native_bool(settings.remote_content_access_enabled),
         "ALLOW_CYPHER_QUERY": _native_bool(settings.raw_graph_query_enabled),
         "DB_PROVIDER": settings.relational_store,
@@ -766,7 +956,15 @@ def assert_runtime_matches_pinned_sdk(runtime: CogneeRuntime | None = None) -> N
     cognee = (runtime or CogneeRuntime())._module()
     required = {
         "remember": {"data", "dataset_name", "dataset_id", "self_improvement"},
-        "recall": {"query_text", "dataset_ids", "top_k", "user"},
+        "recall": {
+            "query_text",
+            "query_type",
+            "auto_route",
+            "dataset_ids",
+            "top_k",
+            "only_context",
+            "user",
+        },
         "forget": {"data_id", "dataset_id", "user"},
         "improve": {"dataset"},
     }
@@ -810,6 +1008,10 @@ def assert_runtime_matches_pinned_sdk(runtime: CogneeRuntime | None = None) -> N
             raise RuntimeError(
                 f"Pinned provider {operation} signature is missing {sorted(missing)}"
             )
+    from cognee.modules.search.types import SearchType
+
+    if not hasattr(SearchType, "CHUNKS"):
+        raise RuntimeError("Pinned provider no longer offers the chunk retriever")
     status_api = getattr(cognee, "datasets", None)
     for operation, parameters in {
         "get_progress": {"dataset_ids", "pipeline_names"},
