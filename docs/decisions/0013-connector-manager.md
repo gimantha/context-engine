@@ -1,124 +1,60 @@
-# ADR 0010: Connector interface, manager, and scheduling
+# ADR 0013: Connector interface, manager, and scheduling
 
-**Status:** Accepted for the Ballerina integration layer
+**Status:** Proposed
 
-**Date:** 2026-09-23
+**Date:** 2026-09-23, revised 2026-09-28
 
 ## Context
 
-The engine ingests from many source types with different triggering models: a
-file upload is a one-off user action, while SaaS and data sources (Salesforce,
-Google Drive, databases, Slack) are configured once and then produce new or
-changed records over time. Both end in the same operation — submit a normalized
-record to `POST /v1/ingestions` ([ADR 0009](0009-connector-ingestion-model.md)).
+The engine ingests from many source types with different triggering models. A file upload is a one-off user action, while SaaS and data sources such as Salesforce, Google Drive, databases, and Slack are configured once and then produce new or changed records over time. All of them end in the same operation: deliver a normalized record to the engine ([ADR 0012](0012-connector-delivery-model.md)).
 
-An initial design gave each connector its own process: one `main()` read one set
-of `configurable` values, built one client + connector, and ran a blocking poll
-loop where a single failed fetch aborted the loop. That does not scale to
-operating many connections. We need to run *any number* of configured
-connections (many Salesforce orgs, Drive accounts, databases) without a process
-per connection, to schedule polling centrally, to use event listeners for SaaS
-that pushes changes (e.g. Salesforce Change Data Capture) instead of polling, and
-to swap the source of configurations — hardcoded from the environment now,
-database-backed with cross-node coordination later.
+An initial design gave each connector its own process, with one set of configurable values and a blocking poll loop that a single failed fetch aborted. That does not scale to many connections. The host must run any number of configured connections, schedule polling centrally, use event listeners for sources that push changes, such as Salesforce Change Data Capture, and later take its configuration from a database with cross-node coordination.
 
 ## Decision
 
-A **`ConnectorManager`** (the `manager` module) holds a registry of connector
-*types* and runs any number of *instances* against one engine client. A runtime
-host process wires it together.
+A `ConnectorManager` (the `manager` module) holds a registry of connector types and runs any number of instances against one engine client. A host process wires it together.
 
-- **Modality split.** Connectors implement one or both of two narrow shapes the
-  manager knows how to drive:
+- **Two modalities.** Connectors implement one or both of two narrow shapes the manager can drive:
 
   ```ballerina
   public type PollConnector object {
       public function fetch(string cursor) returns FetchResult|error;
   };
   public type ListenConnector object {
-      public function listen(RecordSink sink) returns error?;
+      public function listen(Sink sink, CheckpointStore checkpoints) returns error?;
   };
   ```
 
-  The manager owns the poll loop, so a poll connector exposes a single `fetch`
-  cycle rather than its own `while true`. A listen connector attaches its
-  listeners and returns; the host keeps the process alive.
+  The manager owns the poll loop, so a poll connector exposes one `fetch` cycle. A listen connector attaches its listeners and returns; the host keeps the process alive.
+- **Scheduling with `ballerina/task`.** Each poll instance is a recurring `task:Job` at its configured interval. A job runs one fetch, delivery, and checkpoint cycle and logs errors instead of propagating them, so one bad poll never stops the schedule.
+- **A poll cursor only passes delivered records.** Every record a poll returns carries its own position. The job delivers records in order and saves the position of the last one the engine accepted, or refused for a reason in the record itself (400, 413, 415, or 422). Any other failure stops the batch, and the next tick resends from there; resends are exact replays (ADR 0012). Saving the batch's final cursor after a partial failure would have skipped the failed records for good.
+- **Registry and factories.** A connector type registers a name plus a poll factory, a listen factory, or both, and the manager runs whichever are present. `salesforce` sets both, so one configuration entry is scheduled and attached. Registration is explicit in the host's `main`.
+- **One package with submodules.** Everything ships as one Ballerina package, `wso2/context_engine_connectors`. The root module is the host, and the connector SDK (`modules/core`), the runtime (`modules/manager`), the Salesforce connector (`modules/salesforce`), and the upload endpoint (`modules/file_source`) are submodules. A connector depends only on `core`. Registration is compile-time and Ballerina has no runtime connector discovery, so separate packages would bring publishing steps without an external consumer.
+- **Durable checkpoints in the engine.** Each instance gets a `CheckpointStore` holding named positions: the poll cursor, and a replay id per change channel. The default store keeps them in the engine's own checkpoint for the instance's source, as one small JSON object, so a restarted host resumes where it stopped. The engine stores one checkpoint per source, so the manager refuses two instances with the same source, as well as two with the same instance id. The in-memory store remains for tests.
+- **Configuration.** The manager runs whatever instances a `ConfigProvider` returns. `EnvConfigProvider` decodes a JSON array from an environment variable; unset or empty means no managed connectors, so a host that only serves uploads still starts. A later database-backed provider can implement the same interface and lease connections so exactly one node runs each.
 
-- **Scheduling via `ballerina/task`.** Each `POLL` instance is registered as a
-  recurring `task:Job` (`scheduleJobRecurByFrequency`) at its configured
-  interval, replacing the blocking `runPolling` loop of the earlier design. The
-  job runs one fetch/ingest/checkpoint cycle and **logs** errors instead of
-  propagating them, so one bad poll never stops the schedule.
+### Salesforce
 
-- **Registry + factories.** A connector type registers a `ConnectorType`
-  (`name`, plus a `pollFactory?` and/or `listenFactory?`). The manager runs
-  whichever factories are present, so a **single type can be multi-modal**: e.g.
-  `salesforce` sets both — a SOQL poll (creates + backfill) and a CDC listener
-  (updates + deletes) — and one config entry is scheduled *and* attached. (An
-  earlier revision modeled `ConnectorType` as a discriminated union of exactly one
-  modality; that made "both" unrepresentable, so it was reverted to the two
-  optional factories, with a runtime check that at least one is set.) Registration
-  is explicit in the host `main` — each connector submodule contributes its
-  `ConnectorType`, imported and `register`ed by the host.
+- **The poll is the backfill.** It pages by `(CreatedDate, Id)`: rows strictly after the saved position, in that order. Paging by `CreatedDate` alone with a strict comparison and a batch limit skipped records that shared the boundary timestamp, such as a bulk insert of hundreds of records in one second. Cursor values and record ids are checked before they are placed in a query.
+- **The change listener handles every change.** Creates, updates, and undeletes re-fetch the full record and deliver it, so the content is identical to a backfill of the same record and a record delivered by both paths is a replay. Handling creates here also covers records that commit after the poll has passed their `CreatedDate`. Deletes deliver the removal with the commit time as the version.
+- **Every record in an event.** One change event can list many records, for example a transaction that deletes 50 Accounts. The library's `metadata.recordId` holds only the first, so the listener reads the full list from the event's change header. An event with no usable record id is skipped and logged, never turned into a delete of a made-up record.
+- **Durable replay positions.** The library resumes a subscription from its coordinator's stored checkpoint and uses `replayFrom` only when none exists. The connector supplies a coordinator that stores the checkpoint in the instance's checkpoint store, so deletes made while the host was down arrive after a restart.
+- **Transient failures are retried in the handler.** The library records an event's replay position once it has been dispatched, whether or not handling succeeded. The handlers therefore retry transient engine failures up to four times, waiting 1, 2, then 4 seconds, before logging the record as not delivered.
 
-- **Single package, submodules.** Everything ships as one Ballerina package,
-  `wso2/context_engine_connectors`: the root module is the host, and the framework
-  (the connector SDK `modules/core` and the runtime `modules/manager`), the
-  `modules/salesforce` connector, and the `modules/file_source` upload endpoint are
-  submodules. A connector depends only on `core` (the manager cannot be reached
-  from a connector); the host depends on both. A connector type may be multi-modal
-  (`salesforce` provides both a poll and a listen factory). Because
-  registration is compile-time (the host must `import` and `register` each
-  connector) and Ballerina has no runtime connector discovery, a connector can
-  never be added without recompiling this host — so there is no external consumer
-  to justify separate packages, and the host jar bundles every connector's
-  dependencies regardless. One package means one `bal build` and no
-  local-repository publishing. Provider SDKs (e.g. `ballerinax/salesforce`) are
-  therefore package-wide dependencies; a connector whose SDK must not load
-  elsewhere would be extracted to its own package at that point.
+### File uploads
 
-- **`ConfigProvider` abstraction.** The manager runs whatever instances a
-  `ConfigProvider.provide()` returns. `EnvConfigProvider` decodes a JSON array of
-  `ConnectorInstanceConfig` from an environment variable now. A future
-  `DatabaseConfigProvider` implements the same interface and additionally leases
-  connections so exactly one node runs each; the manager stays unaware of how
-  configs are sourced or coordinated.
-
-Every modality still ingests through the unchanged `RecordSink`, so envelope
-construction, content hashing, and idempotency (ADR 0009) are shared.
+The upload endpoint is a host built-in, not a managed connector. It serves `POST /files` and delivers into one configured space and source; the engine binds each source to one space, so the earlier per-request space in the path could only ever work for one space. Each file's version is its receipt time in epoch milliseconds, so a later upload of the same file orders after an earlier one. The endpoint listens on loopback by default, refuses to start on another address without an API key, and is off unless configured.
 
 ## Consequences
 
-- Running more connections is data (config entries), not new processes. Listeners
-  and pollers coexist in one host.
-- The `LISTEN` path fits push SaaS directly: the Salesforce connector subscribes
-  to Platform Event channels and ingests each event through the sink.
-- Checkpointing is behind a `CheckpointStore` (`load`/`save`) resolved per
-  instance. The default `InMemoryCheckpointStore` is process-scoped; a durable
-  `DatabaseCheckpointStore` implements the same seam (aligned with the engine's
-  `/sources/{sourceId}/checkpoints` surface) and arrives with the database-backed
-  `ConfigProvider` and its single-owner leasing. `save` returns an `error?` so a
-  durable write failure is logged without stopping the schedule; ingestion
-  idempotency (deterministic `sourceObservedAt` included) makes at-least-once
-  persistence and replays safe.
-- The host is the package's root module; connectors are submodules under
-  `modules/` (`salesforce` provides the poll and listen references), imported and
-  registered by the host rather than run as standalone `main()` processes.
-- The **file-upload endpoint** (`modules/file_source`) is a host built-in, not a
-  managed connector: a file upload is inherently multi-space (the caller names the
-  space per request, `POST /spaces/{spaceId}/files`), which doesn't fit the
-  manager's fixed-`destination` model. The host starts it directly with the engine
-  client and server-controlled governance (source id, audience, ACL version — never
-  taken from the request), and it builds a per-request `RecordSink` for the named
-  space. It reuses `core` (`RecordSink`, `EngineClient`) without touching the
-  connector framework.
+- Running more connections is configuration, not new processes. Listeners and pollers share one host.
+- The host's engine credential should hold `ingest.write` on its sources and nothing else. The host has no default credential, so an administrator token is never used by accident.
+- Each source is written by exactly one instance. Scaling one source across nodes needs the database-backed provider and its leasing.
+- Residual risks: a change whose delivery still fails after the handler's retries is lost from the change stream once later events are checkpointed, and change events the library does not dispatch, such as gap events, are not handled. A periodic full resync would recover both. A crash between the library recording a replay position and the handler finishing loses that change too.
 
 ## Validation
 
-- `integrations/ballerina` builds as one package (`bal build`): the `core` SDK
-  and `manager` runtime modules, the `salesforce` connector, the `file_source`
-  upload endpoint, and the host root module.
-- The host registers the `salesforce` type, loads configs from `EnvConfigProvider`,
-  and starts the manager; a poll instance schedules and re-ticks without exiting.
-- The built-in file-upload endpoint ingests an uploaded file into the space named
-  in its path end-to-end.
+- `bal build` and `bal test` in `integrations/ballerina` pass: 24 tests across `core`, `manager`, `salesforce`, and `file_source`.
+- `modules/manager/tests/manager_test.bal` covers cursor advance on success, transient failure, and rejection; duplicate instance and source refusal; and the engine-backed checkpoint store surviving a restart against a stand-in for the checkpoint routes.
+- `modules/salesforce/tests/salesforce_test.bal` covers epoch-millisecond versions, keyset queries, cursor validation against query injection, every record id in an event, delete commit times, and the replay coordinator.
+- A local run of the host against a running engine exercised the upload endpoint's key check, the engine's 415 passing through, a two-file upload, a changed re-upload, and the connector credential being refused anything but delivery. The engine's checkpoint routes stored and returned the combined positions with that credential.

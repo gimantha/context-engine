@@ -1,42 +1,44 @@
-# ADR 0009: Connector ingestion model
+# ADR 0012: Connector delivery model
 
-**Status:** Accepted for the ingestion transport and envelope
+**Status:** Proposed
 
-**Date:** 2026-09-22
+**Date:** 2026-09-22, revised 2026-09-28
 
 ## Context
 
-Source connectors (a file source, Salesforce, HubSpot, Slack, and databases later) must deliver source records to the engine. Most of these sources are record-oriented: an object, row, message, or contact whose meaningful payload is a modest amount of text, not a large binary. The engine already exposes an asynchronous REST ingestion boundary (`POST /v1/ingestions`) that validates an envelope and enqueues a durable job.
+Source connectors such as a file source, Salesforce, HubSpot, Slack, and databases deliver records to the engine. Most sources are record-oriented: an object, row, message, or contact whose meaningful payload is a modest amount of text. The engine accepts deliveries at an asynchronous REST boundary that validates the event and queues a durable job.
 
-An earlier draft proposed a gRPC transport with client-streaming content upload and a filesystem staging store. Analysis showed the transport is never the bottleneck: ingestion only validates and enqueues, and throughput is gated by the single-writer control database and, later, by provider execution in the worker. Connectors submit a bounded trickle of records, so gRPC's streaming and framing advantages do not apply.
+The first draft of this ADR had connectors put the record text inline in the ingestion event. The engine never accepted that: its service and worker read content only from the staging store, so every inline upsert failed. The content would also have stayed in every job and outbox row, since staged-byte release never touches job payloads. The engine has since gained a one-call route that takes the event and its content in one request and stages the content itself (M3 report revision, 2026-09-28).
+
+An earlier draft still proposed a gRPC transport with client-streaming upload. The transport is never the bottleneck: accepting a delivery only validates it and queues a job, and throughput is set by the control database and by provider work in the worker.
 
 ## Decision
 
-Connectors submit **normalized, inline text content** over the existing REST boundary. The connector owns all source-specific extraction and normalization; the engine stays provider-neutral and only enqueues a durable job.
+Connectors deliver every record through the engine's one-call route, `POST /v1/sources/{sourceId}/ingestions`.
 
-- The ingestion envelope carries an inline `content` string (and optional `title`), bounded in size to protect the control database.
-- `contentRef` and `contentHash` remain optional. An `upsert` requires `contentType` and one of inline `content` or a staged `contentRef`.
-- When both `content` and `contentHash` are present, the engine verifies that the hash describes the content and rejects a mismatch.
-- A shared Ballerina client (`wso2/context_engine_client`) owns the single definition of the HTTP contract; connectors depend on it and only change how records are read and normalized. The file-source connector is the reference shape.
-
-Raw file staging is rejected as the default: the engine does not warehouse source files. Content lives transiently in the durable job payload en route to the worker; its lasting, governed home is the knowledge backend's partition-isolated passage store, which the worker populates when provider execution lands (M4).
+- **One request per record.** The body is multipart: the event as JSON first, then the content bytes. Deletes and ACL changes send only the event. The engine stages the content, so there is no separate upload whose 24-hour expiry a later resend could outlive.
+- **The connector normalizes, the engine extracts.** A connector turns a source record into content with a content type on the engine's allowlist. Salesforce records become a JSON projection of the configured fields; uploaded files pass through as they are.
+- **Versions are numeric epoch milliseconds.** Upserts use the source's modification time, and deletes use their commit time, so both share one time axis and a delete orders after the record's last change. Sources are registered with numeric ordering. A content hash is never used as a version: it neither is numeric nor only grows.
+- **Resends are exact replays.** The observed time comes from the source, never the clock at send time, and the idempotency key is derived from the source, operation, record, and version. The same record state therefore always produces the same event, and the engine returns the original job. Keys are `<sourceId>:<operation>:<sha256>`, which stays under the engine's 200-character header limit however long the record id is.
+- **The event carries the content hash.** The engine checks it against the bytes it received.
+- **After a lost reply, look before resending.** When the connection fails, the sink asks the engine for the delivery by its key before reporting a failure.
+- **A shared client owns the HTTP contract.** `modules/core` in `integrations/ballerina` is the one place that knows the engine's routes; connectors only change how records are read and normalized.
 
 ## Alternatives
 
-- **gRPC with streaming upload:** rejected. The async, enqueue-bound design makes transport throughput irrelevant, and it would double the public surface (proto, codegen, servicer, tests) and duplicate idempotency, auth, tracing, and error handling already solved for REST.
-- **Filesystem staging store plus `/uploads`:** deferred. Nothing downstream reads content until M4, and record-oriented connectors carry no files. A by-reference path for genuinely large binaries remains a narrow future exception via `contentRef`.
-- **Message broker (Kafka/NATS/SQS) between connectors and the engine:** deferred. The engine already provides a durable transactional outbox and job queue; a broker is a larger topology decision for a later milestone.
+- **Inline content in the event:** rejected. It duplicates content into durable job and outbox rows that are never released, and it needs a second content path through the service and worker.
+- **Upload first, then send the event:** kept as the engine's two-call path, but not used by connectors. It costs an extra call per record, and resending an event after its upload expires fails.
+- **gRPC with streaming upload:** rejected. Accepting a delivery is bound by queueing, not transport, and gRPC would double the public surface and duplicate idempotency, authentication, tracing, and error handling already solved for REST.
+- **A message broker between connectors and the engine:** deferred. The engine already has a durable outbox and job queue; a broker is a larger topology decision.
 
 ## Consequences
 
-- Connectors must normalize source records to text and compute a content hash for a stable record version and integrity check.
-- Inline content is persisted in the control database within the job payload until the job succeeds; the size cap and later pruning bound this footprint.
-- Adding a new connector reuses the shared client and envelope with no engine change.
-- Provider consumption of `content` (building a source record for the knowledge backend) remains M4; the M1 worker still records only the durable ledger effect.
+- Connectors need no engine change to add a source; they reuse the shared client and event.
+- Every content type a connector sends must be on the engine's upload allowlist, which is plain text, Markdown, HTML, JSON, and PDF by default. Anything else is refused with 415.
+- Version and observed time are required fields of a connector's record, so a connector cannot fall back to a value that differs between resends.
 
 ## Validation
 
-- `engine/tests/test_contracts.py` (schema and content-or-reference rule)
-- `engine/tests/test_api.py` (inline content accepted, staged reference accepted, missing content rejected, hash mismatch rejected)
-- `scripts/check_provider_boundary.py`
-- `integrations/ballerina/common` builds and publishes; `integrations/ballerina/file-source` builds against it.
+- `integrations/ballerina/modules/core/tests/client_test.bal` checks the request on the wire: part order, the event without `contentRef`, the content bytes, the header key, and which engine errors count as a rejection of the record.
+- A local run delivered uploaded files through the connector host into a running engine, including a changed re-upload at a newer version (PR description, 2026-09-28).
+- `engine/tests/test_direct_ingestion.py` covers the engine side of the one-call route.
