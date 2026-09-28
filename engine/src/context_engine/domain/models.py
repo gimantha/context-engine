@@ -289,6 +289,8 @@ class RecordLocation:
     content_hash: str | None
     parser_version: str | None
     updated_at: datetime
+    # The version whose content the backend holds; see migration 0007.
+    written_version: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -397,6 +399,29 @@ class SourceProgress:
 
 
 @dataclass(frozen=True, slots=True)
+class PublicEvidence:
+    """Authorized, source-linked passage that has passed the read-time visibility barrier."""
+
+    id: str
+    record_id: str
+    source_id: str
+    source_version: str
+    passage: str
+    location: str | None
+    source_url: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class ContextQueryResult:
+    """Outcome of one context-mode query; answers arrive with M5."""
+
+    query_id: str
+    evidence: tuple[PublicEvidence, ...]
+    insufficient_evidence: bool
+    trace_id: str
+
+
+@dataclass(frozen=True, slots=True)
 class ContextSpace:
     """Public context-space metadata stored by the control plane."""
 
@@ -423,8 +448,6 @@ class IngestionCommand:
     source_acl_version: str
     idempotency_key: str
     content_type: str | None = None
-    content: str | None = None
-    title: str | None = None
     content_ref: str | None = None
     source_url: str | None = None
     content_hash: str | None = None
@@ -446,8 +469,6 @@ class IngestionCommand:
         }
         optional = {
             "contentType": self.content_type,
-            "content": self.content,
-            "title": self.title,
             "contentRef": self.content_ref,
             "sourceUrl": self.source_url,
             "contentHash": self.content_hash,

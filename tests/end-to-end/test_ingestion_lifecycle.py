@@ -6,6 +6,7 @@ import hashlib
 import json
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 from context_engine.api import create_app
@@ -79,16 +80,8 @@ class Connector:
         }
         if operation == "upsert":
             assert content is not None
-            upload = self.stage(content)
-            body.update(
-                contentType="text/plain",
-                contentRef=upload["uploadId"],
-                contentHash=upload["contentHash"],
-                sourceUrl=f"https://files.invalid/{record_id}",
-            )
-        response = self.client.post(
-            "/v1/ingestions", headers=self._headers(**{"Idempotency-Key": key}), json=body
-        )
+            body["sourceUrl"] = f"https://files.invalid/{record_id}"
+        response = self._send(body, key, content if operation == "upsert" else None)
         assert response.status_code == 202, response.text
         self.client.put(
             f"/v1/sources/{self.source_id}/checkpoints",
@@ -97,12 +90,46 @@ class Connector:
         )
         return response.json()
 
+    def _send(self, body: dict, key: str, content: bytes | None):
+        """Stage the bytes, then send an event that references them."""
+
+        if content is not None:
+            upload = self.stage(content)
+            body = {
+                **body,
+                "contentType": "text/plain",
+                "contentRef": upload["uploadId"],
+                "contentHash": upload["contentHash"],
+            }
+        return self.client.post(
+            "/v1/ingestions", headers=self._headers(**{"Idempotency-Key": key}), json=body
+        )
+
     def status(self, record_id: str) -> dict:
         response = self.client.get(
             f"/v1/sources/{self.source_id}/records/{record_id}", headers=self._headers()
         )
         assert response.status_code == 200, response.text
         return response.json()
+
+
+class DirectConnector(Connector):
+    """A connector that sends each event and its content in one request."""
+
+    def _send(self, body: dict, key: str, content: bytes | None):
+        files = {"event": (None, json.dumps(body), "application/json")}
+        if content is not None:
+            files["content"] = ("record.txt", content, "text/plain")
+        return self.client.post(
+            f"/v1/sources/{self.source_id}/ingestions",
+            headers=self._headers(**{"Idempotency-Key": key}),
+            files=files,
+        )
+
+
+CONNECTORS = pytest.mark.parametrize(
+    "connector_type", [Connector, DirectConnector], ids=["two-call", "one-call"]
+)
 
 
 def _tokens(tmp_path: Path) -> Path:
@@ -163,7 +190,8 @@ def _history(
     ]
 
 
-async def test_sync_converges_and_never_resurrects_deleted_content(tmp_path):
+@CONNECTORS
+async def test_sync_converges_and_never_resurrects_deleted_content(tmp_path, connector_type):
     settings = Settings(
         database_path=tmp_path / "control.db",
         migrations_path=MIGRATIONS,
@@ -190,7 +218,7 @@ async def test_sync_converges_and_never_resurrects_deleted_content(tmp_path):
             headers=admin,
             json={"principalId": connector_id, "actions": ["ingest.write"]},
         )
-        connector = Connector(client, CONNECTOR, space["id"], source["id"])
+        connector = connector_type(client, CONNECTOR, space["id"], source["id"])
 
         # Initial scan delivers v1; a re-sync delivers the same event again under a new key.
         connector.deliver("runbook", "1", "upsert", content=b"v1 body")
@@ -245,7 +273,8 @@ async def test_sync_converges_and_never_resurrects_deleted_content(tmp_path):
     ]
 
 
-async def test_unmapped_audience_quarantines_until_a_mapped_acl_change(tmp_path):
+@CONNECTORS
+async def test_unmapped_audience_quarantines_until_a_mapped_acl_change(tmp_path, connector_type):
     settings = Settings(
         database_path=tmp_path / "control.db",
         migrations_path=MIGRATIONS,
@@ -272,7 +301,7 @@ async def test_unmapped_audience_quarantines_until_a_mapped_acl_change(tmp_path)
             headers=admin,
             json={"principalId": connector_id, "actions": ["ingest.write"]},
         )
-        connector = Connector(client, CONNECTOR, space["id"], source["id"])
+        connector = connector_type(client, CONNECTOR, space["id"], source["id"])
 
         connector.deliver("secret", "1", "upsert", content=b"body", audience=["src:unknown-team"])
         assert await _drain(tmp_path) == 1

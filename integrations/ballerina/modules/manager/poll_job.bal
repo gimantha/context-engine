@@ -5,26 +5,28 @@ import ballerina/task;
 
 import context_engine_connectors.core;
 
+// The checkpoint position name of a poll cursor.
+const string POLL_POSITION = "poll";
+
 # One scheduled poll cycle for a pull connector.
 #
-# Runs `fetch`, ingests each record, and saves the advanced cursor through the
-# checkpoint store. Errors are logged rather than propagated so one bad poll
-# never stops the schedule; the next tick retries from the last saved cursor.
-#
-# The working cursor is cached in memory (seeded once at construction) and
-# advanced only after a successful save, so a failed save is retried and, with
-# idempotent ingestion, replaying the last batch is safe.
+# Runs `fetch`, delivers each record in order, and saves how far delivery got. The
+# cursor only moves past records the engine accepted, or refused for a reason in the
+# record itself: a failure of any other kind stops the batch, and the next tick
+# resends from the last delivered record. Delivery is idempotent, so resending records
+# the engine already has is a clean replay. Errors are logged rather than propagated,
+# so one bad poll never stops the schedule.
 class PollJob {
     *task:Job;
 
     private final core:PollConnector connector;
-    private final core:RecordSink sink;
-    private final CheckpointStore checkpoints;
+    private final core:Sink sink;
+    private final core:CheckpointStore checkpoints;
     private final string instanceId;
     private string cursor;
 
-    function init(core:PollConnector connector, core:RecordSink sink, string instanceId,
-            CheckpointStore checkpoints, string cursor) {
+    function init(core:PollConnector connector, core:Sink sink, string instanceId,
+            core:CheckpointStore checkpoints, string cursor) {
         self.connector = connector;
         self.sink = sink;
         self.instanceId = instanceId;
@@ -38,22 +40,41 @@ class PollJob {
             log:printError("poll failed", 'error = result, instance = self.instanceId);
             return;
         }
+        string reached = self.deliver(result);
+        if reached == self.cursor {
+            return;
+        }
+        error? saved = self.checkpoints.save(POLL_POSITION, reached);
+        if saved is error {
+            // The cursor stays where it was; the next tick resends and replays.
+            log:printError("checkpoint persist failed", 'error = saved, instance = self.instanceId,
+                    cursor = reached);
+            return;
+        }
+        self.cursor = reached;
+    }
+
+    // Deliver the batch in order and return the cursor delivery reached.
+    function deliver(core:FetchResult result) returns string {
+        string reached = self.cursor;
         foreach core:SourceRecord sourceRecord in result.records {
             core:JobAccepted|error accepted = self.sink->ingest(sourceRecord);
             if accepted is error {
-                log:printError("ingest failed", 'error = accepted, instance = self.instanceId,
-                        recordId = sourceRecord.recordId);
+                if !core:isRecordRejection(accepted) {
+                    log:printError("delivery failed; the next poll resends from here",
+                            'error = accepted, instance = self.instanceId,
+                            recordId = sourceRecord.recordId);
+                    return reached;
+                }
+                // Resending the same record cannot succeed, so the poll moves past it.
+                log:printError("record rejected by the engine; skipping it", 'error = accepted,
+                        instance = self.instanceId, recordId = sourceRecord.recordId);
+            }
+            string? position = sourceRecord?.pollCursor;
+            if position is string {
+                reached = position;
             }
         }
-        if result.cursor == self.cursor {
-            return;
-        }
-        error? saved = self.checkpoints.save(self.instanceId, result.cursor);
-        if saved is error {
-            log:printError("checkpoint persist failed", 'error = saved, instance = self.instanceId,
-                    cursor = result.cursor);
-            return;
-        }
-        self.cursor = result.cursor;
+        return result.cursor;
     }
 }

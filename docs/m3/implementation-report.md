@@ -84,3 +84,13 @@ Added before M4 at the user's request, recorded in ADR 0010.
 - **Migration** `0004_source_progress.sql` adds `sync_runs`, `indexing_snapshots`, and an expression index on jobs by source.
 
 Validation on 2026-09-24: ruff clean, 64 non-live tests passing, API and worker startup checks, four migrations on a fresh database, and the provider boundary check.
+
+## Revision (2026-09-28, one-call delivery)
+
+Connectors can now send an event and its content in one request, as `docs/TODO.md` proposed. The two-call path is unchanged.
+
+- **Route.** `POST /v1/sources/{sourceId}/ingestions` takes a multipart body: an `event` part with the envelope, without `contentRef`, then a `content` part with the raw bytes. Deletes and ACL changes send only the event part.
+- **Same checks, earlier.** Delivery rights on the path's source are checked before the body is read. The body is parsed as it streams, so the event is validated before its content is read and the size limit holds while the bytes arrive. The engine stages the content through the same type, size, and hash checks as the upload route; a `contentHash` or `contentType` in the event must match.
+- **Idempotency over event and bytes.** The content is staged under the event's key in its own namespace. The same event and bytes return the original job; different bytes or a different event under the key are a conflict.
+- **Lost replies.** `GET /v1/sources/{sourceId}/ingestions/{idempotencyKey}` returns the job a delivery created, so a connector need not resend the content to learn it.
+- Validation: `engine/tests/test_direct_ingestion.py`, the contract tests, and the reference-connector lifecycle tests in `tests/end-to-end/test_ingestion_lifecycle.py`, which now run over both paths.

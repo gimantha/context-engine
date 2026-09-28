@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Context Engine API
-  version: 0.6.0
+  version: 0.8.0
   description: Provider-neutral API draft for governed context spaces.
 servers:
   - url: /v1
@@ -204,7 +204,8 @@ paths:
       description: >-
         Stage content bytes for a later ingestion event. The response uploadId becomes the
         event's contentRef and its contentHash and contentType must match. Requires
-        ingest.write on the source.
+        ingest.write on the source. Connectors can instead send the event and its content in
+        one request to /sources/{sourceId}/ingestions.
       parameters:
         - $ref: "#/components/parameters/SourceId"
         - $ref: "#/components/parameters/IdempotencyKey"
@@ -239,7 +240,9 @@ paths:
   /sources/{sourceId}/records/{recordId}:
     get:
       operationId: getRecordStatus
-      description: Record lifecycle without content, audiences, or backend details.
+      description: >-
+        Record lifecycle without content, audiences, or backend details. Requires ingest.write,
+        source.manage, or space.manage on the source.
       parameters:
         - $ref: "#/components/parameters/SourceId"
         - name: recordId
@@ -400,6 +403,87 @@ paths:
           $ref: "#/components/responses/Error"
         "409":
           $ref: "#/components/responses/Error"
+  /sources/{sourceId}/ingestions:
+    post:
+      operationId: acceptDirectIngestion
+      description: >-
+        Deliver one event and, for an upsert, its content in a single multipart request: the
+        event part first, then a content part with the raw bytes. Deletes and ACL changes send
+        only the event part. The engine stages and hashes the content itself, so the event
+        carries no contentRef; a contentHash or contentType in it must match the content. The
+        idempotency key binds the event and the bytes together: the same pair returns the
+        original job, and different bytes under the key are a conflict. Requires ingest.write
+        on the source, checked before the body is read.
+      parameters:
+        - $ref: "#/components/parameters/SourceId"
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [event]
+              properties:
+                event:
+                  $ref: "../schemas/ingestion-direct-event.schema.json"
+                content:
+                  type: string
+                  format: binary
+            encoding:
+              event:
+                contentType: application/json
+      responses:
+        "202":
+          $ref: "#/components/responses/JobAccepted"
+        "400":
+          $ref: "#/components/responses/Error"
+        "401":
+          $ref: "#/components/responses/Error"
+        "403":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
+        "409":
+          $ref: "#/components/responses/Error"
+        "413":
+          $ref: "#/components/responses/Error"
+        "415":
+          $ref: "#/components/responses/Error"
+  /sources/{sourceId}/ingestions/{idempotencyKey}:
+    get:
+      operationId: findIngestion
+      description: >-
+        Return the job that a delivery to this source created under an idempotency key, so a
+        connector that lost the reply can poll it instead of resending the content. Requires
+        ingest.write on the source.
+      parameters:
+        - $ref: "#/components/parameters/SourceId"
+        - name: idempotencyKey
+          in: path
+          required: true
+          schema:
+            type: string
+            minLength: 8
+            maxLength: 200
+      responses:
+        "200":
+          description: The delivery's job
+          headers:
+            Location:
+              schema:
+                type: string
+              description: Job status URL
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JobAccepted"
+        "401":
+          $ref: "#/components/responses/Error"
+        "403":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
   /jobs/{jobId}:
     get:
       operationId: getJob
@@ -417,6 +501,11 @@ paths:
   /queries:
     post:
       operationId: createQuery
+      description: >-
+        Context mode returns authorized, source-linked passages. Requires context.read on the
+        space; only records whose audiences include one of the caller's groups can appear, and
+        every passage is checked against the ledger before it is returned. Answer mode is not
+        available yet and is rejected. A deployment without the knowledge backend answers 503.
       requestBody:
         required: true
         content:
@@ -432,6 +521,16 @@ paths:
                 $ref: "#/components/schemas/QueryResponse"
         "202":
           $ref: "#/components/responses/JobAccepted"
+        "400":
+          $ref: "#/components/responses/Error"
+        "401":
+          $ref: "#/components/responses/Error"
+        "403":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
+        "503":
+          $ref: "#/components/responses/Error"
   /queries/{queryId}:
     get:
       operationId: getQuery
@@ -491,12 +590,25 @@ paths:
   /spaces/{spaceId}/enrichments:
     post:
       operationId: createContextEnrichment
+      description: >-
+        Queue a versioned enrichment of the space. Requires context.enrich. Each internal
+        isolation unit is enriched separately, so derived data never spans reader sets.
       parameters:
         - $ref: "#/components/parameters/SpaceId"
         - $ref: "#/components/parameters/IdempotencyKey"
       responses:
         "202":
           $ref: "#/components/responses/JobAccepted"
+        "401":
+          $ref: "#/components/responses/Error"
+        "403":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
+        "409":
+          $ref: "#/components/responses/Error"
+        "503":
+          $ref: "#/components/responses/Error"
   /records/{recordId}:
     delete:
       operationId: deleteRecord

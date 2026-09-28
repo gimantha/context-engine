@@ -62,3 +62,10 @@ class UnsupportedContentTypeError(ApplicationError):
 
     def __init__(self, message: str = "Content type is not accepted") -> None:
         super().__init__("unsupported_content_type", message)
+
+
+class ServiceUnavailableError(ApplicationError):
+    """Indicate that a capability is not configured or its backend cannot answer now."""
+
+    def __init__(self, message: str = "This capability is not available right now") -> None:
+        super().__init__("unavailable", message)

@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any, Protocol
 
-from context_engine.domain import IndexState, Job, Source
+from context_engine.domain import IndexState, Job, JobOperation, Source
 from context_engine.persistence import SourceRepository, StagingStore
 
 
@@ -98,3 +99,20 @@ class LifecycleJobHandler:
             "state": transition.state.value,
             "indexState": index_state.value if index_state is not None else None,
         }
+
+
+class OperationDispatcher:
+    """Route each claimed job to the handler registered for its operation."""
+
+    def __init__(self, handlers: Mapping[JobOperation, JobHandler]) -> None:
+        self._handlers = dict(handlers)
+
+    async def handle(self, job: Job) -> dict[str, Any]:
+        """Run the job's handler; operations without one fail terminally."""
+
+        handler = self._handlers.get(job.operation)
+        if handler is None:
+            raise TerminalJobError(
+                "unsupported_operation", "This operation is not available in this worker"
+            )
+        return await handler.handle(job)

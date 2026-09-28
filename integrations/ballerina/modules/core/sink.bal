@@ -1,106 +1,126 @@
-// The single place that turns a connector's `SourceRecord` into a canonical
-// ingestion event and submits it.
+// The single place that turns a connector's `SourceRecord` into an ingestion event
+// and delivers it.
 
 import ballerina/crypto;
-import ballerina/time;
+import ballerina/http;
 
-# Ingests normalized records into the engine.
+# Where connectors deliver records. The runtime provides a `RecordSink`; tests can
+# supply their own implementation.
+public type Sink client object {
+    # Deliver one record as an upsert.
+    #
+    # + sourceRecord - the normalized record
+    # + return - the accepted job handle, or an error
+    remote function ingest(SourceRecord sourceRecord) returns JobAccepted|error;
+
+    # Deliver the deletion of one record.
+    #
+    # + recordId - the removed record's identity within its source
+    # + sourceVersion - version of the deletion; it must order after the record's last
+    #   upsert, or the engine ignores it as older
+    # + sourceObservedAt - time the source removed the record (RFC 3339)
+    # + return - the accepted job handle, or an error
+    remote function remove(string recordId, string sourceVersion, string sourceObservedAt)
+            returns JobAccepted|error;
+};
+
+# Delivers normalized records into the engine for one destination.
 #
-# Provided to each connector by the runtime; it owns everything provider-neutral:
-# hashing content, deriving the idempotency key, and building the envelope.
-public client class RecordSink {
+# Owns everything provider-neutral: hashing content, deriving the idempotency key, and
+# building the event. It is isolated, so change listeners may call it from concurrent
+# strands.
+public isolated client class RecordSink {
+    *Sink;
+
     private final EngineClient engineClient;
-    private final Destination destination;
+    private final readonly & Destination destination;
 
     # Create a sink bound to an engine client and a destination.
     #
     # + engineClient - the shared engine client
-    # + destination - the engine-side space/source this connector writes to
-    public function init(EngineClient engineClient, Destination destination) {
+    # + destination - the engine-side space and source this connector writes to
+    public isolated function init(EngineClient engineClient, Destination destination) {
         self.engineClient = engineClient;
-        self.destination = destination;
+        self.destination = destination.cloneReadOnly();
     }
 
-    # Normalize and ingest one source record as an `upsert`.
+    # Deliver one record as an upsert, with its content in the same request.
     #
-    # + sourceRecord - the normalized record to ingest
+    # The event carries the content's SHA-256 so the engine can check the bytes it
+    # received. The key covers the source, record, and version, so a resend of the same
+    # state replays the original job.
+    #
+    # + sourceRecord - the normalized record
     # + return - the accepted job handle, or an error
-    remote function ingest(SourceRecord sourceRecord) returns JobAccepted|error {
-        // The engine no longer accepts inline content: an upsert stages the content
-        // bytes first, then references the staged object. Text content is staged as
-        // UTF-8; binary sources (e.g. file uploads) supply raw `contentBytes`.
-        byte[]? rawBytes = sourceRecord?.contentBytes;
-        string? text = sourceRecord?.content;
-        byte[] bytes;
-        if rawBytes is byte[] {
-            bytes = rawBytes;
-        } else if text is string {
-            bytes = text.toBytes();
-        } else {
-            return error("source record has neither content nor contentBytes");
-        }
-        // A content-addressed hash gives a stable version when the source has none.
-        byte[] digest = crypto:hashSha256(bytes);
-        string hashHex = digest.toBase16().toLowerAscii();
-        string sourceVersion = sourceRecord?.sourceVersion ?: hashHex;
-        string[] audience = sourceRecord?.audience ?: self.destination.audience;
-        string key = idempotencyKey(self.destination.spaceId, self.destination.sourceId,
-                sourceRecord.recordId, sourceVersion);
-
-        // Stage the content, then echo the engine's own contentRef/hash/type so the
-        // event verifies against the staged object exactly.
-        StagedUpload upload = check self.engineClient->stageUpload(self.destination.sourceId,
-                sourceRecord.contentType, bytes, key);
+    remote isolated function ingest(SourceRecord sourceRecord) returns JobAccepted|error {
+        byte[] bytes = check contentOf(sourceRecord);
         IngestionEvent ingestionEvent = {
             spaceId: self.destination.spaceId,
             sourceId: self.destination.sourceId,
             sourceRecordId: sourceRecord.recordId,
-            sourceVersion: sourceVersion,
+            sourceVersion: sourceRecord.sourceVersion,
             operation: "upsert",
-            contentType: upload.contentType,
-            contentRef: upload.uploadId,
-            contentHash: upload.contentHash,
-            sourceObservedAt: sourceRecord?.sourceObservedAt ?: time:utcToString(time:utcNow()),
-            audience: audience,
+            contentHash: "sha256:" + crypto:hashSha256(bytes).toBase16(),
+            sourceObservedAt: sourceRecord.sourceObservedAt,
+            audience: sourceRecord?.audience ?: self.destination.audience,
             sourceAclVersion: self.destination.sourceAclVersion,
-            idempotencyKey: key
+            idempotencyKey: idempotencyKey(self.destination.sourceId, "upsert",
+                    sourceRecord.recordId, sourceRecord.sourceVersion)
         };
-        string? title = sourceRecord?.title;
-        if title is string {
-            ingestionEvent.title = title;
-        }
         string? sourceUrl = sourceRecord?.sourceUrl;
         if sourceUrl is string {
             ingestionEvent.sourceUrl = sourceUrl;
         }
-        return self.engineClient->ingest(ingestionEvent);
+        return self.send(ingestionEvent, bytes, sourceRecord.contentType);
     }
 
-    # Ingest a deletion of a source record.
+    # Deliver the deletion of one record; a delete carries no content.
     #
-    # A `delete` carries only the record's identity; the engine requires no
-    # content for it. Used by change-capture connectors when a source record is
-    # removed.
-    #
-    # + recordId - stable logical identity of the removed record within its source
-    # + sourceVersion - monotonic version of this deletion (e.g. a source change number)
-    # + sourceObservedAt - time the source produced this deletion (RFC 3339); defaults
-    #   to now(). Supplying the source's real timestamp keeps replays byte-identical.
+    # + recordId - the removed record's identity within its source
+    # + sourceVersion - version of the deletion, ordered after the last upsert
+    # + sourceObservedAt - time the source removed the record (RFC 3339)
     # + return - the accepted job handle, or an error
-    remote function remove(string recordId, string sourceVersion, string? sourceObservedAt = ())
+    remote isolated function remove(string recordId, string sourceVersion, string sourceObservedAt)
             returns JobAccepted|error {
         IngestionEvent ingestionEvent = {
             spaceId: self.destination.spaceId,
             sourceId: self.destination.sourceId,
             sourceRecordId: recordId,
-            sourceVersion: sourceVersion,
+            sourceVersion,
             operation: "delete",
-            sourceObservedAt: sourceObservedAt ?: time:utcToString(time:utcNow()),
+            sourceObservedAt,
             audience: self.destination.audience,
             sourceAclVersion: self.destination.sourceAclVersion,
-            idempotencyKey: idempotencyKey(self.destination.spaceId, self.destination.sourceId,
-                    recordId, sourceVersion)
+            idempotencyKey: idempotencyKey(self.destination.sourceId, "delete", recordId,
+                    sourceVersion)
         };
-        return self.engineClient->ingest(ingestionEvent);
+        return self.send(ingestionEvent);
     }
+
+    // Deliver, and after a lost reply ask the engine whether it accepted the delivery.
+    // A transport failure can happen after the engine stored the event; finding the job
+    // by its key avoids sending the content again.
+    private isolated function send(IngestionEvent ingestionEvent, byte[]? content = (),
+            string contentType = "application/octet-stream") returns JobAccepted|error {
+        JobAccepted|error accepted = self.engineClient->deliver(ingestionEvent, content, contentType);
+        if accepted is JobAccepted || accepted is http:ApplicationResponseError {
+            return accepted;
+        }
+        JobAccepted|error? found = self.engineClient->findDelivery(ingestionEvent.sourceId,
+                ingestionEvent.idempotencyKey);
+        return found is JobAccepted ? found : accepted;
+    }
+}
+
+// The bytes to deliver: raw bytes as given, or text as UTF-8.
+isolated function contentOf(SourceRecord sourceRecord) returns byte[]|error {
+    byte[]? rawBytes = sourceRecord?.contentBytes;
+    if rawBytes is byte[] {
+        return rawBytes;
+    }
+    string? text = sourceRecord?.content;
+    if text is string {
+        return text.toBytes();
+    }
+    return error("source record has neither content nor contentBytes");
 }

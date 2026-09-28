@@ -2,7 +2,7 @@
 
 Devant Context Engine is a standalone service for ingesting governed source records and returning authorized, source-linked context. Its public contracts use engine-owned concepts such as context spaces, sources, evidence, enrichments, and jobs. Knowledge-provider details stay behind a private Python adapter.
 
-The repository contains the Milestone 0 architecture spike, the Milestone 1 runnable control plane, the Milestone 2 identity and grants slice, and the engine half of Milestone 3: source registration, staged uploads, connector checkpoints, and the authoritative record ledger with version ordering, deletion tombstones, and audience quarantine. The Ballerina file-source connector is developed separately; an end-to-end test plays the connector's role. Live-provider isolation and deletion verification remains an open release gate recorded in [the M0 exit decision](docs/m0/exit-decision.md).
+The repository contains the Milestone 0 architecture spike, the Milestone 1 runnable control plane, the Milestone 2 identity and grants slice, and the engine half of Milestone 3: source registration, staged uploads, connector checkpoints, and the authoritative record ledger with version ordering, deletion tombstones, and audience quarantine. The Ballerina file-source connector is developed separately; an end-to-end test plays the connector's role. The live-provider isolation, lifecycle, and residue checks passed on 2026-09-25; the open items are recorded in [the M0 exit decision](docs/m0/exit-decision.md).
 
 ## Repository layout
 
@@ -11,7 +11,7 @@ The repository contains the Milestone 0 architecture spike, the Milestone 1 runn
 ├── contracts/                 # Provider-neutral HTTP, event, and MCP contracts
 ├── docs/                      # Plans, ADRs, threat model, and milestone evidence
 ├── engine/                    # REST API, worker, control plane, private adapter, and tests
-├── integrations/              # Ballerina source connectors and shared ingestion client
+├── integrations/              # Ballerina connector host: Salesforce connector and file uploads
 ├── local/                     # Safe example configuration for local verification
 ├── scripts/                   # Repository policy and boundary checks
 ├── tests/                     # Cross-component contract, isolation, and recovery tests
@@ -80,6 +80,14 @@ Start the worker independently in the second terminal:
 uv run context-engine-worker
 ```
 
+In provider mode, run the API and the worker as one process instead. The local knowledge-backend stores can be opened by only one process at a time, so queries fail while a separate worker process holds them (ADR 0002 revision). This command serves the API and runs the worker loop in the same process, and readiness reports unavailable while that loop is failing:
+
+```bash
+uv run context-engine-serve --host 127.0.0.1 --port 8000
+```
+
+On shutdown it lets the current job finish for up to the worker lease period, `CONTEXT_ENGINE_WORKER_LEASE_SECONDS`, before stopping it; an interrupted job is retried on the next start.
+
 Verify the API. Health routes are open; every other route needs a bearer token from the static file:
 
 ```bash
@@ -116,6 +124,22 @@ curl -H "Authorization: Bearer <connector token>" -H "Idempotency-Key: upload-00
 
 The upload response carries `uploadId` and `contentHash`. Put them into an ingestion event as `contentRef` and `contentHash`, post it to `/v1/ingestions` with the same `Idempotency-Key` as the body, and watch `/v1/jobs/<job id>` and `/v1/sources/<source id>/records/<record id>` as the worker applies it. Failed deliveries are listed at `/v1/sources/<source id>/jobs?state=failed`.
 
+A connector can also send the event and its content in one request. The event part comes first, as JSON without `contentRef`; the engine stages and hashes the content part itself. Deletes and ACL changes send only the event part. The `Idempotency-Key` header must match the event's `idempotencyKey`, and it binds the event and the bytes together:
+
+```bash
+curl -H "Authorization: Bearer <connector token>" -H "Idempotency-Key: runbook-84-v84" \
+  -F "event=@event.json;type=application/json" \
+  -F "content=@runbook.txt;type=text/plain" \
+  http://127.0.0.1:8000/v1/sources/<source id>/ingestions
+```
+
+If the reply is lost, look the delivery up by its key instead of resending the content:
+
+```bash
+curl -H "Authorization: Bearer <connector token>" \
+  http://127.0.0.1:8000/v1/sources/<source id>/ingestions/runbook-84-v84
+```
+
 Watch a source's progress through the separate, read-only progress API. A connector marks reading with a sync run; the progress response reports the reading state, processing counts and percentage since the latest run started, ledger record counts, and indexing counts and percentage from the last background collection:
 
 ```bash
@@ -129,9 +153,19 @@ curl -X POST -H "Authorization: Bearer <connector token>" \
 
 Indexing reports `not_collected` while the worker is ledger-only.
 
-To index content into the knowledge backend, install the provider extra, copy `local/m4.env.example` to `engine/.env`, fill in the model and embedding keys, and start the worker as usual. With `CONTEXT_ENGINE_KNOWLEDGE_BACKEND=provider`, the worker extracts text from staged bytes, writes each record into its partition as the engine's service identity, replaces and moves copies as versions and audiences change, removes copies of deleted records, and grants read access that matches engine policy. Each record's `indexState` on the record-status route and the indexing section of the progress route show how far it got. See [the M4 report](docs/m4/implementation-report.md); the provider path has only been verified against the deterministic backend so far.
+To index content into the knowledge backend, install the provider extra, copy `local/m4.env.example` to `engine/.env`, fill in the model and embedding keys, and start the worker as usual. With `CONTEXT_ENGINE_KNOWLEDGE_BACKEND=provider`, the worker extracts text from staged bytes, writes each record into its partition as the engine's service identity, replaces and moves copies as versions and audiences change, removes copies of deleted records, and grants read access that matches engine policy. Each record's `indexState` on the record-status route and the indexing section of the progress route show how far it got. Serve queries and enrichment with `uv run context-engine-serve`, which runs the API and the worker in one process with the same profile. A separate API process cannot query while a separate worker process holds the local stores (ADR 0002 revision). A member of a record's audience with `context.read` on the space can then ask for passages, and a principal with `context.enrich` can start an enrichment:
 
-Interactive API documentation is available at `http://127.0.0.1:8000/docs`. Identity-provider integrations arrive in M6. Provider-backed execution arrives in M4.
+```bash
+curl -H "Authorization: Bearer <reader token>" -H "Content-Type: application/json" \
+  -d '{"spaceId": "<space id>", "question": "rollback checkpoint", "mode": "context"}' \
+  http://127.0.0.1:8000/v1/queries
+curl -X POST -H "Authorization: Bearer <enricher token>" -H "Idempotency-Key: enrich-000001" \
+  http://127.0.0.1:8000/v1/spaces/<space id>/enrichments
+```
+
+See [the M4 report](docs/m4/implementation-report.md) for the live verification and its open items.
+
+Interactive API documentation is available at `http://127.0.0.1:8000/docs`. Identity-provider integrations arrive in M6.
 
 ## Run the live-provider verification
 
@@ -154,7 +188,7 @@ set +a
 uv run pytest -m live_provider -v
 ```
 
-The test skips unless `CONTEXT_ENGINE_RUN_LIVE_PROVIDER=true` and `CONTEXT_ENGINE_MODEL_API_KEY` are present. It writes every record as the engine's service identity, `CONTEXT_ENGINE_SERVICE_PRINCIPAL_ID`, and grants read access to separate reader identities before checking isolation. Record verified results in [the spike report](docs/m0/spike-report.md) and update [the exit decision](docs/m0/exit-decision.md) only when the complete isolation, lifecycle, and residue checks pass.
+The tests skip unless `CONTEXT_ENGINE_RUN_LIVE_PROVIDER=true` and `CONTEXT_ENGINE_MODEL_API_KEY` are present. The lifecycle test writes every record as the engine's service identity, `CONTEXT_ENGINE_SERVICE_PRINCIPAL_ID`, grants read access to separate reader identities, checks isolation, replacement, and deletion, and scans the provider's live stores for residue. The end-to-end test drives the REST API and the worker in one process. A run takes about three minutes and calls the configured models. Record verified results in [the spike report](docs/m0/spike-report.md) and update [the exit decision](docs/m0/exit-decision.md) only when the complete isolation, lifecycle, and residue checks pass.
 
 ## Development workflow
 
@@ -183,6 +217,7 @@ Changes to a public contract should update its examples and contract tests in th
 - Effective permissions come from grants on a resource and its ancestors. Grants on the root resource `engine` apply to every context space. A principal that holds no action on a resource receives not-found, never a hint that the resource exists.
 - A connector's delivery right is a grant of `ingest.write` on the source. The ingestion body cannot pick a space or source the credential is not bound to, and staged content must match the event's type and hash.
 - The worker converges the knowledge backend to the ledger record by record. It records each write's intent before calling the backend, checks that removed and replaced versions are gone, and marks a record reconcile-required rather than writing twice after a crash (ADR 0007).
+- Queries resolve readable partitions from engine policy, ask the backend as the caller, and return a passage only when the ledger shows its record active and indexed at its current version where the caller may read. The adapter pins its retriever and never lets the provider route a question.
 - The engine never fetches a supplied URL. `sourceUrl` is display provenance; bytes arrive through staged uploads delivered by a connector, whatever the source type.
 - The record ledger is authoritative. Versions compare under the source's declared ordering, an older event never replaces or resurrects a newer or deleted record, and records with an unmapped audience tag are quarantined.
 - Progress is read-only observability under `/v1/progress/`. It needs delivery or management rights on the source, and it never queries the knowledge backend on the request path; a worker collector stores indexing snapshots that the API reads (ADR 0010).

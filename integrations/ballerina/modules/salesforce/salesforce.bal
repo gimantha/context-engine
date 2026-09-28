@@ -1,5 +1,6 @@
-// The Salesforce connector: one registration that runs BOTH a SOQL poll (creates +
-// initial backfill, paged by CreatedDate) and a CDC listener (updates + deletes).
+// The Salesforce connector: one registration that runs BOTH a SOQL poll (initial
+// backfill, paged by CreatedDate and Id) and a CDC listener (creates, updates,
+// undeletes, and deletes).
 // Its `ConnectorType` sets both a poll factory and a listen factory, so the manager
 // schedules the poll and attaches the listener for a single `salesforce` config —
 // the user never has to know it is two connectors underneath.
@@ -38,7 +39,8 @@ public type SalesforceSettings record {|
     string sobject;
     # Business fields to ingest as content.
     string[] fields;
-    # CDC subscription start: -1 tip (new only), -2 last 72h, or a replayId.
+    # CDC subscription start for the first run: -1 tip (new only), -2 last 72h, or a
+    # replayId. Once a replay position has been stored, restarts resume from it instead.
     int replayFrom = -1;
     # Maximum records per backfill poll.
     int batchSize = 200;
@@ -58,14 +60,14 @@ public function salesforceType() returns core:ConnectorType {
     };
 }
 
-// Poll factory: SOQL for creates + backfill.
+// Poll factory: SOQL for the backfill.
 function createPollConnector(json settings) returns core:PollConnector|error {
     SalesforceSettings s = check settings.cloneWithType();
     salesforce:Client sfClient = check newClient(s.baseUrl, s.apiVersion, s.clientId, s.clientSecret);
     return new SalesforceSoqlConnector(s, sfClient);
 }
 
-// Listen factory: CDC for updates + deletes.
+// Listen factory: CDC for creates, updates, undeletes, and deletes.
 function createListenConnector(json settings) returns core:ListenConnector|error {
     SalesforceSettings s = check settings.cloneWithType();
     salesforce:Client sfClient = check newClient(s.baseUrl, s.apiVersion, s.clientId, s.clientSecret);
