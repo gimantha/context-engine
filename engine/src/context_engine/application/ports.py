@@ -69,6 +69,13 @@ class ControlPlaneStore(Protocol):
 
         ...
 
+    def find_source_job(
+        self, source_id: str, idempotency_key: str, operations: tuple[JobOperation, ...]
+    ) -> Job | None:
+        """Return the newest job one source's delivery created under an idempotency key."""
+
+        ...
+
     def count_source_jobs(self, source_id: str, since: datetime | None = None) -> JobCounts:
         """Count a source's deliveries by public state, optionally since a time."""
 

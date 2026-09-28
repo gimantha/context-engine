@@ -10,6 +10,7 @@ from uuid import uuid4
 from fastapi import Depends, FastAPI, Header, Path, Query, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, PlainTextResponse
+from pydantic import ValidationError as SchemaValidationError
 
 from context_engine.application import (
     AccessDeniedError,
@@ -22,10 +23,11 @@ from context_engine.application import (
     UnauthenticatedError,
     UnsupportedContentTypeError,
     UploadPolicy,
+    ValidationError,
     build_query_backend,
 )
 from context_engine.config import Settings
-from context_engine.domain import JobState, SourceState, VersionOrdering
+from context_engine.domain import IngestionCommand, JobState, SourceState, VersionOrdering
 from context_engine.observability import (
     MetricsRegistry,
     configure_logging,
@@ -49,6 +51,7 @@ from context_engine.security.identity import (
     provision_static_identities,
 )
 
+from .multipart import read_ingestion_parts
 from .progress import build_progress_router
 from .schemas import (
     CheckpointResponse,
@@ -56,6 +59,7 @@ from .schemas import (
     ContextQueryResponse,
     ContextSpaceResponse,
     CreateContextSpaceRequest,
+    DirectIngestionEvent,
     EffectivePermissionsResponse,
     ErrorResponse,
     GrantResponse,
@@ -80,6 +84,7 @@ ResourceId = Annotated[str, Path(min_length=1, max_length=200)]
 GrantId = Annotated[str, Path(pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")]
 RecordId = Annotated[str, Path(min_length=1, max_length=500)]
 IdempotencyKey = Annotated[str, Header(alias="Idempotency-Key", min_length=8, max_length=200)]
+DeliveryKey = Annotated[str, Path(min_length=8, max_length=200)]
 
 
 def _trace_id(request: Request) -> str:
@@ -529,6 +534,84 @@ def create_app(
         principal: AuthenticatedPrincipal = Depends(current_principal),
     ) -> JobAcceptedResponse:
         job = service.accept_ingestion(principal, body.to_command(), idempotency_key)
+        status_url = f"/v1/jobs/{job.id}"
+        response.headers["Location"] = status_url
+        return JobAcceptedResponse(jobId=job.id, statusUrl=status_url)
+
+    @app.post(
+        "/v1/sources/{source_id}/ingestions",
+        response_model=JobAcceptedResponse,
+        response_model_by_alias=True,
+        status_code=202,
+        openapi_extra={
+            "requestBody": {
+                "required": True,
+                "content": {
+                    "multipart/form-data": {
+                        "schema": {
+                            "type": "object",
+                            "required": ["event"],
+                            "properties": {
+                                "event": {"type": "string", "format": "json"},
+                                "content": {"type": "string", "format": "binary"},
+                            },
+                        },
+                        "encoding": {"event": {"contentType": "application/json"}},
+                    }
+                },
+            }
+        },
+    )
+    async def accept_direct_ingestion(
+        source_id: ResourceId,
+        request: Request,
+        response: Response,
+        idempotency_key: IdempotencyKey,
+        principal: AuthenticatedPrincipal = Depends(current_principal),
+    ) -> JobAcceptedResponse:
+        # Authorize before reading the body so an unbound caller cannot occupy the size budget.
+        service.authorize_upload(principal, source_id)
+
+        def parse_event(raw: bytes) -> IngestionCommand:
+            try:
+                event = DirectIngestionEvent.model_validate_json(raw)
+            except SchemaValidationError as exc:
+                raise ValidationError("Ingestion event is invalid") from exc
+            if event.source_id != source_id:
+                raise ValidationError("Event source must match the request path")
+            return event.to_command()
+
+        parts = await read_ingestion_parts(
+            request.headers.get("content-type", ""),
+            request.stream(),
+            parse_event,
+            upload_policy.max_bytes,
+        )
+        job = service.accept_direct_ingestion(
+            principal,
+            source_id,
+            parts.event,
+            parts.content,
+            parts.content_type,
+            idempotency_key,
+        )
+        status_url = f"/v1/jobs/{job.id}"
+        response.headers["Location"] = status_url
+        return JobAcceptedResponse(jobId=job.id, statusUrl=status_url)
+
+    @app.get(
+        "/v1/sources/{source_id}/ingestions/{idempotency_key}",
+        response_model=JobAcceptedResponse,
+        response_model_by_alias=True,
+    )
+    async def find_ingestion(
+        source_id: ResourceId,
+        idempotency_key: DeliveryKey,
+        response: Response,
+        principal: AuthenticatedPrincipal = Depends(current_principal),
+    ) -> JobAcceptedResponse:
+        # A connector that lost the reply finds its job here instead of resending the content.
+        job = service.find_ingestion(principal, source_id, idempotency_key)
         status_url = f"/v1/jobs/{job.id}"
         response.headers["Location"] = status_url
         return JobAcceptedResponse(jobId=job.id, statusUrl=status_url)

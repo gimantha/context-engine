@@ -123,6 +123,22 @@ curl -H "Authorization: Bearer <connector token>" -H "Idempotency-Key: upload-00
 
 The upload response carries `uploadId` and `contentHash`. Put them into an ingestion event as `contentRef` and `contentHash`, post it to `/v1/ingestions` with the same `Idempotency-Key` as the body, and watch `/v1/jobs/<job id>` and `/v1/sources/<source id>/records/<record id>` as the worker applies it. Failed deliveries are listed at `/v1/sources/<source id>/jobs?state=failed`.
 
+A connector can also send the event and its content in one request. The event part comes first, as JSON without `contentRef`; the engine stages and hashes the content part itself. Deletes and ACL changes send only the event part. The `Idempotency-Key` header must match the event's `idempotencyKey`, and it binds the event and the bytes together:
+
+```bash
+curl -H "Authorization: Bearer <connector token>" -H "Idempotency-Key: runbook-84-v84" \
+  -F "event=@event.json;type=application/json" \
+  -F "content=@runbook.txt;type=text/plain" \
+  http://127.0.0.1:8000/v1/sources/<source id>/ingestions
+```
+
+If the reply is lost, look the delivery up by its key instead of resending the content:
+
+```bash
+curl -H "Authorization: Bearer <connector token>" \
+  http://127.0.0.1:8000/v1/sources/<source id>/ingestions/runbook-84-v84
+```
+
 Watch a source's progress through the separate, read-only progress API. A connector marks reading with a sync run; the progress response reports the reading state, processing counts and percentage since the latest run started, ledger record counts, and indexing counts and percentage from the last background collection:
 
 ```bash

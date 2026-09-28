@@ -131,6 +131,24 @@ class IngestionRequest(_ApiModel):
         )
 
 
+class DirectIngestionEvent(IngestionRequest):
+    """Validate an ingestion envelope whose content travels in the same request.
+
+    The engine stages the content and fills in the reference and hash itself, so an upsert
+    needs neither; a hash or content type that is present is checked against the bytes.
+    """
+
+    @model_validator(mode="after")
+    def validate_operation_content(self) -> DirectIngestionEvent:
+        """Keep the envelope's audience rule and refuse a reference to separate content."""
+
+        if len(set(self.audience)) != len(self.audience):
+            raise ValueError("audience values must be unique")
+        if self.content_ref is not None:
+            raise ValueError("contentRef is not used when content travels with the event")
+        return self
+
+
 class JobAcceptedResponse(_ApiModel):
     """Return the stable handle for accepted asynchronous work."""
 

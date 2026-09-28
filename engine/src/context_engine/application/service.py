@@ -8,7 +8,7 @@ answer with not-found so denials reveal nothing about what exists.
 from __future__ import annotations
 
 import hashlib
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from uuid import uuid4
 
 from context_engine.domain import (
@@ -72,6 +72,10 @@ _MANAGE_SOURCES = frozenset({Action.SOURCE_MANAGE, Action.SPACE_MANAGE})
 _INSPECT_DELIVERIES = frozenset({Action.SOURCE_MANAGE, Action.SPACE_MANAGE, Action.INGEST_WRITE})
 ENRICHMENT_PIPELINE_VERSION = "enrich@1"
 _RETRY_ONE_BY_ONE = frozenset({BackendErrorCode.ACCESS_DENIED, BackendErrorCode.NOT_FOUND})
+_DELIVERY_OPERATIONS = (JobOperation.INGESTION, JobOperation.UPDATE, JobOperation.DELETION)
+# Content delivered with its event is staged under the event's key in its own namespace, so
+# it never collides with a key the connector used for a separate upload.
+_DIRECT_UPLOAD_PREFIX = "event:"
 
 
 @dataclass(frozen=True, slots=True)
@@ -402,24 +406,7 @@ class ContextEngineService:
         against the event's type and hash before the job exists (threat T12).
         """
 
-        if header_idempotency_key != command.idempotency_key:
-            raise ValidationError("Idempotency key header and body must match")
-        # A connector may hold rights on the source alone, so the source is the visibility
-        # anchor; its registered space must match the body.
-        source = self._sources.get_source(command.source_id)
-        if (
-            source is None
-            or source.space_id != command.space_id
-            or not self._visible(principal, source.id)
-        ):
-            raise NotFoundError("Source not found")
-        self._require(principal, Action.INGEST_WRITE, source.id)
-        if source.state is not SourceState.READY:
-            raise ConflictError("Source is not accepting deliveries")
-        try:
-            source.version_key(command.source_version)
-        except ValueError as exc:
-            raise ValidationError("Source version does not match the source ordering") from exc
+        source = self._check_delivery(principal, command, header_idempotency_key)
         if command.operation == "upsert":
             self._verify_staged_content(source, command)
         try:
@@ -439,6 +426,94 @@ class ContextEngineService:
             else "context_engine_jobs_replayed_total"
         )
         self._metrics.increment(metric)
+        return job
+
+    def _check_delivery(
+        self,
+        principal: AuthenticatedPrincipal,
+        command: IngestionCommand,
+        header_idempotency_key: str,
+    ) -> Source:
+        """Check everything about a delivery that does not depend on its content."""
+
+        if header_idempotency_key != command.idempotency_key:
+            raise ValidationError("Idempotency key header and body must match")
+        # A connector may hold rights on the source alone, so the source is the visibility
+        # anchor; its registered space must match the body.
+        source = self._sources.get_source(command.source_id)
+        if (
+            source is None
+            or source.space_id != command.space_id
+            or not self._visible(principal, source.id)
+        ):
+            raise NotFoundError("Source not found")
+        self._require(principal, Action.INGEST_WRITE, source.id)
+        if source.state is not SourceState.READY:
+            raise ConflictError("Source is not accepting deliveries")
+        try:
+            source.version_key(command.source_version)
+        except ValueError as exc:
+            raise ValidationError("Source version does not match the source ordering") from exc
+        return source
+
+    def accept_direct_ingestion(
+        self,
+        principal: AuthenticatedPrincipal,
+        source_id: str,
+        command: IngestionCommand,
+        content: bytes | None,
+        content_type: str | None,
+        header_idempotency_key: str,
+    ) -> Job:
+        """Stage content delivered with its event, then accept the event as a staged delivery.
+
+        The engine hashes the bytes itself; a hash or type in the event is only checked
+        against them. The event's idempotency key also binds the bytes, so a replay with the
+        same event and bytes returns the original job and different bytes are a conflict.
+        """
+
+        if command.source_id != source_id:
+            raise ValidationError("Event source must match the request path")
+        if command.content_ref is not None:
+            raise ValidationError("contentRef is not used when content travels with the event")
+        # Everything that can reject the event is checked before its bytes are staged, so a
+        # refused delivery leaves no upload behind.
+        self._check_delivery(principal, command, header_idempotency_key)
+        if command.operation == "upsert":
+            if content is None:
+                raise ValidationError("An upsert requires a content part")
+            upload = self.stage_upload(
+                principal,
+                source_id,
+                content_type or "",
+                content,
+                _DIRECT_UPLOAD_PREFIX + command.idempotency_key,
+            )
+            declared_type = (command.content_type or "").split(";", 1)[0].strip().lower()
+            if (
+                command.content_hash is not None and command.content_hash != upload.content_hash
+            ) or (declared_type and declared_type != upload.content_type):
+                raise ValidationError("Content does not match the ingestion event")
+            command = replace(
+                command,
+                content_ref=upload.id,
+                content_hash=upload.content_hash,
+                content_type=upload.content_type,
+            )
+        elif content is not None:
+            raise ValidationError("Only an upsert carries content")
+        return self.accept_ingestion(principal, command, header_idempotency_key)
+
+    def find_ingestion(
+        self, principal: AuthenticatedPrincipal, source_id: str, idempotency_key: str
+    ) -> Job:
+        """Return the job a delivery created under a key, for a connector that lost the reply."""
+
+        self._visible_source(principal, source_id)
+        self._require(principal, Action.INGEST_WRITE, source_id)
+        job = self._store.find_source_job(source_id, idempotency_key, _DELIVERY_OPERATIONS)
+        if job is None:
+            raise NotFoundError("Ingestion not found")
         return job
 
     def _verify_staged_content(self, source: Source, command: IngestionCommand) -> None:

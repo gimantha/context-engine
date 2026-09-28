@@ -36,6 +36,21 @@ def test_invalid_ingestion_example_is_rejected():
         validate(example, schema)
 
 
+def test_direct_ingestion_example_matches_its_schema_only():
+    direct = json.loads((ROOT / "contracts/schemas/ingestion-direct-event.schema.json").read_text())
+    staged = json.loads((ROOT / "contracts/schemas/ingestion-event.schema.json").read_text())
+    example = json.loads((ROOT / "contracts/examples/ingestion-direct-event.json").read_text())
+    Draft202012Validator.check_schema(direct)
+    validate(example, direct)
+    # An upsert without staged content is valid only when the content travels with it.
+    with pytest.raises(ValidationError):
+        validate(example, staged)
+    # A reference to separately staged content is never part of a one-call event.
+    referenced = {**example, "contentRef": "staged-object-01J8M0"}
+    with pytest.raises(ValidationError):
+        validate(referenced, direct)
+
+
 def test_mcp_contract_matches_schema():
     schema = json.loads((ROOT / "contracts/mcp/context-engine-tools.schema.json").read_text())
     contract = json.loads((ROOT / "contracts/mcp/context-engine-tools.json").read_text())

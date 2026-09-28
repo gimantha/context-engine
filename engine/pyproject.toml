@@ -9,6 +9,7 @@ description = "Governed context engine API and durable control plane"
 requires-python = ">=3.12,<3.13"
 dependencies = [
   "fastapi==0.141.1",
+  "python-multipart==0.0.32",
   "uvicorn==0.53.0",
 ]
 

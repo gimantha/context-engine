@@ -4,11 +4,11 @@ Work agreed in principle but not yet scheduled in a milestone. Each item says wh
 
 ## One-call ingestion for connectors
 
-**Status:** Proposed on 2026-09-25. The two-call path stays until the Ballerina connector owner agrees to retire it.
+**Status:** Built on 2026-09-28, alongside the two-call path. Retiring the two-call path still needs the Ballerina connector owner's agreement.
 
 ### Why
 
-Today a connector makes two calls for every upsert:
+Before this change, a connector made two calls for every upsert:
 
 1. It uploads the bytes to `POST /v1/sources/{sourceId}/uploads` and receives an `uploadId` and `contentHash`.
 2. It sends an ingestion event to `POST /v1/ingestions` that names the upload in `contentRef` and repeats its hash and content type. The engine answers `202 Accepted` with the `jobId` and `statusUrl`.
@@ -21,7 +21,7 @@ One call gives connectors a simpler protocol and makes accepting an event and st
 
 - **Route.** `POST /v1/sources/{sourceId}/ingestions` takes a `multipart/form-data` body: an `event` part with the ingestion envelope, then a `content` part with the raw bytes. Deletes and ACL changes send only the event part.
 - **Authorization before the bytes.** With the source in the path, the engine checks `ingest.write` before it reads the body, as the upload route does today. The event part comes first, so a malformed event is rejected before the file is read. A `sourceId` in the event must match the path.
-- **Internal staging.** The engine streams the content part into the staging store under the same type allowlist, size limit, and SHA-256 hashing as the upload route. It then records the upload and queues the job together, so an accepted event always has its content. The job payload keeps a reference, never the content.
+- **Internal staging.** The engine streams the content part into the staging store under the same type allowlist, size limit, and SHA-256 hashing as the upload route. Every check that can refuse the event runs before the bytes are staged, and the job is queued only after they are, so an accepted event always has its content. The job payload keeps a reference, never the content.
 - **Engine-computed hash.** The engine hashes the bytes itself. A `contentHash` in the event becomes an optional integrity check that must match when present. Same-version conflict detection keeps comparing the engine's hashes.
 - **Idempotency over event and bytes.** Resending with the same key, event, and bytes returns the original job. The same key with a different event or different bytes is a conflict.
 - **Response.** `202 Accepted` with `jobId`, `statusUrl`, and a `Location` header, as today.
@@ -38,16 +38,24 @@ The job id arrives only in the response. Today a connector that loses it resends
 ### Compatibility
 
 - Keep `POST /v1/sources/{sourceId}/uploads` and `POST /v1/ingestions` working while the connector moves over. Retire them only with the connector owner's agreement. A separate upload step may still be worth keeping for very large or resumable uploads that go straight to object storage in a hosted deployment.
-- The event schema requires `contentRef` and `contentHash` for upserts. The one-call route needs a variant without them.
+- The staged event schema still requires `contentRef` and `contentHash` for upserts. One-call events use `contracts/schemas/ingestion-direct-event.schema.json`, which has no `contentRef`.
 
 ### Work list
 
-- **API.** The multipart route and the lookup route in `engine/src/context_engine/api/app.py`, with the size limit enforced while streaming.
-- **Application.** An ingestion command in `engine/src/context_engine/application/service.py` that stages the bytes and queues the job, sharing the upload route's checks.
+Done on 2026-09-28:
+
+- **API.** The multipart route and the lookup route in `engine/src/context_engine/api/app.py`. The body is parsed as it streams by `engine/src/context_engine/api/multipart.py`, so the event is validated before its content is read and the size limit holds while the bytes arrive.
+- **Application.** `accept_direct_ingestion` and `find_ingestion` in `engine/src/context_engine/application/service.py`, sharing the upload route's checks. The content is staged under the event's key in its own namespace.
 - **Persistence.** A lookup of jobs by source and idempotency key.
-- **Contracts.** OpenAPI routes and examples, the event schema variant, and the planned MCP ingest tool, all under `contracts/`.
-- **Tests.** Acceptance, replay, a conflict with different bytes under the same key, authorization before the body is read, oversized and disallowed content, lookup after a lost response, and the end-to-end connector test on the one-call path.
-- **Docs.** The M3 report's ingestion section, the README delivery walkthrough, and threat model rows T12 and T13.
+- **Contracts.** OpenAPI 0.8.0 with both routes, the one-call event schema, and its example.
+- **Tests.** `engine/tests/test_direct_ingestion.py` covers acceptance, replay, conflicts over event and bytes, declared hash and type checks, request shape, limits, rights checked before the body is read, an invalid event rejected before its content is read, a refused event staging nothing, and the lookup. The reference-connector lifecycle tests now run over both paths. A curl run against a real server staged a 5.5 MB file with the correct hash.
+- **Docs.** The README delivery walkthrough, AGENT.md, the M3 report revision, and threat model row T12.
+
+Remaining:
+
+- **MCP ingest tool.** The planned tool in `contracts/mcp/` still takes a `contentRef`. Decide how an MCP client delivers content when the MCP facade is built in M6.
+- **`Expect: 100-continue`.** Optional, once the Ballerina HTTP client is confirmed to support it.
+- **Retiring the two-call path.** Only with the connector owner's agreement.
 
 ### Open questions
 
