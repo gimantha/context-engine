@@ -97,7 +97,7 @@ When changing a contract, update the matching examples and tests. Run `scripts/c
 - Use `uv lock` after dependency edits; never hand-edit the lock file.
 - Apply migrations with `uv run context-engine-migrate`; add forward-only numbered SQL files under `engine/migrations/`.
 - Keep API and worker entrypoints independently runnable.
-- Give every hand-written Python file a module docstring. Document public classes, protocols, functions, and non-obvious private helpers with concise docstrings; generated files are exempt. Add inline comments for invariants, security boundaries, transaction semantics, and recovery behavior that the code alone does not make clear; do not narrate straightforward statements.
+- Give every hand-written Python file a module docstring. Document public classes, protocols, functions, and private helpers with docstrings that say what the code does and why it works that way; cite the ADR, threat, or milestone where a decision was recorded, and when no reason was recorded, describe the behavior's effect rather than inventing one. Generated files are exempt. Add inline comments for invariants, security boundaries, transaction semantics, and recovery behavior that the code alone does not make clear; do not narrate straightforward statements.
 - Keep default development and test paths independent of external credentials.
 - Never commit `.env`, credentials, model tokens, generated provider stores, caches, or logs.
 
