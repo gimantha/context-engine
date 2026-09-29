@@ -30,8 +30,7 @@ function aRowMapsToTheSameRecordEveryTime() returns error? {
 }
 
 SalesforceSettings settings = {
-    clientId: "id",
-    clientSecret: "secret",
+    auth: {authType: "client_credentials", clientId: "id", clientSecret: "secret"},
     baseUrl: "https://example.my.salesforce.com",
     sobject: "Account",
     fields: ["Name"],

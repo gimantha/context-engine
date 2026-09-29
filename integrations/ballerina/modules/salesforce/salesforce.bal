@@ -9,29 +9,19 @@ import ballerinax/salesforce;
 
 import context_engine_connectors.core;
 
-// TODO: support all Salesforce auth flows, not just client-credentials. The
-// salesforce Client and Listener both accept BearerTokenConfig, refresh-token,
-// password, and client-credentials grants. Add an `authType` discriminator to
-// `SalesforceSettings` (with the fields each flow needs) and build the matching
-// auth config in `newClient` (client.bal) and the listener (cdc.bal). Include the
-// JWT bearer flow too (mint the token via ballerina/jwt, pass BearerTokenConfig)
-// for cert-based server-to-server auth.
-
 # Registry key for the Salesforce connector.
 public const SALESFORCE_TYPE = "salesforce";
 
 # Settings for the Salesforce connector (shared by the SOQL poll and CDC listener).
 #
-# Uses the OAuth2 client-credentials flow: enable it on the Connected App and set a
-# run-as user. No refresh token is involved, so mandatory refresh-token rotation
-# does not apply.
+# `auth` selects one of the supported OAuth2 flows (see `SalesforceAuth`). For
+# server-to-server sync, prefer client-credentials: it involves no refresh token,
+# so mandatory refresh-token rotation does not apply.
 public type SalesforceSettings record {|
-    # Connected App consumer key.
-    string clientId;
-    # Connected App consumer secret.
-    string clientSecret;
+    # Authentication settings; one of the supported OAuth2 flows.
+    SalesforceAuth auth;
     # Salesforce instance base URL, e.g. "https://<instance>.my.salesforce.com".
-    # The client-credentials token endpoint is derived from it.
+    # The OAuth token endpoint is derived from it.
     string baseUrl;
     # Salesforce REST API version.
     string apiVersion = "59.0";
@@ -63,13 +53,13 @@ public function salesforceType() returns core:ConnectorType {
 // Poll factory: SOQL for the backfill.
 function createPollConnector(json settings) returns core:PollConnector|error {
     SalesforceSettings s = check settings.cloneWithType();
-    salesforce:Client sfClient = check newClient(s.baseUrl, s.apiVersion, s.clientId, s.clientSecret);
+    salesforce:Client sfClient = check newClient(s.baseUrl, s.apiVersion, s.auth);
     return new SalesforceSoqlConnector(s, sfClient);
 }
 
 // Listen factory: CDC for creates, updates, undeletes, and deletes.
 function createListenConnector(json settings) returns core:ListenConnector|error {
     SalesforceSettings s = check settings.cloneWithType();
-    salesforce:Client sfClient = check newClient(s.baseUrl, s.apiVersion, s.clientId, s.clientSecret);
+    salesforce:Client sfClient = check newClient(s.baseUrl, s.apiVersion, s.auth);
     return new SalesforceCdcConnector(s, sfClient);
 }

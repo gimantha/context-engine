@@ -39,7 +39,7 @@ Every instance gets a checkpoint store. By default it keeps the instance's posit
       "sourceAclVersion": "1"
     },
     "settings": {
-      "clientId": "…", "clientSecret": "…",
+      "auth": { "authType": "client_credentials", "clientId": "…", "clientSecret": "…" },
       "baseUrl": "https://<instance>.my.salesforce.com",
       "sobject": "Account", "fields": ["Name", "Description"]
     }
@@ -54,19 +54,32 @@ Every instance gets a checkpoint store. By default it keeps the instance's posit
 - `Ballerina.toml`, `main.bal`: the root module, the host that registers types, loads configurations, starts the manager, optionally serves uploads, and keeps the process alive.
 - `modules/core/`: the connector SDK. `EngineClient` is the only code that knows the engine's routes; `RecordSink` builds and delivers events. It also holds `SourceRecord`, `Destination`, the `PollConnector` and `ListenConnector` shapes, `CheckpointStore`, and the registration types. Connectors depend on this alone.
 - `modules/manager/`: the runtime. It holds the `ConnectorManager`, the `task`-based `PollJob`, the checkpoint stores, and `EnvConfigProvider`.
-- `modules/salesforce/`: the Salesforce connector, one type with both factories. The poll is the backfill; the change listener handles creates, updates, undeletes, and deletes.
+- `modules/salesforce/`: the Salesforce connector, one type with both factories. The poll is the backfill and owns creates; the change listener handles updates, undeletes, and deletes.
 - `modules/file_source/`: the file-upload endpoint, a host built-in.
 
 ## Salesforce
 
 One `salesforce` configuration drives the full sync:
 
-- **The poll backfills** by paging through the object by `(CreatedDate, Id)`.
-- **The change listener delivers every change.** For a create, update, or undelete it re-fetches the full record, so the content is identical to a backfill and a record delivered by both paths is a replay. It reads every record id in an event, not just the first.
+- **The poll backfills** by paging through the object by `(CreatedDate, Id)`, and owns creates.
+- **The change listener delivers updates, undeletes, and deletes.** For an update or undelete it re-fetches the full record, so the content is identical to a backfill and a record delivered by both paths is a replay. An update that changed none of the projected `fields` is dropped, since it would only re-deliver identical content under a new version. Creates are left to the poll. It reads every record id in an event, not just the first.
 - **Versions are the record's `SystemModstamp`** in epoch milliseconds, and deletes use their commit time. Register the source with numeric version ordering, the default.
 - **Replay positions are stored durably**, so after a restart the listener resumes where it stopped. `replayFrom` applies only to the very first run.
 
-Authentication uses the OAuth2 client-credentials flow. Enable Client Credentials Flow on the Connected App and set a run-as user with Read on the object, API Enabled, and CDC access. The token endpoint is derived from `baseUrl`, the My Domain URL. Enable Change Data Capture for the object in Setup; the channel is derived from `sobject`, for example `Account` becomes `/data/AccountChangeEvent`.
+The token endpoint is derived from `baseUrl`, the My Domain URL. Enable Change Data Capture for the object in Setup; the channel is derived from `sobject`, for example `Account` becomes `/data/AccountChangeEvent`. `settings.auth` selects the OAuth2 flow. The poll client and the change listener use the same settings.
+
+### Auth flows
+
+`settings.auth.authType` selects one of three OAuth2 flows:
+
+- **`client_credentials`** is the server-to-server flow. It takes `clientId` and `clientSecret` and uses no refresh token, so mandatory refresh-token rotation does not apply. Enable Client Credentials Flow on the Connected App and set a run-as user with Read on the object, API Enabled, and CDC access.
+- **`refresh_token`** takes `clientId`, `clientSecret`, and `refreshToken`. Mandatory Refresh Token Rotation is supported in one process: the REST client and the change listener each cache the rotated token in memory and refresh with the latest. Run a single replica; more than one replica needs a shared token store. The configured `refreshToken` is a seed reused on restart, so under strict rotation prefer `client_credentials`, or run poll-only or listen-only per refresh token.
+- **`bearer`** takes a pre-obtained `token`. The token is static and is not refreshed, so it stops working when it expires. It is useful for short-lived tests.
+
+```json
+"auth": { "authType": "refresh_token", "clientId": "…", "clientSecret": "…", "refreshToken": "…" }
+"auth": { "authType": "bearer", "token": "…" }
+```
 
 ## File uploads
 

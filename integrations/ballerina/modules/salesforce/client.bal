@@ -10,19 +10,14 @@ import ballerinax/salesforce;
 
 import context_engine_connectors.core;
 
-// Build an authenticated Salesforce REST client using the OAuth2 client-credentials flow.
-isolated function newClient(string baseUrl, string apiVersion, string clientId, string clientSecret)
+// Build an authenticated Salesforce REST client for any of the supported auth flows.
+isolated function newClient(string baseUrl, string apiVersion, SalesforceAuth auth)
         returns salesforce:Client|error {
     return new ({
         baseUrl,
-        auth: {tokenUrl: tokenEndpoint(baseUrl), clientId, clientSecret},
+        auth: clientAuthConfig(auth, baseUrl),
         apiVersion
     });
-}
-
-// The client-credentials token endpoint is the instance's My Domain URL.
-isolated function tokenEndpoint(string baseUrl) returns string {
-    return baseUrl + "/services/oauth2/token";
 }
 
 // Query one record by Id and map it to a SourceRecord, or () if it no longer exists.

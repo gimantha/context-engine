@@ -32,7 +32,7 @@ configurable string engineToken = ?;
 configurable string configEnvVar = "CONNECTOR_CONFIGS";
 
 # Whether to serve the file-upload endpoint (`POST /files`). Off unless configured.
-configurable boolean fileUploadEnabled = false;
+configurable boolean fileUploadEnabled = true;
 
 # Address the upload endpoint binds. Loopback by default; any other address requires
 # `fileUploadApiKey`.
