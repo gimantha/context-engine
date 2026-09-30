@@ -1,10 +1,11 @@
-// Salesforce Change Data Capture listener: creates, updates, undeletes, and deletes.
+// Salesforce Change Data Capture listener: updates, undeletes, and deletes.
 //
-// For every change except a delete, the listener re-fetches the full record by Id and
-// delivers that. The result is identical to a backfill of the same record, so when the
-// poll and the listener both deliver a record, the second delivery is a clean replay.
-// Handling creates here as well as in the poll covers records that commit after the
-// poll has already moved past their CreatedDate. A delete delivers the removal by
+// For an update or undelete the listener re-fetches the full record by Id and delivers
+// that. The result is identical to a backfill of the same record, so when the poll and
+// the listener both deliver a record, the second delivery is a clean replay. An update
+// that changed none of the connector's projected fields is dropped: it would only
+// re-deliver identical content under a new version. Creates are left to the poll
+// backfill (it pages the object by CreatedDate). A delete delivers the removal by
 // identity.
 //
 // One change event can cover many records: a transaction that updates or deletes 50
@@ -17,6 +18,7 @@
 // been dispatched, whether or not handling succeeded, so the handlers retry transient
 // engine failures themselves before giving up on a record.
 
+import ballerina/lang.regexp;
 import ballerina/lang.runtime;
 import ballerina/log;
 
@@ -60,11 +62,7 @@ public class SalesforceCdcConnector {
     # + return - an error if the listener fails to attach or start
     public function listen(core:Sink sink, core:CheckpointStore checkpoints) returns error? {
         salesforce:RestBasedListenerConfig listenerConfig = {
-            auth: {
-                tokenUrl: tokenEndpoint(self.settings.baseUrl),
-                clientId: self.settings.clientId,
-                clientSecret: self.settings.clientSecret
-            },
+            auth: listenerAuthConfig(self.settings.auth, self.settings.baseUrl),
             baseUrl: self.settings.baseUrl,
             // Used only until a replay position has been stored for the channel.
             replayFrom: self.settings.replayFrom,
@@ -101,19 +99,28 @@ service class ChangeEventIngestService {
         self.channel = channel;
     }
 
-    # Created records: re-fetch each and deliver it as an upsert.
+    # Created records: ignored. The poll backfill owns creates, paging the object by
+    # (CreatedDate, Id), so delivering them here as well would be redundant.
     #
     # + payload - the change event
-    # + return - an error if any record could not be delivered
+    # + return - always `()`
     remote function onCreate(salesforce:EventData payload) returns error? {
-        return self.refetchAndIngest(payload);
     }
 
-    # Updated records: re-fetch each and deliver it as an upsert.
+    # Updated records: re-fetch each and deliver it as an upsert, unless the update
+    # changed none of the connector's projected fields.
+    #
+    # An update to an unobserved field still bumps SystemModstamp, so re-fetching it would
+    # deliver identical projected content under a new version. Those events are dropped.
     #
     # + payload - the change event
     # + return - an error if any record could not be delivered
     remote function onUpdate(salesforce:EventData payload) returns error? {
+        if !self.touchesObservedField(payload) {
+            log:printInfo("update changed no observed field; skipping", channel = self.channel,
+                    changedFields = changedFields(payload));
+            return;
+        }
         return self.refetchAndIngest(payload);
     }
 
@@ -159,6 +166,21 @@ service class ChangeEventIngestService {
     # + return - always `()`
     remote function onError(error err) returns error? {
         log:printError("salesforce cdc listener error", 'error = err, channel = self.channel);
+    }
+
+    // Whether the event changed any of the connector's projected fields. When the header
+    // lists no changed fields, deliver rather than risk dropping a real change.
+    private function touchesObservedField(salesforce:EventData payload) returns boolean {
+        string[] changed = changedFields(payload);
+        if changed.length() == 0 {
+            return true;
+        }
+        foreach string 'field in self.fields {
+            if changed.indexOf('field) !is () {
+                return true;
+            }
+        }
+        return false;
     }
 
     // Re-fetch every record the event names and deliver each one.
@@ -240,6 +262,53 @@ isolated function changedRecordIds(salesforce:EventData payload) returns string[
         }
     }
     return ids;
+}
+
+// The API names of the fields a change event altered, from its change header. Empty when
+// the header carries none. The library delivers `ChangeEventHeader` either as a JSON
+// object or as its Ballerina record toString (e.g. "{... changedFields=[Site, Name] ...}"),
+// so both forms are handled.
+isolated function changedFields(salesforce:EventData payload) returns string[] {
+    json header = payload.changedData["ChangeEventHeader"];
+    if header is map<json> {
+        json listed = header["changedFields"];
+        string[] names = [];
+        if listed is json[] {
+            foreach json name in listed {
+                if name is string {
+                    names.push(name);
+                }
+            }
+        }
+        return names;
+    }
+    if header is string {
+        return parseChangedFieldNames(header);
+    }
+    return [];
+}
+
+// Extract the names from the `changedFields=[A, B]` segment of the header's toString
+// form. Field API names never contain "," or "]", so a bracket scan is safe.
+isolated function parseChangedFieldNames(string header) returns string[] {
+    string marker = "changedFields=[";
+    int? at = header.indexOf(marker);
+    if at is () {
+        return [];
+    }
+    int listStart = at + marker.length();
+    int? end = header.indexOf("]", listStart);
+    if end is () {
+        return [];
+    }
+    string[] names = [];
+    foreach string part in regexp:split(re `,`, header.substring(listStart, end)) {
+        string name = part.trim();
+        if name != "" {
+            names.push(name);
+        }
+    }
+    return names;
 }
 
 // The change-event header as a plain JSON map. It is serialized rather than read field
