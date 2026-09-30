@@ -15,6 +15,7 @@ import ballerina/log;
 
 import context_engine_connectors.core;
 import context_engine_connectors.file_source;
+import context_engine_connectors.google_drive;
 import context_engine_connectors.manager;
 import context_engine_connectors.salesforce;
 
@@ -68,6 +69,7 @@ public function main() returns error? {
     manager:ConnectorManager connectorManager = new (engineClient);
     // Register every connector type this host enables.
     connectorManager.register(salesforce:salesforceType());
+    connectorManager.register(google_drive:googleDriveType());
 
     manager:ConfigProvider provider = new manager:EnvConfigProvider(configEnvVar);
     manager:ConnectorInstanceConfig[] configs = check provider.provide();

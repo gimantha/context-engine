@@ -4,6 +4,14 @@ Source connectors that deliver records into the Context Engine through its one-c
 
 This is a single Ballerina package, `wso2/context_engine_connectors`. The root module is the runtime host, and the framework and each connector are submodules under `modules/`. One `bal build` compiles everything into one executable. See [ADR 0012](../../docs/decisions/0012-connector-delivery-model.md) for the delivery model and [ADR 0013](../../docs/decisions/0013-connector-manager.md) for the connector interface, manager, and scheduling.
 
+## Connectors
+
+Each connector documents its own sync model, auth, settings, and config example:
+
+- [Salesforce](modules/salesforce/README.md) — `salesforce`: a SOQL poll (backfill + creates) plus a CDC listener (updates, undeletes, deletes).
+- [Google Drive](modules/google_drive/README.md) — `google_drive`: a poll-only connector that backfills a folder subtree, then follows the Drive Changes API.
+- [File uploads](modules/file_source/README.md) — a host built-in that serves `POST /files` into one source (configured via `Config.toml`, not `CONNECTOR_CONFIGS`).
+
 ## Manager, types, and instances
 
 A single runtime host runs any number of configured connections. It builds one engine client, registers the connector types it enables, loads the instance configurations from a `ConfigProvider`, and hands them to the `ConnectorManager`:
@@ -11,6 +19,7 @@ A single runtime host runs any number of configured connections. It builds one e
 ```ballerina
 manager:ConnectorManager connectorManager = new (engineClient);
 connectorManager.register(salesforce:salesforceType());
+connectorManager.register(google_drive:googleDriveType());
 
 manager:ConfigProvider provider = new manager:EnvConfigProvider();
 check connectorManager.'start(check provider.provide());
@@ -18,7 +27,7 @@ check connectorManager.'start(check provider.provide());
 
 A connector type provides a poll factory, a listen factory, or both, and the manager runs whichever are present:
 
-- A **poll** factory builds a `PollConnector { fetch(cursor) }`. The manager schedules `fetch` as a recurring `ballerina/task` job and delivers each record in order. The saved cursor only moves past records the engine accepted, or refused for a reason in the record itself; any other failure stops the batch and the next tick resends from there.
+- A **poll** factory builds a `PollConnector { fetch(cursor) }`. The manager schedules `fetch` as a recurring `ballerina/task` job and delivers each record in order. The saved cursor only moves past records the engine accepted, or refused for a reason in the record itself; any other failure stops the batch and the next tick resends from there. A record's `operation` (`UPSERT` or `DELETE`) selects delivery vs removal, so a poll can express deletes in the same ordered batch.
 - A **listen** factory builds a `ListenConnector { listen(sink, checkpoints) }`. The manager calls `listen` once; the connector attaches its listeners and returns while the host stays alive.
 
 Every instance gets a checkpoint store. By default it keeps the instance's positions, the poll cursor and any change-event replay ids, in the engine's checkpoint for the instance's source, so a restarted host resumes where it stopped. Because the engine keeps one checkpoint per source, each instance needs its own source; the manager refuses duplicates.
@@ -30,62 +39,28 @@ Every instance gets a checkpoint store. By default it keeps the instance's posit
 ```json
 [
   {
-    "instanceId": "sf-account",
-    "connectorType": "salesforce",
+    "instanceId": "<unique id>",
+    "connectorType": "<registry type>",
     "destination": {
       "spaceId": "<space id>",
       "sourceId": "<source id>",
-      "audience": ["source-group:sales"],
+      "audience": ["<source audience label>"],
       "sourceAclVersion": "1"
     },
-    "settings": {
-      "auth": { "authType": "client_credentials", "clientId": "…", "clientSecret": "…" },
-      "baseUrl": "https://<instance>.my.salesforce.com",
-      "sobject": "Account", "fields": ["Name", "Description"]
-    }
+    "pollIntervalSeconds": 30,
+    "settings": { }
   }
 ]
 ```
 
-`settings` is the type-specific bag each connector factory decodes into its own record.
+`settings` is the type-specific bag each connector factory decodes into its own record — see the connector's README for its shape and a full example.
 
 ## Layout
 
 - `Ballerina.toml`, `main.bal`: the root module, the host that registers types, loads configurations, starts the manager, optionally serves uploads, and keeps the process alive.
-- `modules/core/`: the connector SDK. `EngineClient` is the only code that knows the engine's routes; `RecordSink` builds and delivers events. It also holds `SourceRecord`, `Destination`, the `PollConnector` and `ListenConnector` shapes, `CheckpointStore`, and the registration types. Connectors depend on this alone.
+- `modules/core/`: the connector SDK. `EngineClient` is the only code that knows the engine's routes; `RecordSink` builds and delivers events. It also holds `SourceRecord`, `Destination`, the `PollConnector` and `ListenConnector` shapes, `CheckpointStore`, shared utilities, and the registration types. Connectors depend on this alone.
 - `modules/manager/`: the runtime. It holds the `ConnectorManager`, the `task`-based `PollJob`, the checkpoint stores, and `EnvConfigProvider`.
-- `modules/salesforce/`: the Salesforce connector, one type with both factories. The poll is the backfill and owns creates; the change listener handles updates, undeletes, and deletes.
-- `modules/file_source/`: the file-upload endpoint, a host built-in.
-
-## Salesforce
-
-One `salesforce` configuration drives the full sync:
-
-- **The poll backfills** by paging through the object by `(CreatedDate, Id)`, and owns creates.
-- **The change listener delivers updates, undeletes, and deletes.** For an update or undelete it re-fetches the full record, so the content is identical to a backfill and a record delivered by both paths is a replay. An update that changed none of the projected `fields` is dropped, since it would only re-deliver identical content under a new version. Creates are left to the poll. It reads every record id in an event, not just the first.
-- **Versions are the record's `SystemModstamp`** in epoch milliseconds, and deletes use their commit time. Register the source with numeric version ordering, the default.
-- **Replay positions are stored durably**, so after a restart the listener resumes where it stopped. `replayFrom` applies only to the very first run.
-
-The token endpoint is derived from `baseUrl`, the My Domain URL. Enable Change Data Capture for the object in Setup; the channel is derived from `sobject`, for example `Account` becomes `/data/AccountChangeEvent`. `settings.auth` selects the OAuth2 flow. The poll client and the change listener use the same settings.
-
-### Auth flows
-
-`settings.auth.authType` selects one of three OAuth2 flows:
-
-- **`client_credentials`** is the server-to-server flow. It takes `clientId` and `clientSecret` and uses no refresh token, so mandatory refresh-token rotation does not apply. Enable Client Credentials Flow on the Connected App and set a run-as user with Read on the object, API Enabled, and CDC access.
-- **`refresh_token`** takes `clientId`, `clientSecret`, and `refreshToken`. Mandatory Refresh Token Rotation is supported in one process: the REST client and the change listener each cache the rotated token in memory and refresh with the latest. Run a single replica; more than one replica needs a shared token store. The configured `refreshToken` is a seed reused on restart, so under strict rotation prefer `client_credentials`, or run poll-only or listen-only per refresh token.
-- **`bearer`** takes a pre-obtained `token`. The token is static and is not refreshed, so it stops working when it expires. It is useful for short-lived tests.
-
-```json
-"auth": { "authType": "refresh_token", "clientId": "…", "clientSecret": "…", "refreshToken": "…" }
-"auth": { "authType": "bearer", "token": "…" }
-```
-
-## File uploads
-
-The host can serve `POST /files` and deliver each uploaded file into one configured space and source. Each file's name is its record id; its version is the time the upload was received. It is off unless `fileUploadEnabled` is set, listens on `127.0.0.1` by default, and refuses to listen on any other address without `fileUploadApiKey`. Callers then send `Authorization: Bearer <key>`.
-
-Files pass through unmodified, so each part needs a content type the engine accepts: plain text, Markdown, HTML, JSON, or PDF by default. Other types are refused with 415.
+- `modules/salesforce/`, `modules/google_drive/`, `modules/file_source/`: the connectors, each with its own README.
 
 ## Build and run
 
@@ -103,7 +78,7 @@ Files pass through unmodified, so each part needs a content type the engine acce
    curl -H "Authorization: Bearer <admin token>" -H "Content-Type: application/json" \
      -d '{"name": "Incident response"}' http://127.0.0.1:8000/v1/spaces
    curl -H "Authorization: Bearer <admin token>" -H "Content-Type: application/json" \
-     -d '{"name": "Uploads", "type": "file", "audienceMapping": {"src:uploads": "research"}}' \
+     -d '{"name": "Drive sync", "type": "google_drive", "audienceMapping": {"src:drive": "research"}}' \
      http://127.0.0.1:8000/v1/spaces/<space id>/sources
    curl -X PUT -H "Authorization: Bearer <admin token>" -H "Content-Type: application/json" \
      -d '{"principalId": "<host principal id>", "actions": ["ingest.write"]}' \
@@ -112,29 +87,22 @@ Files pass through unmodified, so each part needs a content type the engine acce
 
    The host's principal id is the `id` that `GET /v1/auth/me` returns for its token.
 
-4. **Configure and run the host.** Put the settings in a `Config.toml`, which Git ignores:
+4. **Configure and run the host.** Put the engine settings in a `Config.toml`, which Git ignores:
 
    ```toml
    engineBaseUrl = "http://127.0.0.1:8000"
    engineToken = "<host token>"
-   fileUploadEnabled = true
-   fileUploadSpaceId = "<space id>"
-   fileUploadSourceId = "<source id>"
-   fileUploadAudience = ["src:uploads"]
+   fileUploadEnabled = false
    ```
 
-   Then start it, with managed connectors, if any, in `CONNECTOR_CONFIGS`:
+   Then start it, with managed connectors, if any, in `CONNECTOR_CONFIGS` (see each connector's README for its `settings`):
 
    ```bash
+   export CONNECTOR_CONFIGS="$(cat connector-configs.json)"
    bal run
    ```
 
-5. **Upload a file:**
-
-   ```bash
-   echo "Confirm the rollback checkpoint." > note.txt
-   curl -F "file=@note.txt;type=text/plain" http://127.0.0.1:9090/files
-   ```
+   To serve file uploads too, see the [file uploads README](modules/file_source/README.md).
 
 ## Tests
 
@@ -142,8 +110,8 @@ Files pass through unmodified, so each part needs a content type the engine acce
 bal test
 ```
 
-The tests cover the request the client puts on the wire, cursor advance and checkpoint durability in the manager, the Salesforce connector's versions, paging, cursor validation, and change-event handling, and the upload endpoint's safety rules. They run against in-process stand-ins for the engine, so no engine or Salesforce org is needed.
+The tests cover the request the client puts on the wire, cursor advance (including deletes routed to removal) and checkpoint durability in the manager, each connector's versioning and change handling, and the upload endpoint's safety rules. They run against in-process stand-ins for the engine, so no engine, Salesforce org, or Drive account is needed.
 
 ## Adding a connector
 
-Add a submodule under `modules/<name>/` that imports `context_engine_connectors.core`, implement `PollConnector`, `ListenConnector`, or both, and expose a `ConnectorType` with a name and its factories; `salesforceType` is the example. Import the submodule in the host's `main.bal`, register it, and reference it from configuration by its type name. Give every record a numeric, growing `sourceVersion` and a `sourceObservedAt` taken from the source, and give poll records a `pollCursor`.
+Add a submodule under `modules/<name>/` that imports `context_engine_connectors.core`, implement `PollConnector`, `ListenConnector`, or both, and expose a `ConnectorType` with a name and its factories; `salesforceType` is the example. Import the submodule in the host's `main.bal`, register it, and reference it from configuration by its type name. Give every record a numeric, growing `sourceVersion` and a `sourceObservedAt` taken from the source, and give poll records a `pollCursor`. Add a `README.md` in the module documenting its sync model, auth, settings, and a config example.

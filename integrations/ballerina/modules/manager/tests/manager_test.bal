@@ -12,6 +12,7 @@ client class FakeSink {
 
     private final map<error> failures;
     string[] delivered = [];
+    string[] removed = [];
 
     function init(map<error> failures = {}) {
         self.failures = failures;
@@ -28,7 +29,12 @@ client class FakeSink {
 
     remote function remove(string recordId, string sourceVersion, string sourceObservedAt)
             returns core:JobAccepted|error {
-        return {jobId: "job_delete", statusUrl: "/v1/jobs/job_delete"};
+        error? failure = self.failures[recordId];
+        if failure is error {
+            return failure;
+        }
+        self.removed.push(recordId);
+        return {jobId: "job_delete_" + recordId, statusUrl: "/v1/jobs/job_delete_" + recordId};
     }
 }
 
@@ -55,6 +61,23 @@ function runOnce(map<error> failures) returns [string?, string[]]|error {
     PollJob job = new (new FixedBatch(), sink, "instance-1", checkpoints, "");
     job.execute();
     return [check checkpoints.load(POLL_POSITION), sink.delivered];
+}
+
+// A poll connector whose batch interleaves an upsert, a delete, and another upsert.
+class MixedBatch {
+    *core:PollConnector;
+
+    public function fetch(string cursor) returns core:FetchResult|error {
+        core:SourceRecord[] records = [
+            {recordId: "a", content: "a", sourceVersion: "1", sourceObservedAt: "2026-09-28T10:00:00Z",
+                pollCursor: "after-a"},
+            {recordId: "b", operation: core:DELETE, sourceVersion: "2",
+                sourceObservedAt: "2026-09-28T10:00:01Z", pollCursor: "after-b"},
+            {recordId: "c", content: "c", sourceVersion: "1", sourceObservedAt: "2026-09-28T10:00:02Z",
+                pollCursor: "after-c"}
+        ];
+        return {records, cursor: "after-c"};
+    }
 }
 
 function rejected() returns error {
@@ -90,6 +113,29 @@ function aRejectedRecordIsSkipped() returns error? {
     [string?, string[]] [saved, delivered] = check runOnce({"b": rejected()});
     test:assertEquals(saved, "after-c", "resending a rejected record cannot help");
     test:assertEquals(delivered, ["a", "c"]);
+}
+
+@test:Config {}
+function aDeleteRecordIsRoutedToTheSinkRemoval() returns error? {
+    InMemoryCheckpointStore checkpoints = new;
+    FakeSink sink = new ();
+    PollJob job = new (new MixedBatch(), sink, "instance-mixed", checkpoints, "");
+    job.execute();
+    test:assertEquals(sink.delivered, ["a", "c"], "upserts go to ingest");
+    test:assertEquals(sink.removed, ["b"], "the delete goes to remove, in feed order");
+    test:assertEquals(check checkpoints.load(POLL_POSITION), "after-c");
+}
+
+@test:Config {}
+function aFailedDeleteStopsTheBatchLikeAnUpsert() returns error? {
+    InMemoryCheckpointStore checkpoints = new;
+    FakeSink sink = new ({"b": unavailable()});
+    PollJob job = new (new MixedBatch(), sink, "instance-mixed", checkpoints, "");
+    job.execute();
+    test:assertEquals(sink.delivered, ["a"], "delivery stops at the failed delete");
+    test:assertEquals(sink.removed, []);
+    test:assertEquals(check checkpoints.load(POLL_POSITION), "after-a",
+            "the next poll resends from just before the failed delete");
 }
 
 function config(string instanceId, string sourceId) returns ConnectorInstanceConfig {

@@ -1,5 +1,14 @@
 // Provider-neutral data a connector produces and is configured with.
 
+# The change a record expresses. Its values are the wire operations, so the sink and the poll
+# job compare against them directly.
+public enum Operation {
+    # Create or update the record with its content.
+    UPSERT = "upsert",
+    # Remove the record; it carries no content.
+    DELETE = "delete"
+}
+
 # A normalized source record produced by a connector.
 #
 # The connector supplies the record's content, version, and observed time; the sink
@@ -16,6 +25,11 @@ public type SourceRecord record {|
     # Raw binary content, for non-text sources such as file uploads. Provide this or
     # `content`. Sent as-is under `contentType`.
     byte[] contentBytes?;
+    # Operation for this change: `UPSERT` (default) or `DELETE`. A delete carries no content
+    # and uses only `recordId`, `sourceVersion`, and `sourceObservedAt`; the poll job routes
+    # it to `Sink.remove` instead of `Sink.ingest`. This lets a poll connector express
+    # removals in the same ordered batch as upserts (a change feed interleaves both).
+    Operation operation = UPSERT;
     # Version of this record state, compared by the engine under the source's version
     # ordering. Connectors use epoch milliseconds so versions are numeric and only grow;
     # register such sources with numeric ordering.

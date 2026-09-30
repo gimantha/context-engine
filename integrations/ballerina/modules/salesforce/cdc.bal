@@ -147,7 +147,7 @@ service class ChangeEventIngestService {
             return error("delete event without a commit time");
         }
         string version = committed.toString();
-        string observedAt = millisToRfc3339(committed);
+        string observedAt = core:millisToRfc3339(committed);
         error? failure = ();
         foreach string recordId in changedRecordIds(payload) {
             core:JobAccepted|error removed = self.removeWithRetries(recordId, version, observedAt);

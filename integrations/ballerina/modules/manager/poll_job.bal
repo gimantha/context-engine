@@ -58,7 +58,16 @@ class PollJob {
     function deliver(core:FetchResult result) returns string {
         string reached = self.cursor;
         foreach core:SourceRecord sourceRecord in result.records {
-            core:JobAccepted|error accepted = self.sink->ingest(sourceRecord);
+            // A delete carries no content, so it is routed to the sink's removal path; every
+            // other record is an upsert. Both share this batch so a change feed's removals
+            // and upserts are applied in feed order.
+            core:JobAccepted|error accepted;
+            if sourceRecord.operation == core:DELETE {
+                accepted = self.sink->remove(sourceRecord.recordId, sourceRecord.sourceVersion,
+                        sourceRecord.sourceObservedAt);
+            } else {
+                accepted = self.sink->ingest(sourceRecord);
+            }
             if accepted is error {
                 if !core:isRecordRejection(accepted) {
                     log:printError("delivery failed; the next poll resends from here",
