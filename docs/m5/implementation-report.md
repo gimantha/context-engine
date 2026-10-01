@@ -65,6 +65,27 @@ context-engine-api, -worker, and -serve --check: passed
 provider boundary check: passed
 ```
 
+## Slice 2 delivered
+
+- **Stored queries.** `POST /v1/queries` stores each query with its asker, trace id, question, policy version, partitions, outcome, the counts of retrieved and suppressed passages, and the model that served it: the space's embedding model or the environment's (the slice 1 item "every stored query records the provider and model"). A caller outside every audience is stored too, with nothing retrieved.
+- **Reads.** `GET /v1/queries/{queryId}` and `/queries/{queryId}/evidence` reopen a query for its asker only. `GET /v1/evidence/{evidenceId}` opens one item for anyone holding `context.read` or `evidence.read` who is in an audience of the record's current partition, while the record is still at that version. Every refusal is the same 404, and every read re-runs the visibility barrier.
+- **Typed locator.** Evidence gains a `locator`: chunk index, character range, sentence range, and by type source lines (text, Markdown), nearest heading (Markdown, HTML), or JSON path. The engine rebuilds the indexed text from the current version's staged bytes and places passages by exact match (`provenance/`). A passage repeated in its record is placed only when chunk order settles it. The `location` string stays `chunk:<n>`, which the control-plane UI parses, so the UI keeps working unchanged and can adopt `locator` when ready.
+- **Erasure.** Evidence is deleted in the transaction that releases its version's staged bytes, and with the space on space deletion.
+- **Extraction** records source line numbers, Markdown and HTML headings, and JSON value spans. Its text output is unchanged for every parser version, which a 65,000-case comparison against the previous extractor confirmed, so already indexed content needs no reindexing.
+- **Contract 0.11.0** documents the three read routes and adds `EvidenceLocator`. Migration `0009_stored_queries.sql` adds `queries`, `evidence`, and `query_evidence`.
+
+Two choices made within the plan: the typed structure is a separate `locator` field rather than a replacement for `location`, to keep the UI working; and it carries lines, heading, and path as separate optional parts instead of one anchor whose kind depends on the type, because a Markdown passage has both a line range and a heading.
+
+Validation performed on 2026-10-01 from `engine/`:
+
+```text
+ruff format --check and ruff check: passed
+pytest -m "not live_provider": 174 passed, 2 live tests deselected
+provider boundary check: passed
+```
+
+Live verification on 2026-10-01: both live tests passed in 8 min 39 s. The end-to-end test now also delivers a 43,583-character record that the provider split into several chunks; every returned passage matched the record's text at the engine's offsets, chunk order matched text order, source lines were correct, and the stored query reopened with the same evidence. This confirms against the pinned provider that its chunks are exact slices of the text the engine sends.
+
 ## Decisions
 
 - **Answers use the space's models** (user, 2026-09-29), and so do extraction and embeddings.

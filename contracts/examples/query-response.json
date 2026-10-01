@@ -9,7 +9,14 @@
       "sourceId": "source-runbooks",
       "sourceVersion": "84",
       "passage": "Confirm the rollback checkpoint before remediation.",
-      "location": "page:4",
+      "location": "chunk:3",
+      "locator": {
+        "chunkIndex": 3,
+        "characters": { "start": 412, "end": 463 },
+        "sentences": { "first": 7, "last": 7 },
+        "lines": { "first": 18, "last": 18 },
+        "heading": "Rollback"
+      },
       "sourceUrl": "https://sources.invalid/runbooks/84"
     }
   ],

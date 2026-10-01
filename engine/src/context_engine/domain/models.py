@@ -399,6 +399,27 @@ class SourceProgress:
 
 
 @dataclass(frozen=True, slots=True)
+class EvidenceLocator:
+    """Where a passage sits in the record version it came from (ADR 0008, M5 slice 2).
+
+    `start` and `end` count Unicode code points in the version's extracted text, end
+    exclusive, so the text from `start` to `end` is the passage. `sentences` and `lines` are
+    1-based and inclusive: sentences as the engine segments the extracted text, lines of the
+    source file. `heading` is the nearest heading above the passage and `path` the JSON path
+    of the smallest value holding it. Each field is set only when the engine could establish
+    it; a passage the engine cannot place keeps its chunk index alone.
+    """
+
+    chunk_index: int | None = None
+    start: int | None = None
+    end: int | None = None
+    sentences: tuple[int, int] | None = None
+    lines: tuple[int, int] | None = None
+    heading: str | None = None
+    path: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class PublicEvidence:
     """Authorized, source-linked passage that has passed the read-time visibility barrier."""
 
@@ -407,8 +428,20 @@ class PublicEvidence:
     source_id: str
     source_version: str
     passage: str
-    location: str | None
+    locator: EvidenceLocator
     source_url: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class StoredEvidence:
+    """A passage kept with the record version it came from, and the space that holds it.
+
+    The row lives exactly as long as that version's content: when the worker releases the
+    version's staged bytes, the evidence goes in the same transaction (M5 decision).
+    """
+
+    space_id: str
+    evidence: PublicEvidence
 
 
 @dataclass(frozen=True, slots=True)
@@ -419,6 +452,40 @@ class ContextQueryResult:
     evidence: tuple[PublicEvidence, ...]
     insufficient_evidence: bool
     trace_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class ModelUse:
+    """Which model served a call, without its key: from the space, or the engine's default."""
+
+    provider: str
+    model: str
+    configured_by: str
+
+
+@dataclass(frozen=True, slots=True)
+class StoredQuery:
+    """One query as the engine recorded it, for its asker to reopen and for later traces.
+
+    `partitions` are private and never leave the engine. `retrieved` and `suppressed` count
+    the backend's passages and those the visibility barrier withheld; they can only be known
+    when the query runs, so they are kept for the trace that slice 4 serves.
+    """
+
+    id: str
+    space_id: str
+    principal_id: str
+    trace_id: str
+    mode: str
+    question: str
+    limit: int
+    policy_version: str
+    partitions: tuple[str, ...]
+    outcome: str
+    retrieved: int
+    suppressed: int
+    models: tuple[tuple[str, ModelUse], ...]
+    created_at: datetime
 
 
 @dataclass(frozen=True, slots=True)

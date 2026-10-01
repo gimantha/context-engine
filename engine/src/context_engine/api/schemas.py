@@ -13,6 +13,7 @@ from context_engine.domain import (
     ConfiguredModel,
     ContextQueryResult,
     ContextSpace,
+    EvidenceLocator,
     Grant,
     IndexingSnapshot,
     IngestionCommand,
@@ -717,8 +718,57 @@ class ContextQueryRequest(_ApiModel):
     limit: Annotated[int, Field(ge=1, le=100)] = 10
 
 
+class RangeResponse(_ApiModel):
+    """An inclusive, 1-based range of sentences or lines."""
+
+    first: int
+    last: int
+
+
+class CharacterRangeResponse(_ApiModel):
+    """Code-point offsets into the version's extracted text, end exclusive."""
+
+    start: int
+    end: int
+
+
+class EvidenceLocatorResponse(_ApiModel):
+    """Where a passage sits in its record version; each part only when it is certain."""
+
+    chunk_index: int | None = Field(default=None, alias="chunkIndex")
+    characters: CharacterRangeResponse | None = None
+    sentences: RangeResponse | None = None
+    lines: RangeResponse | None = None
+    heading: str | None = None
+    path: str | None = None
+
+    @classmethod
+    def from_domain(cls, value: EvidenceLocator) -> EvidenceLocatorResponse:
+        """Translate a locator, leaving out every part the engine could not establish."""
+
+        characters = (
+            CharacterRangeResponse(start=value.start, end=value.end)
+            if value.start is not None and value.end is not None
+            else None
+        )
+        return cls(
+            chunkIndex=value.chunk_index,
+            characters=characters,
+            sentences=RangeResponse(first=value.sentences[0], last=value.sentences[1])
+            if value.sentences
+            else None,
+            lines=RangeResponse(first=value.lines[0], last=value.lines[1]) if value.lines else None,
+            heading=value.heading,
+            path=value.path,
+        )
+
+
 class EvidenceResponse(_ApiModel):
-    """One authorized passage with engine lineage and no backend identifiers."""
+    """One authorized passage with engine lineage and no backend identifiers.
+
+    `location` keeps the compact `chunk:<n>` form earlier clients read; `locator` carries the
+    typed position (M5 slice 2).
+    """
 
     id: str
     record_id: str = Field(alias="recordId")
@@ -726,19 +776,22 @@ class EvidenceResponse(_ApiModel):
     source_version: str = Field(alias="sourceVersion")
     passage: str
     location: str | None = None
+    locator: EvidenceLocatorResponse
     source_url: str | None = Field(default=None, alias="sourceUrl")
 
     @classmethod
     def from_domain(cls, value: PublicEvidence) -> EvidenceResponse:
         """Translate public evidence into its REST representation."""
 
+        chunk = value.locator.chunk_index
         return cls(
             id=value.id,
             recordId=value.record_id,
             sourceId=value.source_id,
             sourceVersion=value.source_version,
             passage=value.passage,
-            location=value.location,
+            location=f"chunk:{chunk}" if chunk is not None else None,
+            locator=EvidenceLocatorResponse.from_domain(value.locator),
             sourceUrl=value.source_url,
         )
 

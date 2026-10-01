@@ -7,7 +7,9 @@ answer with not-found so denials reveal nothing about what exists.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from uuid import uuid4
 
@@ -17,6 +19,7 @@ from context_engine.domain import (
     ConfiguredModel,
     ContextQueryResult,
     ContextSpace,
+    EvidenceLocator,
     Grant,
     IndexState,
     IngestionCommand,
@@ -24,7 +27,9 @@ from context_engine.domain import (
     JobOperation,
     JobState,
     LocationState,
+    ModelUse,
     PublicEvidence,
+    RecordLocation,
     RecordState,
     RecordStatus,
     Source,
@@ -34,10 +39,12 @@ from context_engine.domain import (
     SpaceConfiguration,
     SpaceState,
     StagedUpload,
+    StoredQuery,
     SyncRun,
     SyncRunState,
     VersionOrdering,
 )
+from context_engine.ingestion.extraction import ExtractionError, extract
 from context_engine.knowledge_backend import (
     AccessPartitionRef,
     BackendError,
@@ -50,9 +57,10 @@ from context_engine.knowledge_backend import (
 )
 from context_engine.observability import MetricsRegistry
 from context_engine.persistence import IdempotencyConflict
+from context_engine.provenance import TextIndex, locate
 from context_engine.security.authorization import Authorizer
 from context_engine.security.identity import AuthenticatedPrincipal
-from context_engine.security.policy import PolicyInput, authorize
+from context_engine.security.policy import PolicyDecision, PolicyInput, authorize
 from context_engine.security.secrets import SecretError, SecretStore
 
 from .errors import (
@@ -67,6 +75,7 @@ from .errors import (
 from .ports import (
     ControlPlaneStore,
     GrantStore,
+    QueryStore,
     ReadAccessResync,
     SourceStore,
     StagedBytes,
@@ -120,6 +129,8 @@ class ContextEngineService:
         knowledge_backend: KnowledgeBackend | None = None,
         read_access: ReadAccessResync | None = None,
         secrets: SecretStore | None = None,
+        queries: QueryStore | None = None,
+        default_models: Mapping[str, ModelUse] | None = None,
     ) -> None:
         """Wire the service to its stores, authorizer, and policies.
 
@@ -129,6 +140,9 @@ class ContextEngineService:
         `read_access` lets a query ask the worker to resynchronize backend read access when the
         backend refuses a partition that engine policy allows. `secrets` stores and reveals the
         keys of a space's models; without one, only key references can be configured.
+        `queries` stores each query with its evidence; without it, queries are not kept and
+        cannot be reopened. `default_models` names the environment's models, recorded on queries
+        of spaces that configure none.
         """
 
         self._store = store
@@ -144,6 +158,8 @@ class ContextEngineService:
         self._read_access = read_access
         self._secrets = secrets or SecretStore(None)
         self._models = SpaceModelResolver(store, self._secrets)
+        self._queries = queries
+        self._default_models = dict(default_models or {})
 
     # Authorization helpers
 
@@ -899,12 +915,14 @@ class ContextEngineService:
         mode: str,
         limit: int,
     ) -> ContextQueryResult:
-        """Return authorized, source-linked passages for a question in one space.
+        """Return authorized, source-linked passages for a question in one space, and store them.
 
-        Engine policy picks the partitions first, the backend is asked as the caller so its own read
-        checks apply as a second layer, and every passage then passes the visibility barrier against
-        the ledger. A caller outside every audience gets insufficient evidence, with no hint of what
-        exists. Nothing is persisted yet; query history and answers arrive with M5.
+        Engine policy picks the partitions first, the backend is asked as the caller so its own
+        read checks apply as a second layer, and every passage then passes the visibility
+        barrier against the ledger. Each surviving passage is placed in the text the engine
+        indexed, and the query is stored with its evidence so the asker can reopen it (M5 slice
+        2). A caller outside every audience gets insufficient evidence with no hint of what
+        exists; that query is stored too, with no partitions and no evidence.
         """
 
         self._accepting_space(principal, space_id)
@@ -916,24 +934,89 @@ class ContextEngineService:
         if self._backend is None:
             raise ServiceUnavailableError("Context queries need the knowledge backend")
         query_id = f"qry_{uuid4().hex}"
-        partitions = self._readable_partitions(principal, space_id)
+        decision = self._read_decision(principal, space_id, Action.CONTEXT_READ)
+        partitions = decision.partitions if decision.allowed else ()
         self._metrics.increment("context_engine_queries_total")
-        if not partitions:
-            # No hint about what exists outside the caller's audiences.
-            return ContextQueryResult(query_id, (), True, principal.trace_id)
-        caller = PrincipalContext(principal.principal_id, principal.trace_id)
-        try:
-            models = await self._models.resolve(space_id)
-        except SecretError as exc:
-            raise ServiceUnavailableError("The space's model key is not available") from exc
-        retrieved = await self._retrieve(QueryRequest(question, limit), caller, partitions, models)
-        evidence = self._visible_evidence(space_id, partitions, retrieved)[:limit]
+        retrieved: tuple[EvidenceItem, ...] = ()
+        models: ModelSelection | None = None
+        if partitions:
+            caller = PrincipalContext(principal.principal_id, principal.trace_id)
+            try:
+                models = await self._models.resolve(space_id)
+            except SecretError as exc:
+                raise ServiceUnavailableError("The space's model key is not available") from exc
+            retrieved = await self._retrieve(
+                QueryRequest(question, limit), caller, partitions, models
+            )
+        passed = self._visible_evidence(space_id, partitions, retrieved)
+        evidence = (await self._placed_evidence(space_id, passed))[:limit]
+        if self._queries is not None:
+            self._queries.record_query(
+                StoredQuery(
+                    id=query_id,
+                    space_id=space_id,
+                    principal_id=principal.principal_id,
+                    trace_id=principal.trace_id,
+                    mode=mode,
+                    question=question,
+                    limit=limit,
+                    policy_version=decision.policy_version,
+                    partitions=tuple(item.value for item in partitions),
+                    outcome="completed" if evidence else "insufficient_evidence",
+                    retrieved=len(retrieved),
+                    suppressed=len(retrieved) - len(passed),
+                    models=self._models_used(models) if partitions else (),
+                    created_at=utc_now(),
+                ),
+                evidence,
+            )
         return ContextQueryResult(query_id, evidence, not evidence, principal.trace_id)
 
-    def _readable_partitions(
-        self, principal: AuthenticatedPrincipal, space_id: str
-    ) -> tuple[AccessPartitionRef, ...]:
-        """Resolve which of the space's partitions the caller may read.
+    def get_query(self, principal: AuthenticatedPrincipal, query_id: str) -> ContextQueryResult:
+        """Reopen a stored query for the principal who asked it, with its evidence re-checked.
+
+        Only the asker can reopen a query; anyone else gets not-found, as for jobs, so a query
+        id reveals nothing. The asker still needs context.read on the space, and every passage
+        passes the visibility barrier again against the asker's current audiences and the
+        record's current version, so revoked, moved, and superseded evidence drops out (threat
+        model T07). Traces and other principals' queries arrive with slice 4.
+        """
+
+        query = self._queries.get_query(query_id) if self._queries is not None else None
+        if query is None or query.principal_id != principal.principal_id:
+            raise NotFoundError("Query not found")
+        self.get_context_space(principal, query.space_id)
+        self._require(principal, Action.CONTEXT_READ, query.space_id)
+        assert self._queries is not None
+        evidence = self._still_visible(
+            principal, query.space_id, self._queries.query_evidence(query.id), Action.CONTEXT_READ
+        )
+        return ContextQueryResult(query.id, evidence, not evidence, query.trace_id)
+
+    def get_evidence(self, principal: AuthenticatedPrincipal, evidence_id: str) -> PublicEvidence:
+        """Open one evidence item for any principal who could retrieve that passage now.
+
+        A citation can be followed by someone other than the asker, so this needs context.read
+        or evidence.read on the space, membership in an audience of the record's current
+        partition, and the record still at the evidence's version. evidence.read lets a
+        principal open cited evidence without asking questions. Every refusal is the same
+        not-found, so an evidence id reveals neither its space nor its record (threat model T07
+        and T17).
+        """
+
+        stored = self._queries.get_evidence(evidence_id) if self._queries is not None else None
+        if stored is None or not self._visible(principal, stored.space_id):
+            raise NotFoundError("Evidence not found")
+        for action in (Action.CONTEXT_READ, Action.EVIDENCE_READ):
+            visible = self._still_visible(principal, stored.space_id, (stored.evidence,), action)
+            if visible:
+                return visible[0]
+        raise NotFoundError("Evidence not found")
+
+    def _read_decision(
+        self, principal: AuthenticatedPrincipal, space_id: str, action: Action
+    ) -> PolicyDecision:
+        """Decide whether the caller may read the space, and which of its partitions.
 
         Only partitions holding indexed records are candidates. Engine policy decides with the any-
         audience rule, where a partition is readable when the caller is in any of its audiences (ADR
@@ -949,10 +1032,10 @@ class ContextEngineService:
         actions = self._authorizer.effective_actions(
             principal.principal_id, principal.groups, space_id
         )
-        decision = authorize(
+        return authorize(
             PolicyInput(
                 principal_id=principal.principal_id,
-                action=Action.CONTEXT_READ,
+                action=action,
                 space_id=space_id,
                 granted_actions=actions or frozenset(),
                 principal_audiences=principal.groups,
@@ -960,7 +1043,6 @@ class ContextEngineService:
                 policy_version=str(self._authorizer.policy_version()),
             )
         )
-        return decision.partitions if decision.allowed else ()
 
     async def _retrieve(
         self,
@@ -1000,49 +1082,92 @@ class ContextEngineService:
                     raise ServiceUnavailableError("Context retrieval failed") from exc
         return tuple(collected)
 
+    def _live_copy(
+        self, space_id: str, source_id: str, record_id: str, allowed: set[str]
+    ) -> tuple[RecordStatus, RecordLocation] | None:
+        """Return a record and its copy when the ledger vouches for them in an allowed partition.
+
+        This is the visibility barrier (ADR 0007, ADR 0008): the ledger, not the backend or a
+        stored row, decides what may be shown. The record must be active and indexed, in a
+        partition the caller may read, and physically present there at its current version, so
+        leftovers, stale versions, and records mid-move stay out.
+        """
+
+        record = self._sources.get_record(space_id, source_id, record_id)
+        if record is None or not record.partition_id:
+            return None
+        location = self._sources.get_location(space_id, source_id, record_id, record.partition_id)
+        if (
+            location is None
+            or record.state is not RecordState.ACTIVE
+            or record.index_state is not IndexState.INDEXED
+            or record.partition_id not in allowed
+            or location.state is not LocationState.INDEXED
+            or location.version != record.current_version
+        ):
+            return None
+        return record, location
+
     def _visible_evidence(
         self,
         space_id: str,
         partitions: tuple[AccessPartitionRef, ...],
         retrieved: tuple[EvidenceItem, ...],
-    ) -> tuple[PublicEvidence, ...]:
-        """Keep only passages of records that are live and indexed where the caller may read.
+    ) -> list[tuple[EvidenceItem, RecordStatus, RecordLocation]]:
+        """Keep the retrieved passages whose records the ledger vouches for, in rank order.
 
-        This is the visibility barrier (ADR 0007, ADR 0008): the ledger, not the backend, decides
-        what may be shown, so leftovers, stale versions, and records mid-move stay out. Evidence ids
-        are derived from the record, version, location, and passage, so the same passage always has
-        the same id.
+        A passage may come from the version currently recorded or from the version whose bytes
+        were last written, which differ when a new version arrived with unchanged content.
         """
 
         allowed = {item.value for item in partitions}
-        visible: dict[str, PublicEvidence] = {}
-        dropped = 0
+        passed: list[tuple[EvidenceItem, RecordStatus, RecordLocation]] = []
         for item in retrieved:
-            record = self._sources.get_record(space_id, item.source_id, item.record_id)
-            location = (
-                self._sources.get_location(
-                    space_id, item.source_id, item.record_id, record.partition_id
-                )
-                if record is not None and record.partition_id
-                else None
-            )
-            if (
-                record is None
-                or location is None
-                or record.state is not RecordState.ACTIVE
-                or record.index_state is not IndexState.INDEXED
-                or record.partition_id not in allowed
-                or location.state is not LocationState.INDEXED
-                or location.version != record.current_version
-                or (
-                    item.source_version
-                    and item.source_version
-                    not in {record.current_version, location.written_version}
-                )
-                or not item.passage.strip()
-            ):
-                dropped += 1
+            live = self._live_copy(space_id, item.source_id, item.record_id, allowed)
+            if live is None or not item.passage.strip():
                 continue
+            record, location = live
+            if item.source_version and item.source_version not in {
+                record.current_version,
+                location.written_version,
+            }:
+                continue
+            passed.append((item, record, location))
+        if dropped := len(retrieved) - len(passed):
+            self._metrics.increment("context_engine_evidence_suppressed_total", dropped)
+        return passed
+
+    async def _placed_evidence(
+        self,
+        space_id: str,
+        passed: list[tuple[EvidenceItem, RecordStatus, RecordLocation]],
+    ) -> tuple[PublicEvidence, ...]:
+        """Place each passage in its record's text and build public evidence, without repeats.
+
+        Passages of one record are placed together, so chunk order can settle a repeated
+        passage, and the record's text is read once per query. Evidence ids are derived from
+        the record version, chunk, and passage, so the same passage always has the same id.
+        """
+
+        groups: dict[tuple[str, str], list[int]] = {}
+        for position, (item, _, _) in enumerate(passed):
+            groups.setdefault((item.source_id, item.record_id), []).append(position)
+        locators: list[EvidenceLocator] = [
+            EvidenceLocator(chunk_index=item.chunk_index) for item, _, _ in passed
+        ]
+        for positions in groups.values():
+            _, record, location = passed[positions[0]]
+            index = await asyncio.to_thread(self._text_index, record, location)
+            if index is None:
+                continue
+            placed = locate(
+                index, [(passed[p][0].passage, passed[p][0].chunk_index) for p in positions]
+            )
+            for position, locator in zip(positions, placed, strict=True):
+                locators[position] = locator
+        visible: dict[str, PublicEvidence] = {}
+        for (item, record, _), locator in zip(passed, locators, strict=True):
+            chunk = "" if item.chunk_index is None else str(item.chunk_index)
             digest = hashlib.sha256(
                 "\0".join(
                     (
@@ -1050,7 +1175,7 @@ class ContextEngineService:
                         item.source_id,
                         item.record_id,
                         record.current_version,
-                        item.location or "",
+                        chunk,
                         item.passage,
                     )
                 ).encode()
@@ -1064,13 +1189,64 @@ class ContextEngineService:
                     source_id=item.source_id,
                     source_version=record.current_version,
                     passage=item.passage,
-                    location=item.location,
+                    locator=locator,
                     source_url=record.source_url,
                 ),
             )
-        if dropped:
-            self._metrics.increment("context_engine_evidence_suppressed_total", dropped)
         return tuple(visible.values())
+
+    def _text_index(self, record: RecordStatus, location: RecordLocation) -> TextIndex | None:
+        """Rebuild the text the engine indexed for the record's current version.
+
+        The current version's staged bytes are kept while the record is live, so the engine
+        holds no second copy of the content. The text is trusted only when it comes from the
+        same extractor version that produced the indexed copy; otherwise its offsets may not
+        match the provider's chunks, and passages keep their chunk index alone.
+        """
+
+        upload = self._sources.get_upload(record.content_ref) if record.content_ref else None
+        if upload is None:
+            return None
+        try:
+            extracted = extract(upload.content_type, self._staging.read(upload.id))
+        except (FileNotFoundError, ExtractionError):
+            return None
+        if location.parser_version and extracted.parser_version != location.parser_version:
+            return None
+        return TextIndex(extracted)
+
+    def _still_visible(
+        self,
+        principal: AuthenticatedPrincipal,
+        space_id: str,
+        stored: Sequence[PublicEvidence],
+        action: Action,
+    ) -> tuple[PublicEvidence, ...]:
+        """Keep stored evidence the principal could retrieve now, at the version it was taken."""
+
+        decision = self._read_decision(principal, space_id, action)
+        if not decision.allowed:
+            return ()
+        allowed = {item.value for item in decision.partitions}
+        visible = []
+        for item in stored:
+            live = self._live_copy(space_id, item.source_id, item.record_id, allowed)
+            if live is not None and live[0].current_version == item.source_version:
+                visible.append(item)
+        return tuple(visible)
+
+    def _models_used(self, models: ModelSelection | None) -> tuple[tuple[str, ModelUse], ...]:
+        """Name the model that served retrieval: the space's, or the engine's default.
+
+        Context mode embeds the question and calls no language model, so only the embedding
+        model is recorded; answer mode adds the language model in slice 3.
+        """
+
+        chosen = models.embedding_model if models is not None else None
+        if chosen is not None:
+            return (("embedding", ModelUse(chosen.provider, chosen.model, "space")),)
+        default = self._default_models.get("embedding")
+        return (("embedding", default),) if default is not None else ()
 
     # Enrichment
 

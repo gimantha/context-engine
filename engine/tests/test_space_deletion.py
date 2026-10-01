@@ -45,6 +45,8 @@ SPACE_TABLES = {
     "source_record_effects": "space_id",
     "access_partitions": "space_id",
     "record_locations": "space_id",
+    "queries": "space_id",
+    "evidence": "space_id",
 }
 SOURCE_TABLES = ("source_checkpoints", "staged_uploads", "sync_runs", "indexing_snapshots")
 PARTITION_TABLES = ("backend_bindings", "backend_record_refs", "backend_read_access")
@@ -163,6 +165,8 @@ class _DeletionStack(_Stack):
                 "SELECT COUNT(*) FROM grants WHERE resource_id IN (?, ?)",
                 (space["id"], source["id"]),
             ).fetchone()[0]
+            # Each test database holds one space, so every link belongs to it.
+            count += connection.execute("SELECT COUNT(*) FROM query_evidence").fetchone()[0]
             return count
         finally:
             connection.close()

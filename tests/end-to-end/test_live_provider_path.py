@@ -327,6 +327,32 @@ async def test_live_provider_path_through_the_api_and_worker(tmp_path, tmp_path_
             )
         ).json()
         moved_status = await engine.status(source, "runbook-b")
+
+        # A record long enough for several chunks, to check against the real chunker that
+        # every passage is an exact slice of the text the engine sent (M5 slice 2).
+        long_text = "\n".join(
+            f"Step {number}: confirm gateway node {number} reports healthy before the next step."
+            for number in range(1, 601)
+        )
+        await engine.deliver(space, source, "runbook-long", "1", content=long_text.encode())
+        await engine.drain()
+        long_status = await engine.status(source, "runbook-long")
+        long_body = (
+            await engine.client.post(
+                "/v1/queries",
+                headers=_auth("alpha"),
+                json={
+                    "spaceId": space["id"],
+                    "question": "confirm gateway node reports healthy",
+                    "mode": "context",
+                    "limit": 10,
+                },
+            )
+        ).json()
+        long_reopened = (
+            await engine.client.get(f"/v1/queries/{long_body['queryId']}", headers=_auth("alpha"))
+        ).json()
+
         failed = (
             await engine.client.get(
                 f"/v1/sources/{source['id']}/jobs",
@@ -361,3 +387,18 @@ async def test_live_provider_path_through_the_api_and_worker(tmp_path, tmp_path_
     assert progress["indexing"]["state"] != "not_collected"
     assert moved_status["indexState"] == "indexed"
     assert failed == []
+    # Passages of a multi-chunk record are exact slices at the offsets the engine reports, in
+    # chunk order, with source lines; the stored query reopens with the same evidence.
+    assert long_status["indexState"] == "indexed"
+    long_evidence = [item for item in long_body["evidence"] if item["recordId"] == "runbook-long"]
+    assert len({item["locator"]["chunkIndex"] for item in long_evidence}) >= 2, long_body
+    for item in long_evidence:
+        characters = item["locator"]["characters"]
+        assert long_text[characters["start"] : characters["end"]] == item["passage"]
+        leading = len(item["passage"]) - len(item["passage"].lstrip())
+        first_line = long_text.count("\n", 0, characters["start"] + leading) + 1
+        assert item["locator"]["lines"]["first"] == first_line
+    by_chunk = sorted(long_evidence, key=lambda item: item["locator"]["chunkIndex"])
+    starts = [item["locator"]["characters"]["start"] for item in by_chunk]
+    assert starts == sorted(starts), "chunk order is text order"
+    assert long_reopened == long_body

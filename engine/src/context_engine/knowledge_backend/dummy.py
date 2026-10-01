@@ -46,13 +46,31 @@ class _StoredRecord:
 
 
 class DummyKnowledgeBackend:
-    """In-memory backend with partition-scoped storage, graph data and cache."""
+    """In-memory backend with partition-scoped storage, graph data and cache.
 
-    def __init__(self) -> None:
+    With `chunk_lines` set, each record is split into chunks of that many lines, each an exact
+    slice of the record's text, as the private provider's chunker keeps them; the default keeps
+    every record as one chunk.
+    """
+
+    def __init__(self, *, chunk_lines: int = 0) -> None:
         self._records: dict[str, dict[str, _StoredRecord]] = {}
         self._references: dict[str, tuple[str, str]] = {}
         self._query_cache: dict[tuple[str, tuple[str, ...], str], QueryResult] = {}
         self._readers: dict[str, set[str]] = {}
+        self._chunk_lines = chunk_lines
+
+    def _chunks(self, content: str) -> list[str]:
+        """Split a record into exact slices of its text, as the provider's chunks are.
+
+        Tests use this to exercise chunk order and repeated passages without the provider.
+        """
+
+        if self._chunk_lines <= 0:
+            return [content]
+        lines = content.split("\n")
+        size = self._chunk_lines
+        return ["\n".join(lines[start : start + size]) for start in range(0, len(lines), size)]
 
     @staticmethod
     def _check_context(
@@ -155,34 +173,27 @@ class DummyKnowledgeBackend:
         matches: list[EvidenceItem] = []
         for partition_value in partition_values:
             for stored in self._records.get(partition_value, {}).values():
-                searchable = _tokens(
-                    " ".join(
-                        (
-                            stored.record.content,
-                            stored.record.title or "",
-                            *stored.record.entities,
-                            *stored.artifacts,
+                extra = (stored.record.title or "", *stored.record.entities, *stored.artifacts)
+                for chunk_index, chunk in enumerate(self._chunks(stored.record.content)):
+                    overlap = query_tokens & _tokens(" ".join((chunk, *extra)))
+                    if not overlap:
+                        continue
+                    digest = hashlib.sha256(
+                        f"{partition_value}\0{stored.record.record_id}\0"
+                        f"{stored.record.version}\0{chunk_index}".encode()
+                    ).hexdigest()[:24]
+                    matches.append(
+                        EvidenceItem(
+                            evidence_id=f"evi_{digest}",
+                            record_id=stored.record.record_id,
+                            source_id=stored.record.source_id,
+                            source_version=stored.record.version,
+                            passage=chunk,
+                            score=len(overlap) / max(len(query_tokens), 1),
+                            chunk_index=chunk_index,
+                            graph_path=stored.record.entities,
                         )
                     )
-                )
-                overlap = query_tokens & searchable
-                if not overlap:
-                    continue
-                digest = hashlib.sha256(
-                    f"{partition_value}\0{stored.record.record_id}\0{stored.record.version}".encode()
-                ).hexdigest()[:24]
-                matches.append(
-                    EvidenceItem(
-                        evidence_id=f"evi_{digest}",
-                        record_id=stored.record.record_id,
-                        source_id=stored.record.source_id,
-                        source_version=stored.record.version,
-                        passage=stored.record.content,
-                        score=len(overlap) / max(len(query_tokens), 1),
-                        location="text:0",
-                        graph_path=stored.record.entities,
-                    )
-                )
         matches.sort(key=lambda item: (-item.score, item.evidence_id))
         result = QueryResult(tuple(matches[: request.limit]), insufficient_evidence=not matches)
         self._query_cache[cache_key] = result

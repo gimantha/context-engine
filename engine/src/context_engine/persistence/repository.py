@@ -21,6 +21,7 @@ from context_engine.domain import (
 )
 
 from .database import ControlDatabase
+from .queries import delete_space_queries
 
 
 class IdempotencyConflict(Exception):
@@ -232,9 +233,10 @@ class ControlPlaneRepository:
 
         Called last by space deletion, after each record's backend copy was removed and
         checked and each partition's unit was dropped, so nothing that could still be
-        searchable is left without a ledger row. Jobs, outbox events, and access decisions
-        stay: they are the audit trail of the deletion itself. Children go before parents so
-        foreign keys hold.
+        searchable is left without a ledger row. Stored queries and their evidence go too,
+        since evidence holds passages. Jobs, outbox events, and access decisions stay: they are
+        the audit trail of the deletion itself. Children go before parents so foreign keys
+        hold.
         """
 
         with self.database.transaction() as connection:
@@ -256,6 +258,7 @@ class ControlPlaneRepository:
                     marks = ", ".join("?" for _ in values)
                     connection.execute(f"DELETE FROM {table} WHERE {column} IN ({marks})", values)
 
+            delete_space_queries(connection, space_id)
             connection.execute("DELETE FROM record_locations WHERE space_id = ?", (space_id,))
             delete_in("backend_record_refs", "partition_id", partition_ids)
             delete_in("backend_read_access", "partition_id", partition_ids)

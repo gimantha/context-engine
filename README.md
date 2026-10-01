@@ -163,6 +163,16 @@ curl -X POST -H "Authorization: Bearer <enricher token>" -H "Idempotency-Key: en
   http://127.0.0.1:8000/v1/spaces/<space id>/enrichments
 ```
 
+Each passage carries a `locator` that places it in its record version: the chunk index, the character range in the extracted text, the sentence range, and, by type, source lines (text, Markdown), the nearest heading (Markdown, HTML), or the JSON path. Every query is stored. Its asker can reopen it, and anyone who could retrieve a passage now, with `context.read` or `evidence.read`, can open it by id, for example from a citation:
+
+```bash
+curl -H "Authorization: Bearer <reader token>" http://127.0.0.1:8000/v1/queries/<query id>
+curl -H "Authorization: Bearer <reader token>" http://127.0.0.1:8000/v1/queries/<query id>/evidence
+curl -H "Authorization: Bearer <reader token>" http://127.0.0.1:8000/v1/evidence/<evidence id>
+```
+
+Reads check access again, so evidence whose record moved out of the reader's audiences, or was replaced or deleted, is left out. Stored evidence is erased when the worker releases its version's content.
+
 See [the M4 report](docs/m4/implementation-report.md) for the live verification and its open items.
 
 Interactive API documentation is available at `http://127.0.0.1:8000/docs`. Identity-provider integrations arrive in M6.

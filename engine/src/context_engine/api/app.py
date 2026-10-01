@@ -27,7 +27,13 @@ from context_engine.application import (
     build_query_backend,
 )
 from context_engine.config import KnowledgeBackendSettings, Settings
-from context_engine.domain import IngestionCommand, JobState, SourceState, VersionOrdering
+from context_engine.domain import (
+    IngestionCommand,
+    JobState,
+    ModelUse,
+    SourceState,
+    VersionOrdering,
+)
 from context_engine.observability import (
     MetricsRegistry,
     configure_logging,
@@ -38,6 +44,7 @@ from context_engine.persistence import (
     AuthorizationRepository,
     ControlDatabase,
     ControlPlaneRepository,
+    QueryRepository,
     ReadAccessRepository,
     SourceRepository,
     StagingStore,
@@ -63,6 +70,7 @@ from .schemas import (
     DirectIngestionEvent,
     EffectivePermissionsResponse,
     ErrorResponse,
+    EvidenceResponse,
     GrantResponse,
     HealthResponse,
     IngestionRequest,
@@ -168,6 +176,8 @@ def create_app(
             secrets=build_secret_store(
                 settings.secrets_key, settings.control_plane_url, settings.control_plane_token
             ),
+            queries=QueryRepository(database),
+            default_models=_default_models(settings),
         )
 
     app = FastAPI(title="Context Engine API", version="0.4.0")
@@ -510,6 +520,49 @@ def create_app(
         )
         return ContextQueryResponse.from_domain(result)
 
+    @app.get(
+        "/v1/queries/{query_id}",
+        response_model=ContextQueryResponse,
+        response_model_by_alias=True,
+        response_model_exclude_none=True,
+    )
+    async def get_query(
+        query_id: ResourceId,
+        principal: AuthenticatedPrincipal = Depends(current_principal),
+    ) -> ContextQueryResponse:
+        """Reopen a stored query for its asker; the service re-checks every passage."""
+
+        return ContextQueryResponse.from_domain(service.get_query(principal, query_id))
+
+    @app.get(
+        "/v1/queries/{query_id}/evidence",
+        response_model=list[EvidenceResponse],
+        response_model_by_alias=True,
+        response_model_exclude_none=True,
+    )
+    async def list_query_evidence(
+        query_id: ResourceId,
+        principal: AuthenticatedPrincipal = Depends(current_principal),
+    ) -> list[EvidenceResponse]:
+        """List a stored query's currently authorized evidence, under the same rules."""
+
+        result = service.get_query(principal, query_id)
+        return [EvidenceResponse.from_domain(item) for item in result.evidence]
+
+    @app.get(
+        "/v1/evidence/{evidence_id}",
+        response_model=EvidenceResponse,
+        response_model_by_alias=True,
+        response_model_exclude_none=True,
+    )
+    async def get_evidence(
+        evidence_id: ResourceId,
+        principal: AuthenticatedPrincipal = Depends(current_principal),
+    ) -> EvidenceResponse:
+        """Open one evidence item for a caller who could retrieve it now, else 404."""
+
+        return EvidenceResponse.from_domain(service.get_evidence(principal, evidence_id))
+
     @app.post(
         "/v1/spaces/{space_id}/enrichments",
         response_model=JobAcceptedResponse,
@@ -735,6 +788,22 @@ def create_app(
 
     app.include_router(build_progress_router(service, current_principal))
     return app
+
+
+def _default_models(settings: Settings) -> dict[str, ModelUse]:
+    """Name the environment's models, which serve every space that configures none.
+
+    Stored queries record the model that served them, so a query of an unconfigured space names
+    the environment's model as it was at that moment, not a blank.
+    """
+
+    if settings.knowledge_backend != "provider":
+        return {}
+    backend = KnowledgeBackendSettings.from_env()
+    return {
+        "embedding": ModelUse(backend.embedding_provider, backend.embedding_model, "environment"),
+        "language": ModelUse(backend.model_provider, backend.model_name, "environment"),
+    }
 
 
 def _storage_placement(settings: Settings) -> dict[str, str]:

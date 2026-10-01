@@ -388,7 +388,7 @@ class CogneeBackend:
                 source_version="",
                 passage=passage,
                 score=1.0 / (rank + 1),
-                location=f"chunk:{chunk_index}" if chunk_index is not None else None,
+                chunk_index=chunk_index,
             )
             if item.evidence_id in seen:
                 continue

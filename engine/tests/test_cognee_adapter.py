@@ -385,7 +385,7 @@ async def test_structured_results_resolve_through_recorded_references(record_fac
 
     [evidence] = result.evidence
     assert (evidence.record_id, evidence.source_id) == ("doc-1", "source-incidents")
-    assert (evidence.passage, evidence.location) == ("resolved passage", "chunk:3")
+    assert (evidence.passage, evidence.chunk_index) == ("resolved passage", 3)
     assert unit not in repr(result) and item not in repr(result)
 
 

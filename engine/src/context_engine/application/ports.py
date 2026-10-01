@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import datetime
 from typing import Any, Protocol
 
@@ -17,6 +18,7 @@ from context_engine.domain import (
     JobOperation,
     JobState,
     Principal,
+    PublicEvidence,
     RecordCounts,
     RecordLocation,
     RecordStatus,
@@ -26,6 +28,8 @@ from context_engine.domain import (
     SpaceConfiguration,
     SpaceState,
     StagedUpload,
+    StoredEvidence,
+    StoredQuery,
     SyncRun,
     VersionOrdering,
 )
@@ -261,6 +265,35 @@ class StagedBytes(Protocol):
 
     def exists(self, upload_id: str) -> bool:
         """Return whether the staged bytes are present."""
+
+        ...
+
+    def read(self, upload_id: str) -> bytes:
+        """Return the staged bytes; raises FileNotFoundError once they were released."""
+
+        ...
+
+
+class QueryStore(Protocol):
+    """Durable stored queries and the evidence they returned (M5 slice 2)."""
+
+    def record_query(self, query: StoredQuery, evidence: Sequence[PublicEvidence]) -> None:
+        """Store a query and its evidence, in order, in one transaction."""
+
+        ...
+
+    def get_query(self, query_id: str) -> StoredQuery | None:
+        """Return a stored query when it exists."""
+
+        ...
+
+    def query_evidence(self, query_id: str) -> tuple[PublicEvidence, ...]:
+        """Return the evidence a query returned that still exists, in order."""
+
+        ...
+
+    def get_evidence(self, evidence_id: str) -> StoredEvidence | None:
+        """Return one evidence row with the space that holds it."""
 
         ...
 

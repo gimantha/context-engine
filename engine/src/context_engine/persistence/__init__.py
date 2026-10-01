@@ -3,6 +3,7 @@
 from .authorization import AuthorizationRepository
 from .backend_state import SqliteBackendState
 from .database import ControlDatabase
+from .queries import QueryRepository
 from .read_access import ReadAccessRepository
 from .repository import ControlPlaneRepository, EffectConflict, IdempotencyConflict
 from .sources import SourceRepository
@@ -14,6 +15,7 @@ __all__ = [
     "ControlPlaneRepository",
     "EffectConflict",
     "IdempotencyConflict",
+    "QueryRepository",
     "ReadAccessRepository",
     "SourceRepository",
     "SqliteBackendState",

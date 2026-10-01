@@ -33,6 +33,7 @@ from context_engine.domain import (
 )
 
 from .database import ControlDatabase
+from .queries import delete_released_evidence
 from .repository import EffectConflict, IdempotencyConflict, insert_source_effect
 
 
@@ -1169,7 +1170,11 @@ class SourceRepository:
         return tuple(row["upload_id"] for row in rows)
 
     def mark_released(self, upload_ids: tuple[str, ...]) -> None:
-        """Record that staged bytes were removed; the metadata row stays for audit."""
+        """Record that staged bytes were removed, and erase the evidence taken from them.
+
+        The metadata row stays for audit. Stored evidence of the versions whose content this
+        was goes in the same transaction, so a passage never outlives its version (M5 slice 2).
+        """
 
         if not upload_ids:
             return
@@ -1179,6 +1184,7 @@ class SourceRepository:
                 "UPDATE staged_uploads SET released_at = ? WHERE id = ?",
                 [(now, upload_id) for upload_id in upload_ids],
             )
+            delete_released_evidence(connection, upload_ids)
 
 
 def _acl_key(source: Source, acl_version: str) -> tuple[int, int | str]:

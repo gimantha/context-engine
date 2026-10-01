@@ -4,6 +4,7 @@ and the configured models reaching every backend call."""
 from __future__ import annotations
 
 import json
+import sqlite3
 from itertools import count
 from pathlib import Path
 
@@ -309,6 +310,19 @@ async def test_configured_models_reach_every_backend_call(tmp_path, monkeypatch)
         assert models.embedding_model.dimensions == 1536
         # Keys never appear in the string form that could reach a log or an error.
         assert "sk-" not in repr(models)
+    # The stored query names the space's embedding model that served it, never its key.
+    stored = json.loads(
+        sqlite3.connect(tmp_path / "control.db")
+        .execute("SELECT models_json FROM queries WHERE id = ?", (query.json()["queryId"],))
+        .fetchone()[0]
+    )
+    assert stored == {
+        "embedding": {
+            "provider": "openai",
+            "model": "text-embedding-3-small",
+            "configuredBy": "space",
+        }
+    }
 
 
 async def test_unconfigured_spaces_use_the_backend_default(tmp_path):

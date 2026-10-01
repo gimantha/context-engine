@@ -126,7 +126,12 @@ class EnrichmentRequest:
 
 @dataclass(frozen=True, slots=True)
 class EvidenceItem:
-    """Authorized source-linked evidence returned by a backend."""
+    """Authorized source-linked evidence returned by a backend.
+
+    `chunk_index` is the passage's position among its record's chunks, when the backend
+    reports one. The engine places the passage in the record's text itself (M5 slice 2), so
+    the order of chunks is the only position a backend needs to give.
+    """
 
     evidence_id: str
     record_id: str
@@ -134,7 +139,7 @@ class EvidenceItem:
     source_version: str
     passage: str
     score: float
-    location: str | None = None
+    chunk_index: int | None = None
     graph_path: tuple[str, ...] = ()
 
 

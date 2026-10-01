@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Context Engine API
-  version: 0.10.0
+  version: 0.11.0
   description: Provider-neutral API draft for governed context spaces.
 servers:
   - url: /v1
@@ -573,8 +573,10 @@ paths:
       description: >-
         Context mode returns authorized, source-linked passages. Requires context.read on the
         space; only records whose audiences include one of the caller's groups can appear, and
-        every passage is checked against the ledger before it is returned. Answer mode is not
-        available yet and is rejected. A deployment without the knowledge backend answers 503.
+        every passage is checked against the ledger before it is returned. Each passage carries
+        a locator placing it in its record version. The query is stored with its evidence, so
+        its asker can reopen it. Answer mode is not available yet and is rejected. A deployment
+        without the knowledge backend answers 503.
       requestBody:
         required: true
         content:
@@ -603,18 +605,30 @@ paths:
   /queries/{queryId}:
     get:
       operationId: getQuery
+      description: >-
+        Reopen a stored query. Only the principal who asked it can, while holding context.read
+        on the space; anyone else gets 404. The evidence is checked again against the asker's
+        current audiences and each record's current version, so evidence that was revoked,
+        moved out of reach, or superseded is left out.
       parameters:
         - $ref: "#/components/parameters/QueryId"
       responses:
         "200":
-          description: Query result
+          description: Query result with its currently authorized evidence
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/QueryResponse"
+        "401":
+          $ref: "#/components/responses/Error"
+        "403":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
   /queries/{queryId}/evidence:
     get:
       operationId: listQueryEvidence
+      description: The stored query's currently authorized evidence, under the same rules.
       parameters:
         - $ref: "#/components/parameters/QueryId"
       responses:
@@ -626,6 +640,12 @@ paths:
                 type: array
                 items:
                   $ref: "#/components/schemas/Evidence"
+        "401":
+          $ref: "#/components/responses/Error"
+        "403":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
   /queries/{queryId}/trace:
     get:
       operationId: getQueryTrace
@@ -641,6 +661,12 @@ paths:
   /evidence/{evidenceId}:
     get:
       operationId: getEvidence
+      description: >-
+        Open one evidence item, for example from a citation. Requires context.read or
+        evidence.read on the space, membership in an audience of the record's current
+        partition, and the record still at the evidence's version; evidence.read opens evidence
+        without allowing queries. Every refusal is the same 404. Evidence is erased when the
+        worker releases its record version's content.
       parameters:
         - name: evidenceId
           in: path
@@ -654,6 +680,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Evidence"
+        "401":
+          $ref: "#/components/responses/Error"
         "404":
           $ref: "#/components/responses/Error"
   /spaces/{spaceId}/enrichments:
@@ -1227,7 +1255,7 @@ components:
     Evidence:
       type: object
       additionalProperties: false
-      required: [id, recordId, sourceId, sourceVersion, passage]
+      required: [id, recordId, sourceId, sourceVersion, passage, locator]
       properties:
         id:
           $ref: "#/components/schemas/Identifier"
@@ -1241,9 +1269,61 @@ components:
           type: string
         location:
           type: string
+          description: Compact form of the chunk position, `chunk:<n>`, kept for earlier clients.
+        locator:
+          $ref: "#/components/schemas/EvidenceLocator"
         sourceUrl:
           type: string
           format: uri
+    EvidenceLocator:
+      type: object
+      additionalProperties: false
+      description: >-
+        Where the passage sits in its record version. Each part is present only when the engine
+        could establish it; a passage it cannot place with certainty, such as one repeated in
+        the record, keeps its chunk index alone.
+      properties:
+        chunkIndex:
+          type: integer
+          minimum: 0
+          description: Position among the record version's chunks.
+        characters:
+          type: object
+          additionalProperties: false
+          required: [start, end]
+          description: >-
+            Offsets in Unicode code points into the version's extracted text, end exclusive.
+          properties:
+            start:
+              type: integer
+              minimum: 0
+            end:
+              type: integer
+              minimum: 0
+        sentences:
+          $ref: "#/components/schemas/LineRange"
+        lines:
+          $ref: "#/components/schemas/LineRange"
+        heading:
+          type: string
+          description: Nearest heading above the passage, for Markdown and HTML.
+        path:
+          type: string
+          description: JSON path of the smallest value holding the passage, for JSON records.
+    LineRange:
+      type: object
+      additionalProperties: false
+      required: [first, last]
+      description: >-
+        A 1-based, inclusive range: sentences as the engine segments the extracted text, or
+        lines of the source file for plain text and Markdown.
+      properties:
+        first:
+          type: integer
+          minimum: 1
+        last:
+          type: integer
+          minimum: 1
     QueryTrace:
       type: object
       additionalProperties: false
