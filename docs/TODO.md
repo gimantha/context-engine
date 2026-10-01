@@ -106,3 +106,39 @@ Remaining:
 
 - Which production deployment is expected: a hosted graph service, or engine-managed stores?
 - Is a Neo4j or Postgres dependency acceptable for the first release?
+
+## Incremental updates for large records
+
+**Status:** Not started (2026-10-01). A candidate for M7, or earlier if large records with small, frequent edits become common.
+
+### Why
+
+An update replaces the whole record today. The private adapter writes the new version as a new item, moves the engine's reference to it, and deletes the old item; the indexer then checks that the old version is gone (ADR 0007). That is simple and safe, but the provider re-runs model extraction over the entire record for every version, even when one sentence changed. Model extraction is the most expensive and slowest step of indexing.
+
+The provider also has a native in-place update with a chunk-level path. It compares the new text with the stored text, re-extracts only the chunks the edit touched, and keeps the entities and summaries of the rest. For a large record with a small edit, that saves most of the extraction cost.
+
+### Why it is not used today
+
+- **The version lives in item metadata.** Each item carries the engine's record, source, and version. Indexing progress, the absence check after every change, and the scheduled cross-check all match on record and version from that metadata. The chunk-level path does not change metadata, and passing new metadata makes the provider fall back to a full rebuild.
+- **The full rebuild deletes first.** It removes the item, then re-adds and re-extracts it, so the record is not searchable in between, and a crash in between loses the copy. Replace writes the new version first, so the record stays searchable throughout.
+- **One item id across versions.** The adapter derives a new item id from each record version and content hash, so a retried write lands on the same item and an old copy can never be taken for the current one (ADR 0007 revision of 2026-09-25). The in-place update keeps one id for every version.
+- **No per-call models.** The in-place update takes no model settings, which every write passes since M5 slice 1. Enrichment's route through the provider's context variables would be needed.
+
+### What has to change
+
+- **Version tracking in the engine.** Record the written version and content hash with the engine's backend reference, and have progress and absence checks compare those instead of item metadata. Lineage already resolves through these references.
+- **An absence check for a stable id.** After an in-place update, check that the old version's text no longer appears in the item's chunks, instead of checking that the old item is gone.
+- **Models through context variables**, as enrichment does.
+- **Replace as the fallback.** When the provider refuses the chunk-level path, run the engine's replace instead of the provider's delete-first rebuild.
+- **A size threshold.** Use the in-place path only for records large enough to save real cost; small records keep replace.
+
+### Gate
+
+- **Residue (threat model T10).** A live scan after an edit that removes text finds no trace of it in chunks, vectors, or the graph, including entity descriptions and summaries built from several chunks, which the chunk-level path keeps.
+- **Locators (M5 slice 2).** Chunks stay exact slices of the new text, in order, so evidence still lines up. The provider renumbers kept chunks and checks that they tile the new text; the multi-chunk live test must confirm it.
+- **Crash safety.** A crash mid-update leaves the old version readable and the engine's intent record consistent, as the provider claims for its chunk-level path.
+
+### Open questions
+
+- How large are records expected to be, and how often are they edited? That decides whether the saving is worth a second update path.
+- A space can change its language model. The provider refuses the chunk-level path for a non-default extraction schema or prompt, but not for a different model, so one record could mix extraction from two models. Is that acceptable, or should a model change force replace?
