@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from sqlite3 import Connection, Row
 from uuid import uuid4
@@ -693,6 +695,86 @@ class SourceRepository:
         with self.database.connection() as connection:
             rows = connection.execute("SELECT * FROM sources ORDER BY created_at, id").fetchall()
         return tuple(_source(row) for row in rows)
+
+    def list_source_records(self, source_id: str) -> tuple[RecordStatus, ...]:
+        """Return every record of a source in any state, for deletion of the whole source."""
+
+        with self.database.connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM source_records WHERE source_id = ? ORDER BY source_record_id",
+                (source_id,),
+            ).fetchall()
+        return tuple(_record(row) for row in rows)
+
+    def list_space_uploads(self, space_id: str) -> tuple[str, ...]:
+        """Return the ids of every staged upload under a space's sources, released or not."""
+
+        with self.database.connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT u.id FROM staged_uploads AS u
+                JOIN sources AS s ON s.id = u.source_id
+                WHERE s.space_id = ? ORDER BY u.id
+                """,
+                (space_id,),
+            ).fetchall()
+        return tuple(row["id"] for row in rows)
+
+    def delete_record_as_engine(
+        self, job: Job, source: Source, source_record_id: str
+    ) -> RecordTransition | None:
+        """Tombstone one record at its current version on the engine's behalf.
+
+        Space deletion has no source version to offer, so the record is deleted at the version
+        it holds. Under ADR 0006 that stops a resend of the same version from bringing it back
+        while a strictly newer version from the source still can, which is the right outcome
+        for a source that keeps changing after its space was removed. The effect row is keyed
+        by the deletion job, so a retried job replays as a no-op. Returns None when the record
+        is unknown, already deleted, or already handled by this job.
+        """
+
+        with self.database.transaction() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM source_records
+                WHERE space_id = ? AND source_id = ? AND source_record_id = ?
+                """,
+                (source.space_id, source.id, source_record_id),
+            ).fetchone()
+            if row is None or RecordState(row["state"]) is RecordState.DELETED:
+                return None
+            version = row["current_version"]
+            payload = {
+                "schemaVersion": "1",
+                "spaceId": source.space_id,
+                "sourceId": source.id,
+                "sourceRecordId": source_record_id,
+                "sourceVersion": version,
+                "operation": "delete",
+                "sourceAclVersion": row["source_acl_version"],
+                "idempotencyKey": f"{job.idempotency_key}:{source.id}:{source_record_id}",
+            }
+            encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+            effect_job = replace(
+                job,
+                idempotency_key=payload["idempotencyKey"],
+                payload=payload,
+                payload_hash="sha256:" + hashlib.sha256(encoded.encode()).hexdigest(),
+            )
+            if not insert_source_effect(connection, effect_job):
+                return None
+            transition = self._transition(
+                source,
+                row,
+                "delete",
+                version,
+                source.version_key(version),
+                row["source_acl_version"],
+                (),
+                None,
+            )
+            self._write_transition(connection, effect_job, source, row, transition, payload)
+            return transition
 
     def list_active_records(self, source_id: str) -> tuple[RecordStatus, ...]:
         """Return the active records of a source, which are the ones a backend should hold."""

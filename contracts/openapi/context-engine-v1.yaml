@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Context Engine API
-  version: 0.9.0
+  version: 0.10.0
   description: Provider-neutral API draft for governed context spaces.
 servers:
   - url: /v1
@@ -68,9 +68,23 @@ paths:
                 $ref: "#/components/schemas/ContextSpace"
     delete:
       operationId: deleteContextSpace
+      description: >-
+        Queue deletion of the space and everything in it. Requires space.manage. The space
+        moves to the deleting state at once and refuses new deliveries, queries, enrichment,
+        and configuration; the job then tombstones every record at its current version,
+        removes and checks each backend copy, drops each isolation unit whole, releases staged
+        bytes, and removes the space's rows. A copy that is still searchable after that keeps
+        the space in the deleting state with the job failed. Repeating the request returns the
+        running job; after a failed job it queues a new attempt.
       responses:
         "202":
           $ref: "#/components/responses/JobAccepted"
+        "401":
+          $ref: "#/components/responses/Error"
+        "403":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
   /spaces/{spaceId}/configuration:
     parameters:
       - $ref: "#/components/parameters/SpaceId"

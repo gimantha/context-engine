@@ -24,6 +24,7 @@ from context_engine.domain import (
     SourceCheckpoint,
     SourceState,
     SpaceConfiguration,
+    SpaceState,
     StagedUpload,
     SyncRun,
     VersionOrdering,
@@ -45,6 +46,21 @@ class ControlPlaneStore(Protocol):
 
     def get_space(self, space_id: str) -> ContextSpace | None:
         """Return one context space when it exists."""
+
+        ...
+
+    def set_space_state(self, space_id: str, state: SpaceState) -> ContextSpace | None:
+        """Move a space to a lifecycle state and return it, or None when it does not exist."""
+
+        ...
+
+    def latest_job_for_space(self, space_id: str, operation: JobOperation) -> Job | None:
+        """Return the newest job of one operation that names the space."""
+
+        ...
+
+    def purge_space(self, space_id: str) -> None:
+        """Remove every row of a space whose records and partitions are already gone."""
 
         ...
 

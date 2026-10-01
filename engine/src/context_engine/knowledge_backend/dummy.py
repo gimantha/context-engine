@@ -228,6 +228,23 @@ class DummyKnowledgeBackend:
         self._invalidate(partition)
         return DeletionResult(record_id=record_id, deleted=True)
 
+    async def delete_partition(
+        self,
+        partition: AccessPartitionRef,
+        principal: PrincipalContext,
+    ) -> None:
+        """Drop everything held for a partition, including anything derived inside it."""
+
+        self._check_context(principal, (partition,))
+        self._records.pop(partition.value, None)
+        self._references = {
+            reference: location
+            for reference, location in self._references.items()
+            if location[0] != partition.value
+        }
+        self._readers.pop(partition.value, None)
+        self._invalidate(partition)
+
     async def grant_read(
         self,
         partition: AccessPartitionRef,

@@ -683,6 +683,22 @@ def create_app(
 
     storage = _storage_placement(settings)
 
+    @app.delete(
+        "/v1/spaces/{space_id}",
+        response_model=JobAcceptedResponse,
+        response_model_by_alias=True,
+        status_code=202,
+    )
+    async def delete_context_space(
+        space_id: ResourceId,
+        response: Response,
+        principal: AuthenticatedPrincipal = Depends(current_principal),
+    ) -> JobAcceptedResponse:
+        job = service.delete_context_space(principal, space_id)
+        status_url = f"/v1/jobs/{job.id}"
+        response.headers["Location"] = status_url
+        return JobAcceptedResponse(jobId=job.id, statusUrl=status_url)
+
     @app.get(
         "/v1/spaces/{space_id}/configuration",
         response_model=SpaceConfigurationResponse,

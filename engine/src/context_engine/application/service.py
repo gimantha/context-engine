@@ -32,6 +32,7 @@ from context_engine.domain import (
     SourceProgress,
     SourceState,
     SpaceConfiguration,
+    SpaceState,
     StagedUpload,
     SyncRun,
     SyncRunState,
@@ -270,6 +271,49 @@ class ContextEngineService:
             raise NotFoundError("Context space not found")
         return space
 
+    def delete_context_space(self, principal: AuthenticatedPrincipal, space_id: str) -> Job:
+        """Queue deletion of a space for a principal holding space.manage.
+
+        Deletion runs as a job because every record's backend copy is removed and checked
+        before the space's rows go (ADR 0007). The space moves to `deleting` at once, which
+        makes it refuse new deliveries, queries, enrichment, and configuration while the job
+        runs. Repeating the request returns the running job; after a failed job it queues a
+        new attempt, so an operator can retry once the cause is fixed.
+        """
+
+        self.get_context_space(principal, space_id)
+        self._require(principal, Action.SPACE_MANAGE, space_id)
+        latest = self._store.latest_job_for_space(space_id, JobOperation.SPACE_DELETION)
+        if latest is not None and latest.state is not JobState.FAILED:
+            return latest
+        key = (
+            f"space-deletion:{space_id}"
+            if latest is None
+            else f"space-deletion:{space_id}:after-{latest.id}"
+        )
+        self._store.set_space_state(space_id, SpaceState.DELETING)
+        try:
+            job, _ = self._store.enqueue_job(
+                JobOperation.SPACE_DELETION,
+                key,
+                {"spaceId": space_id},
+                principal.trace_id,
+                self._max_job_attempts,
+                principal.principal_id,
+            )
+        except IdempotencyConflict as exc:
+            raise ConflictError("Idempotency key is already bound to another request") from exc
+        self._metrics.increment("context_engine_space_deletions_accepted_total")
+        return job
+
+    def _accepting_space(self, principal: AuthenticatedPrincipal, space_id: str) -> ContextSpace:
+        """Return a visible space that still accepts work; a space being deleted does not."""
+
+        space = self.get_context_space(principal, space_id)
+        if space.state is SpaceState.DELETING:
+            raise ConflictError("Space is being deleted")
+        return space
+
     # Space configuration
 
     def get_space_configuration(
@@ -302,7 +346,7 @@ class ContextEngineService:
         for reindexing in M7.
         """
 
-        self.get_context_space(principal, space_id)
+        self._accepting_space(principal, space_id)
         self._require(principal, Action.SPACE_MANAGE, space_id)
         if embedding is None and language is None:
             raise ValidationError("Configure at least one model")
@@ -396,8 +440,11 @@ class ContextEngineService:
         a connector credential can only ever write into its own feed (M3, threat T02).
         """
 
-        if self._store.get_space(space_id) is None:
+        space = self._store.get_space(space_id)
+        if space is None:
             raise NotFoundError("Context space not found")
+        if space.state is SpaceState.DELETING:
+            raise ConflictError("Space is being deleted")
         self._require_any(principal, _MANAGE_SOURCES, space_id)
         source = self._sources.create_source(
             space_id, name.strip(), type_.strip(), version_ordering, audience_mapping
@@ -573,9 +620,17 @@ class ContextEngineService:
 
         source = self._visible_source(principal, source_id)
         self._require(principal, Action.INGEST_WRITE, source_id)
+        self._source_accepting(source)
+        return source
+
+    def _source_accepting(self, source: Source) -> None:
+        """Refuse deliveries to a paused source or to any source of a space being deleted."""
+
         if source.state is not SourceState.READY:
             raise ConflictError("Source is not accepting deliveries")
-        return source
+        space = self._store.get_space(source.space_id)
+        if space is not None and space.state is SpaceState.DELETING:
+            raise ConflictError("Space is being deleted")
 
     def stage_upload(
         self,
@@ -686,8 +741,7 @@ class ContextEngineService:
         ):
             raise NotFoundError("Source not found")
         self._require(principal, Action.INGEST_WRITE, source.id)
-        if source.state is not SourceState.READY:
-            raise ConflictError("Source is not accepting deliveries")
+        self._source_accepting(source)
         try:
             source.version_key(command.source_version)
         except ValueError as exc:
@@ -853,7 +907,7 @@ class ContextEngineService:
         exists. Nothing is persisted yet; query history and answers arrive with M5.
         """
 
-        self.get_context_space(principal, space_id)
+        self._accepting_space(principal, space_id)
         self._require(principal, Action.CONTEXT_READ, space_id)
         if mode != "context":
             raise ValidationError("Answer mode is not available yet; use context mode")
@@ -1030,7 +1084,7 @@ class ContextEngineService:
         version is recorded on the job, and the idempotency key makes a resend return the same job.
         """
 
-        self.get_context_space(principal, space_id)
+        self._accepting_space(principal, space_id)
         self._require(principal, Action.CONTEXT_ENRICH, space_id)
         if not self._indexing_enabled:
             raise ServiceUnavailableError("Enrichment needs the knowledge backend")

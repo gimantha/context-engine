@@ -104,6 +104,38 @@ class RecordIndexer:
         self._sources.set_index_state(source.space_id, source.id, source_record_id, state)
         return state
 
+    async def purge(self, source: Source, source_record_id: str, trace_id: str) -> None:
+        """Retire a record's remaining copies after their partitions were removed whole.
+
+        This is ADR 0007's fallback for a copy that could not be proven removed on its own:
+        the containing unit is dropped and the binding retired. Space deletion does that for
+        every partition, so here each copy only has to be shown absent before its row goes.
+        Nothing is written or deleted blindly; a copy that is still searchable fails the job
+        with `residue_found` and keeps its row.
+        """
+
+        principal = PrincipalContext(self._service_principal_id, trace_id)
+        record = self._sources.get_record(source.space_id, source.id, source_record_id)
+        if record is None:
+            return
+        for location in self._sources.list_locations(source.space_id, source.id, source_record_id):
+            version = location.version or location.target_version
+            if version and not await self._absent(
+                location.partition_id, source, record, version, principal
+            ):
+                self._record_failure(
+                    source, record, IndexState.RECONCILE_REQUIRED, "residue_found", trace_id
+                )
+                raise TerminalJobError(
+                    "residue_found", "A copy is still searchable after its partition was removed"
+                )
+            self._sources.drop_location(
+                source.space_id, source.id, source_record_id, location.partition_id
+            )
+        self._sources.set_index_state(
+            source.space_id, source.id, source_record_id, IndexState.NOT_INDEXED
+        )
+
     def _record_failure(
         self, source: Source, record: RecordStatus, state: IndexState, code: str, trace_id: str
     ) -> None:

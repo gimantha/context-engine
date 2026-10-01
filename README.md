@@ -187,6 +187,17 @@ uv run python -c "from context_engine.security.secrets import SecretVault; print
 
 Reading the configuration back shows provider, model, and how each key is held, never the key. The embedding model cannot change once the space holds indexed content.
 
+### Delete a space
+
+Deleting a space removes everything in it and runs as a job, because every record's backend copy is removed and checked before the space's rows go (ADR 0007):
+
+```bash
+curl -X DELETE -H "Authorization: Bearer <admin token>" http://127.0.0.1:8000/v1/spaces/<space id>
+curl -H "Authorization: Bearer <admin token>" http://127.0.0.1:8000/v1/jobs/<job id>
+```
+
+The space moves to `deleting` at once and refuses new deliveries, queries, enrichment, and configuration with 409. The job pauses the sources, tombstones every record at its current version, removes and checks each copy, drops each partition's isolation unit whole, deletes the staged bytes, and removes the space's sources, records, partitions, grants, and configuration. Jobs and access decisions stay as the audit trail. A copy that is still searchable after its unit was dropped fails the job and leaves the space in `deleting`; repeating the request after a failed job queues a new attempt. Physical erasure of deleted bytes from the provider's files is still M7 work.
+
 ## Run the live-provider verification
 
 The live test is opt-in because it calls configured external models and writes local provider stores. Install the private provider extra, copy the example environment, and add your credentials:

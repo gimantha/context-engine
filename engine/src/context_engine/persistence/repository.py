@@ -200,6 +200,79 @@ class ControlPlaneRepository:
             ).fetchone()
         return _space(row) if row else None
 
+    def set_space_state(self, space_id: str, state: SpaceState) -> ContextSpace | None:
+        """Move a space to a lifecycle state; `deleting` marks it while its deletion job runs."""
+
+        with self.database.transaction() as connection:
+            connection.execute(
+                "UPDATE context_spaces SET state = ?, updated_at = ? WHERE id = ?",
+                (state.value, _timestamp(), space_id),
+            )
+            row = connection.execute(
+                "SELECT * FROM context_spaces WHERE id = ?", (space_id,)
+            ).fetchone()
+        return _space(row) if row else None
+
+    def latest_job_for_space(self, space_id: str, operation: JobOperation) -> Job | None:
+        """Return the newest job of one operation for a space, so a request can replay it."""
+
+        with self.database.connection() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM jobs
+                WHERE operation = ? AND json_extract(payload_json, '$.spaceId') = ?
+                ORDER BY created_at DESC, id DESC LIMIT 1
+                """,
+                (operation.value, space_id),
+            ).fetchone()
+        return _job(row) if row else None
+
+    def purge_space(self, space_id: str) -> None:
+        """Remove every row of a space in one transaction.
+
+        Called last by space deletion, after each record's backend copy was removed and
+        checked and each partition's unit was dropped, so nothing that could still be
+        searchable is left without a ledger row. Jobs, outbox events, and access decisions
+        stay: they are the audit trail of the deletion itself. Children go before parents so
+        foreign keys hold.
+        """
+
+        with self.database.transaction() as connection:
+            source_ids = [
+                row["id"]
+                for row in connection.execute(
+                    "SELECT id FROM sources WHERE space_id = ?", (space_id,)
+                )
+            ]
+            partition_ids = [
+                row["id"]
+                for row in connection.execute(
+                    "SELECT id FROM access_partitions WHERE space_id = ?", (space_id,)
+                )
+            ]
+
+            def delete_in(table: str, column: str, values: list[str]) -> None:
+                if values:
+                    marks = ", ".join("?" for _ in values)
+                    connection.execute(f"DELETE FROM {table} WHERE {column} IN ({marks})", values)
+
+            connection.execute("DELETE FROM record_locations WHERE space_id = ?", (space_id,))
+            delete_in("backend_record_refs", "partition_id", partition_ids)
+            delete_in("backend_read_access", "partition_id", partition_ids)
+            delete_in("backend_bindings", "partition_id", partition_ids)
+            connection.execute("DELETE FROM access_partitions WHERE space_id = ?", (space_id,))
+            delete_in("indexing_snapshots", "source_id", source_ids)
+            delete_in("sync_runs", "source_id", source_ids)
+            delete_in("source_checkpoints", "source_id", source_ids)
+            delete_in("staged_uploads", "source_id", source_ids)
+            connection.execute("DELETE FROM record_versions WHERE space_id = ?", (space_id,))
+            connection.execute("DELETE FROM source_records WHERE space_id = ?", (space_id,))
+            connection.execute("DELETE FROM source_record_effects WHERE space_id = ?", (space_id,))
+            delete_in("grants", "resource_id", [space_id, *source_ids])
+            connection.execute("DELETE FROM space_configurations WHERE space_id = ?", (space_id,))
+            connection.execute("DELETE FROM sources WHERE space_id = ?", (space_id,))
+            connection.execute("DELETE FROM context_spaces WHERE id = ?", (space_id,))
+
     def get_space_configuration(self, space_id: str) -> SpaceConfiguration | None:
         """Return the space's model configuration, or None before the first change."""
 

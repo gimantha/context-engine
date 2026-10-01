@@ -102,6 +102,11 @@ class _CogneeRuntimePort(Protocol):
 
         ...
 
+    async def forget_unit(self, binding: _CogneeBinding, user: Any) -> Any:
+        """Invoke native deletion of a whole isolation unit, derived data included."""
+
+        ...
+
     async def ensure_user(self, handle: str) -> Any:
         """Return the native user with this deterministic handle, creating it once."""
 
@@ -526,6 +531,34 @@ class CogneeBackend:
         except Exception as exc:
             raise _translate_error(exc) from exc
 
+    async def delete_partition(
+        self,
+        partition: AccessPartitionRef,
+        principal: PrincipalContext,
+    ) -> None:
+        """Remove the partition's isolation unit and the engine's memory of it.
+
+        The native unit, its graph, its vectors, and its permissions go together; the binding
+        and record references are dropped afterwards so a later write to the same partition
+        creates a fresh unit. A unit the provider no longer has counts as removed, and a
+        partition that never received a write has no unit to remove.
+        """
+
+        self._partitions((partition,))
+        binding = self._bindings.resolve(partition)
+        if binding.dataset_id is not None:
+            try:
+                user = await self._user_resolver(principal)
+                await self._runtime.forget_unit(binding, user)
+            except BackendError as exc:
+                if exc.code is not BackendErrorCode.NOT_FOUND:
+                    raise
+            except Exception as exc:
+                translated = _translate_error(exc)
+                if translated.code is not BackendErrorCode.NOT_FOUND:
+                    raise translated from exc
+        self._state.delete_partition(partition.value)
+
     async def indexing_progress(
         self,
         request: IndexingProgressRequest,
@@ -775,6 +808,12 @@ class CogneeRuntime:
             dataset_id=UUID(binding.dataset_id),
             user=user,
         )
+
+    async def forget_unit(self, binding: _CogneeBinding, user: Any) -> Any:
+        """Invoke native deletion of one isolation unit, as its owner."""
+
+        cognee = await self._ready()
+        return await cognee.forget(dataset_id=UUID(binding.dataset_id), user=user)
 
     async def ensure_user(self, handle: str) -> Any:
         """Find the ordinary native account for a handle, creating it on first use."""

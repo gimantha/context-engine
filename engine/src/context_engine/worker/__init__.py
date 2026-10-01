@@ -12,6 +12,7 @@ from .indexing import IndexingCollector
 from .read_access import ReadAccessSynchronizer
 from .reauthorize import JobAuthorizer
 from .runtime import JobWorker, RetryPolicy
+from .space_deletion import SpaceDeletionJobHandler
 
 __all__ = [
     "EnrichmentJobHandler",
@@ -24,5 +25,6 @@ __all__ = [
     "ReadAccessSynchronizer",
     "RecordIndexer",
     "RetryPolicy",
+    "SpaceDeletionJobHandler",
     "TerminalJobError",
 ]

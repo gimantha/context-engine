@@ -42,6 +42,15 @@ class SqliteBackendState:
                 (partition, binding, _timestamp()),
             )
 
+    def delete_partition(self, partition: str) -> None:
+        """Drop the partition's binding and references in one transaction."""
+
+        with self.database.transaction() as connection:
+            connection.execute(
+                "DELETE FROM backend_record_refs WHERE partition_id = ?", (partition,)
+            )
+            connection.execute("DELETE FROM backend_bindings WHERE partition_id = ?", (partition,))
+
     def get_record_reference(self, partition: str, source_id: str, record_id: str) -> str | None:
         """Return the backend reference of a record held in a partition."""
 

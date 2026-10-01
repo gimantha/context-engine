@@ -52,7 +52,7 @@ Ingestion rules: the engine never fetches supplied URLs or enables a provider's 
 
 Query rules: never return a backend passage without the ledger check in `ContextEngineService._visible_evidence`. Query the backend as the caller with partitions resolved by engine policy, never as the service identity. Keep the adapter's retriever pinned with automatic routing off.
 
-Convergence rules: never call the backend's write, update, or delete from anywhere but `worker/indexer.py`. Record intent with `begin_location_write` before a write, confirm it after, and follow every removal or replacement with an absence check. A copy that cannot be proven written or removed becomes reconcile-required; never retry it blindly.
+Convergence rules: never call the backend's write, update, or delete from anywhere but `worker/indexer.py`. Record intent with `begin_location_write` before a write, confirm it after, and follow every removal or replacement with an absence check. A copy that cannot be proven written or removed becomes reconcile-required; never retry it blindly. Space deletion (`worker/space_deletion.py`) is the one place that removes a whole partition through `delete_partition`, and only after every record in it was tombstoned and converged; a reconcile-required copy is then shown absent once more before its row goes, never deleted again.
 
 Backend state rules: keep provider bindings, references, and identities in the control database through `BackendStateStore`; never add process-local maps for them. Write provider content only as the service principal. Never let a bound partition move to another native unit.
 

@@ -34,6 +34,11 @@ class TerminalJobError(RuntimeError):
 class RecordConverger(Protocol):
     """Bring one record's knowledge-backend copies in line with the ledger."""
 
+    async def purge(self, source: Source, source_record_id: str, trace_id: str) -> None:
+        """Retire a record's copies after their partitions were removed whole (ADR 0007)."""
+
+        ...
+
     async def converge(self, source: Source, source_record_id: str, trace_id: str) -> IndexState:
         """Converge one record and return its index state."""
 

@@ -43,6 +43,28 @@ pytest -m live_provider: 2 passed in 3 min 9 s
 
 Both paths produced the same isolation, replacement, deletion, and residue results as before, so a selection that names the environment's own models behaves like the default. A selection naming a different model was not run live; that needs a second configured provider.
 
+## Space deletion delivered
+
+Added before slice 2 so local and test environments can be cleared through the API, and because the contract has listed `DELETE /spaces/{spaceId}` since M1 without an implementation.
+
+- **Route.** `DELETE /v1/spaces/{spaceId}` needs `space.manage` and answers 202 with a `space_deletion` job. The space is marked `deleting` at once; deliveries, queries, enrichment, source registration, and configuration on it answer 409 from then on. Repeating the request returns the running job; after a failed job it queues a new attempt.
+- **Job.** `worker/space_deletion.py` pauses the sources, tombstones every record at its current version through the ledger (keyed by the job, so a retry replays as a no-op), converges each record with the indexer, drops every partition's isolation unit whole through the new `delete_partition` port method, re-checks copies that single deletion left unproven, deletes the staged bytes, and removes the space's rows in one transaction. Jobs and access decisions remain as the audit trail. The sequence, and why a reconcile-required copy no longer blocks a space deletion, is the ADR 0007 revision of 2026-10-01.
+- **Backend.** `delete_partition` on the port, the deterministic backend, and the private adapter (whole-unit removal as the unit's owner; a unit the provider no longer has counts as removed), with `delete_partition` on both backend state stores to forget the binding and references.
+- **Contract 0.10.0** documents the route's behaviour and error responses.
+
+`engine/tests/test_space_deletion.py` (6 tests) covers full deletion with every control-database row, staged file, grant, and backend record checked gone; the 409s while deleting; ledger-only mode; residue keeping the space until a retry succeeds; a retryable backend failure resuming the job; and permissions.
+
+Live run on 2026-10-01 through `context-engine-serve` with the local profile: one record indexed into a fresh space with the environment's OpenAI models, then `DELETE /v1/spaces/{id}`. The job succeeded on its first attempt; the space answered 404, every control-database row of it was gone, its staged file was deleted, and the provider's unit row, vector directory, graph file, and raw data file were removed while the two other local spaces' units stayed. A byte-level scan of every provider file for the record's text found nothing. Two provider run-history rows for the removed unit remain, holding `<engine record>` with the engine's record and source ids and no content; clearing that history is the T19 work of slice 4.
+
+Validation performed on 2026-10-01 from `engine/`:
+
+```text
+ruff format --check and ruff check: passed
+pytest -m "not live_provider": 161 passed, 2 live tests deselected
+context-engine-api, -worker, and -serve --check: passed
+provider boundary check: passed
+```
+
 ## Decisions
 
 - **Answers use the space's models** (user, 2026-09-29), and so do extraction and embeddings.

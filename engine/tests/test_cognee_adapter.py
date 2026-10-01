@@ -114,6 +114,9 @@ class FakeCogneeRuntime:
     async def forget(self, binding, data_id, user):
         self.calls.append(("forget", binding, data_id, user))
 
+    async def forget_unit(self, binding, user):
+        self.calls.append(("forget_unit", binding.dataset_id, user))
+
     async def health(self):
         return True, "fake Cognee runtime"
 

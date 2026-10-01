@@ -34,6 +34,7 @@ from .indexing import IndexingCollector
 from .read_access import ReadAccessSynchronizer
 from .reauthorize import JobAuthorizer
 from .runtime import JobWorker
+from .space_deletion import SpaceDeletionJobHandler
 
 BACKEND_MODES = ("none", "provider")
 
@@ -68,6 +69,7 @@ def build_worker_runtime(
     # The worker loads the same identity registry as the API so it can resolve current groups.
     verifier = build_token_verifier(settings)
     backend: KnowledgeBackend | None = None
+    service_principal_id = KnowledgeBackendSettings.from_env().service_principal_id
     read_access: ReadAccessSynchronizer | None = None
     indexer: RecordIndexer | None = None
     collector: IndexingCollector | None = None
@@ -114,6 +116,15 @@ def build_worker_runtime(
     }
     if enrichment is not None:
         handlers[JobOperation.ENRICHMENT] = enrichment
+    handlers[JobOperation.SPACE_DELETION] = SpaceDeletionJobHandler(
+        sources,
+        repository,
+        staging,
+        service_principal_id,
+        metrics,
+        backend=backend,
+        indexer=indexer,
+    )
     worker = JobWorker(
         repository,
         OperationDispatcher(handlers),

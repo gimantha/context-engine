@@ -40,6 +40,11 @@ class BackendStateStore(Protocol):
 
         ...
 
+    def delete_partition(self, partition: str) -> None:
+        """Forget the binding and every record reference of a partition the backend removed."""
+
+        ...
+
     def delete_record_reference(self, reference: str) -> None:
         """Drop a backend reference once its item has been deleted."""
 
@@ -74,6 +79,13 @@ class InMemoryBackendState:
         """Store or replace the binding for a partition."""
 
         self._bindings[partition] = binding
+
+    def delete_partition(self, partition: str) -> None:
+        """Drop the partition's binding and references so nothing points at a removed unit."""
+
+        self._bindings.pop(partition, None)
+        for key in [key for key in self._references if key[0] == partition]:
+            self._locations.pop(self._references.pop(key), None)
 
     def get_record_reference(self, partition: str, source_id: str, record_id: str) -> str | None:
         """Return the backend reference of a record held in a partition."""

@@ -83,6 +83,20 @@ class KnowledgeBackend(Protocol):
 
         ...
 
+    async def delete_partition(
+        self,
+        partition: AccessPartitionRef,
+        principal: PrincipalContext,
+    ) -> None:
+        """Remove a partition's isolation unit once the engine holds no records in it.
+
+        Space deletion calls this after every record's copy is gone and checked, so the unit
+        should be empty; removing it also drops derived data and read grants that lived only
+        there. A partition the backend never bound is a no-op.
+        """
+
+        ...
+
     async def grant_read(
         self,
         partition: AccessPartitionRef,

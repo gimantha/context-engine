@@ -21,7 +21,7 @@ An update succeeds only when the new version is visible and the old version is i
 
 ## Consequences
 
-The API returns an asynchronous job for destructive lifecycle work. No public delete-everything operation is provided.
+The API returns an asynchronous job for destructive lifecycle work. No public delete-everything operation is provided; the widest destructive operation is the deletion of one space (revision of 2026-10-01).
 
 ## Validation
 
@@ -58,3 +58,20 @@ Two retention items remain open. Neither is reachable through any engine read pa
 - **Provider search history.** Every provider query records the question and the passages it returned, per isolation unit, and deletion does not clear either. Question text and passages of deleted records therefore persist in the provider's relational store. The fix is either to purge the history the engine's queries create, or to call the provider's retrieval below the layer that records it. Both depend on provider internals, so the choice is open (threat model T19). Owner: Backend owner.
 
 Validation: `engine/tests/test_live_cognee_provider.py`, run with explicit model and embedding credentials, and the pinned-id, row-listing, and upload tests in `engine/tests/test_cognee_adapter.py`.
+
+## Revision (2026-10-01, space deletion)
+
+`DELETE /v1/spaces/{spaceId}` queues a `space_deletion` job for a principal with `space.manage`. The space moves to `deleting` at once, and the service refuses new deliveries, queries, enrichment, and configuration for it. The job, in `engine/src/context_engine/worker/space_deletion.py`, is idempotent at every step so a retry continues where the last attempt stopped:
+
+1. Pause every source, so no delivery lands mid-deletion.
+2. Tombstone every record at its current version on the engine's behalf, through the same ledger transition as a source's delete event (ADR 0006), keyed by the deletion job. A later resend of the same version cannot bring the record back; a strictly newer version from the source still can, which is right for a source that keeps changing after its space is gone.
+3. Converge each record with the record indexer, which removes each copy and checks its absence as for a single deletion.
+4. Drop each partition's isolation unit whole through the new port method `delete_partition`, then forget the binding and its references. This is the fallback above, applied at space scope: the unit, its graph, its vectors, and its read grants go together.
+5. For a copy that step 3 left reconcile-required or found as residue, check absence once more now that its unit is gone, and drop its row. Nothing is written or deleted blindly. A copy still searchable fails the job with `residue_found`, and the space stays in `deleting` with its rows intact; a new attempt can be queued once the cause is fixed.
+6. Delete the staged bytes, then every row of the space in one transaction: sources, records, versions, effects, partitions, bindings, read access, grants, and configuration. Jobs, outbox events, and access decisions stay as the audit trail.
+
+In ledger-only mode the job skips steps 3 to 5. The private adapter implements `delete_partition` with the provider's whole-unit removal as the unit's owner, and treats a unit the provider no longer has as removed. Physical erasure of the removed unit's bytes remains the M7 item above.
+
+Validation: `engine/tests/test_space_deletion.py` covers full deletion across two partitions with configuration, grants, staged bytes, and every control-database row checked gone; the 409s while deleting; ledger-only mode; residue keeping the space until a retry succeeds; a retryable backend failure continuing the job; and the permission rules.
+
+Live run on 2026-10-01 against the pinned provider, through `context-engine-serve` with the local profile: one record indexed into a new space, then the space deleted. The job succeeded on its first attempt. The unit's row in the provider's relational store, its vector directory, its graph file, and the record's raw data file were all removed, while the two other spaces' units stayed untouched. A byte-level scan of every provider file for the record's text found nothing, which is more than record-level deletion gives: with the unit's files gone there are no fragments or pages left to compact. What remains are two rows of the provider's run history (`pipeline_runs`) for the removed unit, whose `run_info` holds the string form of the input: `<engine record>` with the engine's record id and source id, no content. Clearing the provider's history for the engine's own runs and queries is the open T19 item, planned for M5 slice 4.
