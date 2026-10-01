@@ -52,6 +52,12 @@ class Settings:
         "application/json",
         "application/pdf",
     )
+    # Master key that encrypts literal model keys at rest (base64url, 32 bytes). Unset means
+    # the engine accepts only key references.
+    secrets_key: str = ""
+    # Where `cp:` key references are resolved; unset means such references are refused.
+    control_plane_url: str = ""
+    control_plane_token: str = ""
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -86,6 +92,9 @@ class Settings:
                 "CONTEXT_ENGINE_UPLOAD_CONTENT_TYPES",
                 ("text/plain", "text/markdown", "text/html", "application/json", "application/pdf"),
             ),
+            secrets_key=os.getenv("CONTEXT_ENGINE_SECRETS_KEY", "").strip(),
+            control_plane_url=os.getenv("CONTEXT_ENGINE_CONTROL_PLANE_URL", "").strip(),
+            control_plane_token=os.getenv("CONTEXT_ENGINE_CONTROL_PLANE_TOKEN", "").strip(),
         )
 
 

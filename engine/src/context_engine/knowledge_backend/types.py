@@ -61,6 +61,44 @@ class SourceRecord:
             _required(getattr(self, name), name)
 
 
+@dataclass(frozen=True, slots=True, repr=False)
+class ModelSettings:
+    """One model a backend call should use: provider, name, and credentials.
+
+    The key travels with the call and lives no longer than it, which is how a space's own
+    models reach the backend without the backend storing anything. It never appears in the
+    string form, so a logged or raised value cannot leak it. The provider and model names
+    are the engine's; the private adapter translates them.
+    """
+
+    provider: str
+    model: str
+    api_key: str
+    endpoint: str | None = None
+    api_version: str | None = None
+    dimensions: int | None = None
+
+    def __post_init__(self) -> None:
+        _required(self.provider, "model provider")
+        _required(self.model, "model name")
+
+    def __repr__(self) -> str:
+        return f"ModelSettings(provider={self.provider!r}, model={self.model!r})"
+
+
+@dataclass(frozen=True, slots=True)
+class ModelSelection:
+    """The models for one backend call; `None` for either means the backend's default.
+
+    Spaces configure their own language and embedding models (M5). A call without a
+    selection falls back to the engine's environment settings, so spaces configured before
+    this existed keep working.
+    """
+
+    language_model: ModelSettings | None = None
+    embedding_model: ModelSettings | None = None
+
+
 @dataclass(frozen=True, slots=True)
 class QueryRequest:
     """Bounded evidence retrieval request."""

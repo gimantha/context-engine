@@ -259,7 +259,7 @@ async def test_barrier_hides_records_the_ledger_does_not_show(tmp_path):
 class _LaggingBackend(DummyKnowledgeBackend):
     """Refuse multi-partition queries, as a backend does while one read grant is missing."""
 
-    async def query(self, request, principal, authorized_partitions):
+    async def query(self, request, principal, authorized_partitions, models=None):
         if len(authorized_partitions) > 1:
             raise BackendError(BackendErrorCode.ACCESS_DENIED, "denied")
         return await super().query(request, principal, authorized_partitions)

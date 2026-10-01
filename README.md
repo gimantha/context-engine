@@ -167,6 +167,26 @@ See [the M4 report](docs/m4/implementation-report.md) for the live verification 
 
 Interactive API documentation is available at `http://127.0.0.1:8000/docs`. Identity-provider integrations arrive in M6.
 
+### Configure a space's models
+
+Each space can run its own embedding and language models (ADR 0014). Configure them with `space.manage`; the same models drive answers, extraction, and embeddings, and a space without configuration uses the engine's environment settings:
+
+```bash
+curl -X PUT -H "Authorization: Bearer <admin token>" -H "Content-Type: application/json" \
+  -d '{"embedding": {"provider": "openai", "model": "text-embedding-3-small", "apiKeyRef": "env:OPENAI_EMBEDDING_KEY", "dimensions": 1536},
+       "llm": {"provider": "anthropic", "model": "claude-sonnet-5", "apiKey": "<key>"}}' \
+  http://127.0.0.1:8000/v1/spaces/<space id>/configuration
+curl -H "Authorization: Bearer <admin token>" http://127.0.0.1:8000/v1/spaces/<space id>/configuration
+```
+
+A key is sent once, either as `apiKeyRef`, a reference the engine resolves at call time (`env:<NAME>` from its environment, or `cp:<id>` from the control plane's secret endpoint when `CONTEXT_ENGINE_CONTROL_PLANE_URL` and `CONTEXT_ENGINE_CONTROL_PLANE_TOKEN` are set), or as `apiKey`, which the engine encrypts before storing. Literal keys need a master key in `CONTEXT_ENGINE_SECRETS_KEY`; generate one with:
+
+```bash
+uv run python -c "from context_engine.security.secrets import SecretVault; print(SecretVault.generate_setting())"
+```
+
+Reading the configuration back shows provider, model, and how each key is held, never the key. The embedding model cannot change once the space holds indexed content.
+
 ## Run the live-provider verification
 
 The live test is opt-in because it calls configured external models and writes local provider stores. Install the private provider extra, copy the example environment, and add your credentials:

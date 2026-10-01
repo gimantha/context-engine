@@ -422,6 +422,39 @@ class ContextQueryResult:
 
 
 @dataclass(frozen=True, slots=True)
+class ConfiguredModel:
+    """One model a space is configured with.
+
+    `secret` is a stored token, encrypted or a reference, never a key value: the control
+    plane holds the keys (M5 decision) and the engine reveals a token only for the duration
+    of a call. Provider and model names are the engine's public vocabulary.
+    """
+
+    provider: str
+    model: str
+    secret: str
+    endpoint: str | None = None
+    api_version: str | None = None
+    dimensions: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class SpaceConfiguration:
+    """The models a space runs with, and who set them last.
+
+    The embedding model cannot change once the space has indexed content, because the
+    stored vectors would no longer be comparable; that rule is enforced by the service.
+    """
+
+    space_id: str
+    embedding_model: ConfiguredModel | None
+    language_model: ConfiguredModel | None
+    version: int
+    updated_by: str
+    updated_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
 class ContextSpace:
     """Public context-space metadata stored by the control plane."""
 

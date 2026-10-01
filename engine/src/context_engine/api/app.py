@@ -26,7 +26,7 @@ from context_engine.application import (
     ValidationError,
     build_query_backend,
 )
-from context_engine.config import Settings
+from context_engine.config import KnowledgeBackendSettings, Settings
 from context_engine.domain import IngestionCommand, JobState, SourceState, VersionOrdering
 from context_engine.observability import (
     MetricsRegistry,
@@ -50,6 +50,7 @@ from context_engine.security.identity import (
     build_token_verifier,
     provision_static_identities,
 )
+from context_engine.security.secrets import build_secret_store
 
 from .multipart import read_ingestion_parts
 from .progress import build_progress_router
@@ -73,6 +74,8 @@ from .schemas import (
     RecordStatusResponse,
     RegisterSourceRequest,
     SourceResponse,
+    SpaceConfigurationRequest,
+    SpaceConfigurationResponse,
     SyncRunResponse,
     UpdateSourceRequest,
     UploadResponse,
@@ -162,6 +165,9 @@ def create_app(
             indexing_enabled=settings.knowledge_backend == "provider",
             knowledge_backend=backend,  # type: ignore[arg-type]
             read_access=ReadAccessRepository(database),
+            secrets=build_secret_store(
+                settings.secrets_key, settings.control_plane_url, settings.control_plane_token
+            ),
         )
 
     app = FastAPI(title="Context Engine API", version="0.4.0")
@@ -675,5 +681,58 @@ def create_app(
         service.delete_grant(principal, resource_id, grant_id)
         return Response(status_code=204)
 
+    storage = _storage_placement(settings)
+
+    @app.get(
+        "/v1/spaces/{space_id}/configuration",
+        response_model=SpaceConfigurationResponse,
+        response_model_by_alias=True,
+        response_model_exclude_none=True,
+    )
+    async def get_space_configuration(
+        space_id: ResourceId,
+        principal: AuthenticatedPrincipal = Depends(current_principal),
+    ) -> SpaceConfigurationResponse:
+        # Models and key kinds only; a key never leaves the engine.
+        return SpaceConfigurationResponse.from_view(
+            service.get_space_configuration(principal, space_id), storage
+        )
+
+    @app.put(
+        "/v1/spaces/{space_id}/configuration",
+        response_model=SpaceConfigurationResponse,
+        response_model_by_alias=True,
+        response_model_exclude_none=True,
+    )
+    async def put_space_configuration(
+        space_id: ResourceId,
+        body: SpaceConfigurationRequest,
+        principal: AuthenticatedPrincipal = Depends(current_principal),
+    ) -> SpaceConfigurationResponse:
+        view = service.put_space_configuration(
+            principal,
+            space_id,
+            body.embedding.to_input() if body.embedding else None,
+            body.llm.to_input() if body.llm else None,
+        )
+        return SpaceConfigurationResponse.from_view(view, storage)
+
     app.include_router(build_progress_router(service, current_principal))
     return app
+
+
+def _storage_placement(settings: Settings) -> dict[str, str]:
+    """Report where each kind of store runs; the control plane shows this per space.
+
+    Placement is engine-wide until per-space storage is decided, so every space reports the
+    same stores. Without a knowledge backend there is nothing to report.
+    """
+
+    if settings.knowledge_backend != "provider":
+        return {"vector": "none", "graph": "none", "relational": "none"}
+    backend = KnowledgeBackendSettings.from_env()
+    return {
+        "vector": backend.vector_store,
+        "graph": backend.graph_store,
+        "relational": backend.relational_store,
+    }

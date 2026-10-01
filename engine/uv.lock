@@ -496,6 +496,7 @@ name = "devant-context-engine"
 version = "0.0.1"
 source = { editable = "." }
 dependencies = [
+    { name = "cryptography" },
     { name = "fastapi" },
     { name = "python-multipart" },
     { name = "uvicorn" },
@@ -520,6 +521,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "cognee", marker = "extra == 'knowledge-provider'", specifier = "==1.5.4" },
+    { name = "cryptography", specifier = "==50.0.1" },
     { name = "fastapi", specifier = "==0.141.1" },
     { name = "python-multipart", specifier = "==0.0.32" },
     { name = "uvicorn", specifier = "==0.53.0" },

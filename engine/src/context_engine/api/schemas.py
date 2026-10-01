@@ -5,10 +5,12 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Annotated, Literal
 
-from pydantic import AnyUrl, BaseModel, ConfigDict, Field, model_validator
+from pydantic import AnyUrl, BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from context_engine.application.space_models import ModelInput, SpaceConfigurationView
 from context_engine.domain import (
     Action,
+    ConfiguredModel,
     ContextQueryResult,
     ContextSpace,
     Grant,
@@ -38,6 +40,140 @@ class CreateContextSpaceRequest(_ApiModel):
 
     name: Annotated[str, Field(min_length=1, max_length=120)]
     description: Annotated[str | None, Field(max_length=1000)] = None
+
+
+class ModelConfigurationRequest(_ApiModel):
+    """One model as an administrator configures it.
+
+    The key travels once, as `apiKey`, or as a reference the engine resolves at call time,
+    `apiKeyRef`; never both. A literal key is encrypted before storage, which is how a
+    standalone deployment holds keys. Neither is required when the model is unchanged, so a
+    configuration read from the engine can be sent back without knowing the key. `baseUrl`
+    and `apiVersion` are for providers that need them, such as Azure OpenAI.
+    """
+
+    provider: Annotated[str, Field(min_length=1, max_length=60)]
+    model: Annotated[str, Field(min_length=1, max_length=200)]
+    api_key: Annotated[str | None, Field(max_length=4000)] = Field(default=None, alias="apiKey")
+    api_key_ref: Annotated[str | None, Field(max_length=500)] = Field(
+        default=None, alias="apiKeyRef"
+    )
+    base_url: Annotated[AnyUrl | None, Field(max_length=2000)] = Field(
+        default=None, alias="baseUrl"
+    )
+    api_version: Annotated[str | None, Field(max_length=60)] = Field(
+        default=None, alias="apiVersion"
+    )
+    dimensions: Annotated[int | None, Field(ge=1, le=16384)] = None
+
+    @field_validator("api_key", "api_key_ref", "api_version", mode="before")
+    @classmethod
+    def blank_means_unset(cls, value: object) -> object:
+        """Treat an empty string as absent; the control plane sends one for an unset key."""
+
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
+
+    @model_validator(mode="after")
+    def validate_key(self) -> ModelConfigurationRequest:
+        """Refuse a literal key and a reference together; they would contradict each other."""
+
+        if self.api_key is not None and self.api_key_ref is not None:
+            raise ValueError("send either apiKey or apiKeyRef, not both")
+        return self
+
+    def to_input(self) -> ModelInput:
+        """Translate the request into the application's model input."""
+
+        return ModelInput(
+            provider=self.provider,
+            model=self.model,
+            api_key=self.api_key,
+            api_key_ref=self.api_key_ref,
+            endpoint=str(self.base_url) if self.base_url else None,
+            api_version=self.api_version,
+            dimensions=self.dimensions,
+        )
+
+
+class SpaceConfigurationRequest(_ApiModel):
+    """Replace a space's models.
+
+    `storage` and `sources` are accepted and ignored: the control plane sends them in the
+    same request, but storage placement waits for the topology decision and sources are
+    registered through their own route.
+    """
+
+    embedding: ModelConfigurationRequest | None = None
+    llm: ModelConfigurationRequest | None = None
+    storage: dict[str, object] | None = None
+    sources: list[object] | None = None
+
+
+class ModelSummaryResponse(_ApiModel):
+    """A configured model without its key; `keyKind` says how the key is held."""
+
+    provider: str
+    model: str
+    key_kind: str = Field(alias="keyKind")
+    base_url: str | None = Field(default=None, alias="baseUrl")
+    api_version: str | None = Field(default=None, alias="apiVersion")
+    dimensions: int | None = None
+
+    @classmethod
+    def from_domain(cls, value: ConfiguredModel, key_kind: str | None) -> ModelSummaryResponse:
+        """Translate a stored model into its public summary."""
+
+        return cls(
+            provider=value.provider,
+            model=value.model,
+            keyKind=key_kind or "unknown",
+            baseUrl=value.endpoint,
+            apiVersion=value.api_version,
+            dimensions=value.dimensions,
+        )
+
+
+class StorePlacementResponse(_ApiModel):
+    """Where one kind of store runs, as the engine reports it."""
+
+    provider: str
+
+
+class SpaceConfigurationResponse(_ApiModel):
+    """A space's models, whether its embedding is locked, and where its stores run."""
+
+    embedding: ModelSummaryResponse | None = None
+    llm: ModelSummaryResponse | None = None
+    embedding_locked: bool = Field(alias="embeddingLocked")
+    version: int | None = None
+    updated_at: datetime | None = Field(default=None, alias="updatedAt")
+    storage: dict[str, StorePlacementResponse]
+
+    @classmethod
+    def from_view(
+        cls, view: SpaceConfigurationView, storage: dict[str, str]
+    ) -> SpaceConfigurationResponse:
+        """Translate the service's view into the REST representation, keys excluded."""
+
+        configuration = view.configuration
+        return cls(
+            embedding=ModelSummaryResponse.from_domain(
+                configuration.embedding_model, view.embedding_key_kind
+            )
+            if configuration and configuration.embedding_model
+            else None,
+            llm=ModelSummaryResponse.from_domain(
+                configuration.language_model, view.language_key_kind
+            )
+            if configuration and configuration.language_model
+            else None,
+            embeddingLocked=view.embedding_locked,
+            version=configuration.version if configuration else None,
+            updatedAt=configuration.updated_at if configuration else None,
+            storage={kind: StorePlacementResponse(provider=name) for kind, name in storage.items()},
+        )
 
 
 class ContextSpaceResponse(_ApiModel):

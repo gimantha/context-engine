@@ -14,6 +14,7 @@ from uuid import uuid4
 from context_engine.domain import (
     ROOT_RESOURCE_ID,
     Action,
+    ConfiguredModel,
     ContextQueryResult,
     ContextSpace,
     Grant,
@@ -30,6 +31,7 @@ from context_engine.domain import (
     SourceCheckpoint,
     SourceProgress,
     SourceState,
+    SpaceConfiguration,
     StagedUpload,
     SyncRun,
     SyncRunState,
@@ -41,6 +43,7 @@ from context_engine.knowledge_backend import (
     BackendErrorCode,
     EvidenceItem,
     KnowledgeBackend,
+    ModelSelection,
     PrincipalContext,
     QueryRequest,
 )
@@ -49,6 +52,7 @@ from context_engine.persistence import IdempotencyConflict
 from context_engine.security.authorization import Authorizer
 from context_engine.security.identity import AuthenticatedPrincipal
 from context_engine.security.policy import PolicyInput, authorize
+from context_engine.security.secrets import SecretError, SecretStore
 
 from .errors import (
     AccessDeniedError,
@@ -67,6 +71,7 @@ from .ports import (
     StagedBytes,
     utc_now,
 )
+from .space_models import ModelInput, SpaceConfigurationView, SpaceModelResolver
 
 _MANAGE_SOURCES = frozenset({Action.SOURCE_MANAGE, Action.SPACE_MANAGE})
 _INSPECT_DELIVERIES = frozenset({Action.SOURCE_MANAGE, Action.SPACE_MANAGE, Action.INGEST_WRITE})
@@ -113,6 +118,7 @@ class ContextEngineService:
         indexing_enabled: bool = False,
         knowledge_backend: KnowledgeBackend | None = None,
         read_access: ReadAccessResync | None = None,
+        secrets: SecretStore | None = None,
     ) -> None:
         """Wire the service to its stores, authorizer, and policies.
 
@@ -120,7 +126,8 @@ class ContextEngineService:
         fakes. The knowledge backend and the indexing flag are set only in provider mode; without
         them, queries and enrichment answer unavailable instead of pretending nothing matches.
         `read_access` lets a query ask the worker to resynchronize backend read access when the
-        backend refuses a partition that engine policy allows.
+        backend refuses a partition that engine policy allows. `secrets` stores and reveals the
+        keys of a space's models; without one, only key references can be configured.
         """
 
         self._store = store
@@ -134,6 +141,8 @@ class ContextEngineService:
         self._indexing_enabled = indexing_enabled
         self._backend = knowledge_backend
         self._read_access = read_access
+        self._secrets = secrets or SecretStore(None)
+        self._models = SpaceModelResolver(store, self._secrets)
 
     # Authorization helpers
 
@@ -260,6 +269,114 @@ class ContextEngineService:
         if space is None or not self._visible(principal, space_id):
             raise NotFoundError("Context space not found")
         return space
+
+    # Space configuration
+
+    def get_space_configuration(
+        self, principal: AuthenticatedPrincipal, space_id: str
+    ) -> SpaceConfigurationView:
+        """Return a space's models and key kinds to a principal who manages it.
+
+        Keys are never returned, only whether each is encrypted or a reference. Managing the
+        space or its sources is required, because the models are configuration, not content.
+        """
+
+        self.get_context_space(principal, space_id)
+        self._require_any(principal, _MANAGE_SOURCES, space_id)
+        return self._configuration_view(space_id, self._store.get_space_configuration(space_id))
+
+    def put_space_configuration(
+        self,
+        principal: AuthenticatedPrincipal,
+        space_id: str,
+        embedding: ModelInput | None,
+        language: ModelInput | None,
+    ) -> SpaceConfigurationView:
+        """Replace a space's models for a principal holding space.manage.
+
+        The whole configuration is replaced, so the stored state is exactly what was sent.
+        Literal keys are encrypted before storage and references are kept as given: standalone
+        deployments hold encrypted keys, Devant deployments reference the control plane's (ADR
+        0014). The embedding model cannot change, be added, or be removed once the space has
+        indexed content, because the stored vectors would no longer be comparable; that waits
+        for reindexing in M7.
+        """
+
+        self.get_context_space(principal, space_id)
+        self._require(principal, Action.SPACE_MANAGE, space_id)
+        if embedding is None and language is None:
+            raise ValidationError("Configure at least one model")
+        current = self._store.get_space_configuration(space_id)
+        current_embedding = current.embedding_model if current else None
+        if self._embedding_locked(space_id) and not _same_model(current_embedding, embedding):
+            raise ConflictError(
+                "The embedding model cannot change once the space has indexed content"
+            )
+        stored = self._store.put_space_configuration(
+            space_id,
+            self._configured(embedding, current_embedding),
+            self._configured(language, current.language_model if current else None),
+            principal.principal_id,
+        )
+        self._metrics.increment("context_engine_space_configurations_changed_total")
+        return self._configuration_view(space_id, stored)
+
+    def _configured(
+        self, submitted: ModelInput | None, current: ConfiguredModel | None
+    ) -> ConfiguredModel | None:
+        """Turn a submitted model into its stored form, storing its key as a token.
+
+        A submission with neither a key nor a reference keeps the current key when the model
+        is otherwise unchanged, so an administrator can resend the configuration the `GET`
+        route showed without knowing the key.
+        """
+
+        if submitted is None:
+            return None
+        if (submitted.api_key is None) == (submitted.api_key_ref is None):
+            if (
+                submitted.api_key is None
+                and current is not None
+                and _same_model(current, submitted)
+            ):
+                return current
+            raise ValidationError("Each model needs exactly one of apiKey or apiKeyRef")
+        try:
+            secret = (
+                self._secrets.store_literal(submitted.api_key)
+                if submitted.api_key is not None
+                else self._secrets.store_reference(submitted.api_key_ref or "")
+            )
+        except SecretError as exc:
+            if exc.code == "secrets_not_configured":
+                raise ServiceUnavailableError(exc.message) from exc
+            raise ValidationError(exc.message) from exc
+        return ConfiguredModel(
+            provider=submitted.provider.strip().lower(),
+            model=submitted.model.strip(),
+            secret=secret,
+            endpoint=submitted.endpoint,
+            api_version=submitted.api_version,
+            dimensions=submitted.dimensions,
+        )
+
+    def _embedding_locked(self, space_id: str) -> bool:
+        """Whether the space holds indexed content, which fixes its embedding model."""
+
+        return bool(self._sources.indexed_partitions(space_id))
+
+    def _configuration_view(
+        self, space_id: str, configuration: SpaceConfiguration | None
+    ) -> SpaceConfigurationView:
+        def kind(model: ConfiguredModel | None) -> str | None:
+            return self._secrets.kind(model.secret) if model else None
+
+        return SpaceConfigurationView(
+            configuration,
+            self._embedding_locked(space_id),
+            kind(configuration.embedding_model if configuration else None),
+            kind(configuration.language_model if configuration else None),
+        )
 
     # Sources
 
@@ -751,7 +868,11 @@ class ContextEngineService:
             # No hint about what exists outside the caller's audiences.
             return ContextQueryResult(query_id, (), True, principal.trace_id)
         caller = PrincipalContext(principal.principal_id, principal.trace_id)
-        retrieved = await self._retrieve(QueryRequest(question, limit), caller, partitions)
+        try:
+            models = await self._models.resolve(space_id)
+        except SecretError as exc:
+            raise ServiceUnavailableError("The space's model key is not available") from exc
+        retrieved = await self._retrieve(QueryRequest(question, limit), caller, partitions, models)
         evidence = self._visible_evidence(space_id, partitions, retrieved)[:limit]
         return ContextQueryResult(query_id, evidence, not evidence, principal.trace_id)
 
@@ -792,6 +913,7 @@ class ContextEngineService:
         request: QueryRequest,
         caller: PrincipalContext,
         partitions: tuple[AccessPartitionRef, ...],
+        models: ModelSelection | None = None,
     ) -> tuple[EvidenceItem, ...]:
         """Ask the backend; if it refuses a partition the engine allows, ask one at a time.
 
@@ -803,7 +925,7 @@ class ContextEngineService:
 
         assert self._backend is not None
         try:
-            return (await self._backend.query(request, caller, partitions)).evidence
+            return (await self._backend.query(request, caller, partitions, models=models)).evidence
         except BackendError as exc:
             if exc.code not in _RETRY_ONE_BY_ONE:
                 raise ServiceUnavailableError("Context retrieval failed") from exc
@@ -815,7 +937,9 @@ class ContextEngineService:
         for partition in partitions:
             try:
                 collected.extend(
-                    (await self._backend.query(request, caller, (partition,))).evidence
+                    (
+                        await self._backend.query(request, caller, (partition,), models=models)
+                    ).evidence
                 )
             except BackendError as exc:
                 if exc.code not in _RETRY_ONE_BY_ONE:
@@ -992,3 +1116,17 @@ class ContextEngineService:
         if not self._grants.delete_grant(resource_id, grant_id):
             raise NotFoundError("Grant not found")
         self._metrics.increment("context_engine_grants_changed_total")
+
+
+def _same_model(current: ConfiguredModel | None, submitted: ModelInput | None) -> bool:
+    """Whether a submission names the model already stored, ignoring its key."""
+
+    if current is None or submitted is None:
+        return current is None and submitted is None
+    return (
+        current.provider == submitted.provider.strip().lower()
+        and current.model == submitted.model.strip()
+        and current.dimensions == submitted.dimensions
+        and (current.endpoint or None) == (submitted.endpoint or None)
+        and (current.api_version or None) == (submitted.api_version or None)
+    )

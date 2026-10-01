@@ -20,6 +20,8 @@ from context_engine.knowledge_backend import (
     BackendError,
     BackendErrorCode,
     InMemoryBackendState,
+    ModelSelection,
+    ModelSettings,
     PrincipalContext,
     QueryRequest,
     SourceRecord,
@@ -128,10 +130,24 @@ async def test_live_provider_two_audience_lifecycle(tmp_path_factory):
     beta_record = record(f"Gateway in Colombo has recovery canary {beta_canary}.")
     shared_record = record("Gateway incidents require an owner and a rollback checkpoint.")
 
+    # A space's own models travel per call (M5 slice 1); the shared record and alpha's first
+    # query use the environment's models passed explicitly, which must behave the same.
+    models = ModelSelection(
+        language_model=ModelSettings(
+            settings.model_provider, settings.model_name, settings.model_api_key
+        ),
+        embedding_model=ModelSettings(
+            settings.embedding_provider,
+            settings.embedding_model,
+            settings.embedding_api_key,
+            dimensions=settings.embedding_dimensions,
+        ),
+    )
+
     # The service identity writes everything, so it owns every isolation unit.
     alpha_result = await backend.ingest(alpha_record, service, alpha_partition)
     beta_result = await backend.ingest(beta_record, service, beta_partition)
-    shared_result = await backend.ingest(shared_record, service, shared_partition)
+    shared_result = await backend.ingest(shared_record, service, shared_partition, models=models)
 
     service_user = await resolver(service)
     alpha_user = await resolver(alpha)
@@ -152,6 +168,7 @@ async def test_live_provider_two_audience_lifecycle(tmp_path_factory):
         QueryRequest("Gateway recovery canary", limit=10),
         alpha,
         (alpha_partition, shared_partition),
+        models=models,
     )
     beta_query = await backend.query(
         QueryRequest("Gateway recovery canary", limit=10),

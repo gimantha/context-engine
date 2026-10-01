@@ -35,7 +35,7 @@ Milestone 1 has a runnable REST API and independent worker backed by a migrated 
 | `engine/src/context_engine/observability/` | Secret-safe structured logs and metrics |
 | `engine/src/context_engine/knowledge_backend/` | Engine-owned backend port and immutable types |
 | `engine/src/context_engine/knowledge_backend/providers/` | Private native-provider integration and translation |
-| `engine/src/context_engine/security/` | Token verification, grant-based authorization, policy decisions, and partition resolution |
+| `engine/src/context_engine/security/` | Token verification, grant-based authorization, policy decisions, partition resolution, and key storage by reference or encryption |
 | `engine/tests/` | Unit, adapter, contract, and live-provider tests |
 | `tests/isolation/` | Cross-audience isolation fixtures and checks |
 | `docs/decisions/` | Accepted architectural decisions |
@@ -55,6 +55,8 @@ Query rules: never return a backend passage without the ledger check in `Context
 Convergence rules: never call the backend's write, update, or delete from anywhere but `worker/indexer.py`. Record intent with `begin_location_write` before a write, confirm it after, and follow every removal or replacement with an absence check. A copy that cannot be proven written or removed becomes reconcile-required; never retry it blindly.
 
 Backend state rules: keep provider bindings, references, and identities in the control database through `BackendStateStore`; never add process-local maps for them. Write provider content only as the service principal. Never let a bound partition move to another native unit.
+
+Model and key rules: a space's models reach the backend only as a `ModelSelection` resolved just before the call; keys are stored by reference or encrypted (`security/secrets.py`), never in the clear, and never appear in logs, errors, responses, or string forms (ADR 0014).
 
 Observability rules: progress routes stay read-only and live in `api/progress.py`. They read engine state and stored snapshots only; never call the knowledge backend from a request. Keep native statuses, identifiers, and pipeline names inside the private adapter's translation.
 

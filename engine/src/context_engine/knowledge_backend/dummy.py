@@ -19,6 +19,7 @@ from .types import (
     IndexingProgress,
     IndexingProgressRequest,
     IngestionResult,
+    ModelSelection,
     PrincipalContext,
     QueryRequest,
     QueryResult,
@@ -83,6 +84,7 @@ class DummyKnowledgeBackend:
         record: SourceRecord,
         principal: PrincipalContext,
         partition: AccessPartitionRef,
+        models: ModelSelection | None = None,
     ) -> IngestionResult:
         """Store or idempotently replay a partition-scoped record."""
 
@@ -114,6 +116,7 @@ class DummyKnowledgeBackend:
         record: SourceRecord,
         principal: PrincipalContext,
         partition: AccessPartitionRef,
+        models: ModelSelection | None = None,
     ) -> IngestionResult:
         """Replace a record only with an acceptable source version."""
 
@@ -138,6 +141,7 @@ class DummyKnowledgeBackend:
         request: QueryRequest,
         principal: PrincipalContext,
         authorized_partitions: tuple[AccessPartitionRef, ...],
+        models: ModelSelection | None = None,
     ) -> QueryResult:
         """Return deterministic evidence from authorized partitions only."""
 
@@ -189,6 +193,7 @@ class DummyKnowledgeBackend:
         request: EnrichmentRequest,
         principal: PrincipalContext,
         authorized_partitions: tuple[AccessPartitionRef, ...],
+        models: ModelSelection | None = None,
     ) -> EnrichmentResult:
         """Create deterministic derived artifacts inside each partition."""
 

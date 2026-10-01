@@ -9,7 +9,16 @@ from sqlite3 import Connection, Row
 from typing import Any
 from uuid import uuid4
 
-from context_engine.domain import ContextSpace, Job, JobCounts, JobOperation, JobState, SpaceState
+from context_engine.domain import (
+    ConfiguredModel,
+    ContextSpace,
+    Job,
+    JobCounts,
+    JobOperation,
+    JobState,
+    SpaceConfiguration,
+    SpaceState,
+)
 
 from .database import ControlDatabase
 
@@ -45,6 +54,45 @@ def _space(row: Row) -> ContextSpace:
         description=row["description"],
         state=SpaceState(row["state"]),
         created_at=datetime.fromisoformat(row["created_at"]),
+        updated_at=datetime.fromisoformat(row["updated_at"]),
+    )
+
+
+def _configured_model(encoded: str | None) -> ConfiguredModel | None:
+    if not encoded:
+        return None
+    value = json.loads(encoded)
+    return ConfiguredModel(
+        provider=value["provider"],
+        model=value["model"],
+        secret=value["secret"],
+        endpoint=value.get("endpoint"),
+        api_version=value.get("apiVersion"),
+        dimensions=value.get("dimensions"),
+    )
+
+
+def _encode_model(model: ConfiguredModel | None) -> str | None:
+    if model is None:
+        return None
+    value = {
+        "provider": model.provider,
+        "model": model.model,
+        "secret": model.secret,
+        "endpoint": model.endpoint,
+        "apiVersion": model.api_version,
+        "dimensions": model.dimensions,
+    }
+    return json.dumps({k: v for k, v in value.items() if v is not None}, sort_keys=True)
+
+
+def _space_configuration(row: Row) -> SpaceConfiguration:
+    return SpaceConfiguration(
+        space_id=row["space_id"],
+        embedding_model=_configured_model(row["embedding_json"]),
+        language_model=_configured_model(row["language_json"]),
+        version=row["version"],
+        updated_by=row["updated_by"],
         updated_at=datetime.fromisoformat(row["updated_at"]),
     )
 
@@ -151,6 +199,53 @@ class ControlPlaneRepository:
                 "SELECT * FROM context_spaces WHERE id = ?", (space_id,)
             ).fetchone()
         return _space(row) if row else None
+
+    def get_space_configuration(self, space_id: str) -> SpaceConfiguration | None:
+        """Return the space's model configuration, or None before the first change."""
+
+        with self.database.connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM space_configurations WHERE space_id = ?", (space_id,)
+            ).fetchone()
+        return _space_configuration(row) if row else None
+
+    def put_space_configuration(
+        self,
+        space_id: str,
+        embedding_model: ConfiguredModel | None,
+        language_model: ConfiguredModel | None,
+        updated_by: str,
+    ) -> SpaceConfiguration:
+        """Replace the configuration in one transaction, bumping its version.
+
+        The whole row is replaced rather than patched, so the stored state is always exactly
+        what the last change said, and the version lets a later query trace tell which
+        configuration answered it.
+        """
+
+        with self.database.transaction() as connection:
+            current = connection.execute(
+                "SELECT version FROM space_configurations WHERE space_id = ?", (space_id,)
+            ).fetchone()
+            connection.execute(
+                """
+                INSERT OR REPLACE INTO space_configurations(
+                    space_id, embedding_json, language_json, version, updated_by, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    space_id,
+                    _encode_model(embedding_model),
+                    _encode_model(language_model),
+                    (current["version"] + 1) if current else 1,
+                    updated_by,
+                    _timestamp(),
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM space_configurations WHERE space_id = ?", (space_id,)
+            ).fetchone()
+        return _space_configuration(row)
 
     def enqueue_job(
         self,

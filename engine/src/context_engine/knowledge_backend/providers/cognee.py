@@ -34,6 +34,7 @@ from ..types import (
     IndexingProgress,
     IndexingProgressRequest,
     IngestionResult,
+    ModelSelection,
     PrincipalContext,
     QueryRequest,
     QueryResult,
@@ -58,16 +59,24 @@ class _CogneeRuntimePort(Protocol):
     """Private seam between engine translation and native SDK calls."""
 
     async def remember(
-        self, record: SourceRecord, binding: _CogneeBinding, user: Any
+        self,
+        record: SourceRecord,
+        binding: _CogneeBinding,
+        user: Any,
+        models: ModelSelection | None = None,
     ) -> _NativeIngestion:
-        """Invoke native ingestion and return stable native identifiers."""
+        """Invoke native ingestion with the selected models and return native identifiers."""
 
         ...
 
     async def recall(
-        self, request: QueryRequest, bindings: tuple[_CogneeBinding, ...], user: Any
+        self,
+        request: QueryRequest,
+        bindings: tuple[_CogneeBinding, ...],
+        user: Any,
+        models: ModelSelection | None = None,
     ) -> list[Any]:
-        """Invoke native retrieval within explicit bindings."""
+        """Invoke native retrieval within explicit bindings with the selected models."""
 
         ...
 
@@ -81,8 +90,10 @@ class _CogneeRuntimePort(Protocol):
 
         ...
 
-    async def improve(self, binding: _CogneeBinding, user: Any) -> Any:
-        """Invoke explicit native enrichment for one binding."""
+    async def improve(
+        self, binding: _CogneeBinding, user: Any, models: ModelSelection | None = None
+    ) -> Any:
+        """Invoke explicit native enrichment for one binding with the selected models."""
 
         ...
 
@@ -272,13 +283,16 @@ class CogneeBackend:
         record: SourceRecord,
         principal: PrincipalContext,
         partition: AccessPartitionRef,
+        models: ModelSelection | None = None,
     ) -> IngestionResult:
         """Translate and ingest one engine record in an explicit partition."""
 
         self._partitions((partition,))
         try:
             user = await self._user_resolver(principal)
-            result = await self._runtime.remember(record, self._bindings.resolve(partition), user)
+            result = await self._runtime.remember(
+                record, self._bindings.resolve(partition), user, models
+            )
             self._bindings.set_dataset_id(partition, result.dataset_id)
             reference = _native_reference(result.dataset_id, result.data_id)
             self._state.put_record_reference(
@@ -300,6 +314,7 @@ class CogneeBackend:
         request: QueryRequest,
         principal: PrincipalContext,
         authorized_partitions: tuple[AccessPartitionRef, ...],
+        models: ModelSelection | None = None,
     ) -> QueryResult:
         """Retrieve and translate evidence from authorized bindings."""
 
@@ -309,7 +324,7 @@ class CogneeBackend:
             raise BackendError(BackendErrorCode.NOT_FOUND, "Access partition is not initialized")
         try:
             user = await self._user_resolver(principal)
-            native_results = await self._runtime.recall(request, bindings, user)
+            native_results = await self._runtime.recall(request, bindings, user, models)
             units = {
                 binding.dataset_id: partition.value
                 for binding, partition in zip(bindings, authorized_partitions, strict=True)
@@ -382,6 +397,7 @@ class CogneeBackend:
         record: SourceRecord,
         principal: PrincipalContext,
         partition: AccessPartitionRef,
+        models: ModelSelection | None = None,
     ) -> IngestionResult:
         """Update a previously bound engine record."""
 
@@ -399,7 +415,7 @@ class CogneeBackend:
             user = await self._user_resolver(principal)
             # Replace rather than edit in place: the new item carries the new version in its
             # metadata, which evidence lineage and progress rely on (ADR 0007).
-            result = await self._runtime.remember(record, binding, user)
+            result = await self._runtime.remember(record, binding, user, models)
             if result.dataset_id != binding.dataset_id:
                 raise BackendError(
                     BackendErrorCode.PARTIAL_WRITE,
@@ -466,6 +482,7 @@ class CogneeBackend:
         request: EnrichmentRequest,
         principal: PrincipalContext,
         authorized_partitions: tuple[AccessPartitionRef, ...],
+        models: ModelSelection | None = None,
     ) -> EnrichmentResult:
         """Run explicit native enrichment for authorized bindings."""
 
@@ -476,7 +493,7 @@ class CogneeBackend:
         try:
             user = await self._user_resolver(principal)
             for binding in bindings:
-                await self._runtime.improve(binding, user)
+                await self._runtime.improve(binding, user, models)
             return EnrichmentResult(request.operation_id, affected_records=0)
         except BackendError:
             raise
@@ -628,7 +645,11 @@ class CogneeRuntime:
         return cognee
 
     async def remember(
-        self, record: SourceRecord, binding: _CogneeBinding, user: Any
+        self,
+        record: SourceRecord,
+        binding: _CogneeBinding,
+        user: Any,
+        models: ModelSelection | None = None,
     ) -> _NativeIngestion:
         """Create the native content item and invoke native ingestion."""
 
@@ -658,6 +679,7 @@ class CogneeRuntime:
         }
         if binding.dataset_id:
             kwargs["dataset_id"] = UUID(binding.dataset_id)
+        kwargs.update(_native_model_kwargs(models))
         result = await cognee.remember(**kwargs)
         if getattr(result, "status", None) == "errored":
             raise BackendError(BackendErrorCode.PARTIAL_WRITE, "Provider ingestion failed")
@@ -677,7 +699,11 @@ class CogneeRuntime:
         return _NativeIngestion(str(dataset_id), str(item_id), created=True)
 
     async def recall(
-        self, request: QueryRequest, bindings: tuple[_CogneeBinding, ...], user: Any
+        self,
+        request: QueryRequest,
+        bindings: tuple[_CogneeBinding, ...],
+        user: Any,
+        models: ModelSelection | None = None,
     ) -> list[Any]:
         """Invoke native retrieval with the pinned retriever and explicit binding identifiers."""
 
@@ -699,6 +725,7 @@ class CogneeRuntime:
             top_k=request.limit,
             only_context=False,
             user=user,
+            **_native_model_kwargs(models),
         )
 
     async def grant_read(self, binding: _CogneeBinding, reader: Any, owner: Any) -> None:
@@ -725,11 +752,19 @@ class CogneeRuntime:
             reader.id, [UUID(binding.dataset_id)], "read", owner.id
         )
 
-    async def improve(self, binding: _CogneeBinding, user: Any) -> Any:
-        """Invoke explicit native enrichment for one binding."""
+    async def improve(
+        self, binding: _CogneeBinding, user: Any, models: ModelSelection | None = None
+    ) -> Any:
+        """Invoke explicit native enrichment for one binding.
+
+        Enrichment takes no per-call model settings, so the selected models are applied
+        through the SDK's context variables for the duration of the call, the same mechanism
+        its pipelines use internally.
+        """
 
         cognee = await self._ready()
-        return await cognee.improve(dataset=UUID(binding.dataset_id), user=user)
+        with _native_model_context(models):
+            return await cognee.improve(dataset=UUID(binding.dataset_id), user=user)
 
     async def forget(self, binding: _CogneeBinding, data_id: str, user: Any) -> Any:
         """Invoke native deletion for one explicitly bound record."""
@@ -879,6 +914,111 @@ def _translate_error(exc: Exception) -> BackendError:
     )
 
 
+# Engine provider names to native ones. The engine's vocabulary is the control plane's; the
+# provider spells Azure OpenAI differently and infers unknown prefixes from the model name.
+_NATIVE_PROVIDERS = {
+    "openai": "openai",
+    "anthropic": "anthropic",
+    "mistral": "mistral",
+    "azure_openai": "azure",
+    "azure": "azure",
+    "gemini": "gemini",
+    "ollama": "ollama",
+}
+
+
+def _native_model_name(native_provider: str, model: str) -> str:
+    """Return the routed model name the SDK expects, `<provider>/<model>`, once."""
+
+    return model if "/" in model else f"{native_provider}/{model}"
+
+
+def _native_model_configs(models: ModelSelection | None) -> tuple[Any | None, Any | None]:
+    """Translate a selection into the SDK's language-model and embedding configurations.
+
+    Only the selected models are translated; `None` for either leaves the SDK on the
+    environment the adapter configured, which is the engine's default.
+    """
+
+    if models is None:
+        return None, None
+    language = embedding = None
+    if models.language_model is not None:
+        from cognee.infrastructure.llm.config import LLMConfig
+
+        chosen = models.language_model
+        provider = _native_provider(chosen.provider)
+        fields: dict[str, Any] = {
+            "llm_provider": provider,
+            "llm_model": _native_model_name(provider, chosen.model),
+            "llm_api_key": chosen.api_key,
+        }
+        if chosen.endpoint:
+            fields["llm_endpoint"] = chosen.endpoint
+        if chosen.api_version:
+            fields["llm_api_version"] = chosen.api_version
+        language = LLMConfig(**fields)
+    if models.embedding_model is not None:
+        from cognee.infrastructure.databases.vector.embeddings.config import EmbeddingConfig
+
+        chosen = models.embedding_model
+        provider = _native_provider(chosen.provider)
+        fields = {
+            "embedding_provider": provider,
+            "embedding_model": _native_model_name(provider, chosen.model),
+            "embedding_api_key": chosen.api_key,
+        }
+        if chosen.endpoint:
+            fields["embedding_endpoint"] = chosen.endpoint
+        if chosen.api_version:
+            fields["embedding_api_version"] = chosen.api_version
+        if chosen.dimensions:
+            fields["embedding_dimensions"] = chosen.dimensions
+        embedding = EmbeddingConfig(**fields)
+    return language, embedding
+
+
+def _native_provider(provider: str) -> str:
+    native = _NATIVE_PROVIDERS.get(provider.strip().lower())
+    if native is None:
+        raise BackendError(BackendErrorCode.UNSUPPORTED, "Model provider is not supported")
+    return native
+
+
+def _native_model_kwargs(models: ModelSelection | None) -> dict[str, Any]:
+    """Keyword arguments carrying the selected models to a native call that accepts them."""
+
+    language, embedding = _native_model_configs(models)
+    kwargs: dict[str, Any] = {}
+    if language is not None:
+        kwargs["llm_config"] = language
+    if embedding is not None:
+        kwargs["embedding_config"] = embedding
+    return kwargs
+
+
+@contextmanager
+def _native_model_context(models: ModelSelection | None) -> Iterator[None]:
+    """Apply the selected models through the SDK's context variables for one call."""
+
+    language, embedding = _native_model_configs(models)
+    if language is None and embedding is None:
+        yield
+        return
+    from cognee.context_global_variables import embedding_config, llm_config
+
+    tokens = []
+    if language is not None:
+        tokens.append((llm_config, llm_config.set(language)))
+    if embedding is not None:
+        tokens.append((embedding_config, embedding_config.set(embedding)))
+    try:
+        yield
+    finally:
+        for variable, token in reversed(tokens):
+            variable.reset(token)
+
+
 def _native_bool(value: bool) -> str:
     """Format an engine boolean for the native provider environment."""
 
@@ -964,6 +1104,8 @@ def assert_runtime_matches_pinned_sdk(runtime: CogneeRuntime | None = None) -> N
             "top_k",
             "only_context",
             "user",
+            "llm_config",
+            "embedding_config",
         },
         "forget": {"data_id", "dataset_id", "user"},
         "improve": {"dataset"},
@@ -978,6 +1120,13 @@ def assert_runtime_matches_pinned_sdk(runtime: CogneeRuntime | None = None) -> N
             raise RuntimeError(
                 f"Pinned provider {operation} signature is missing {sorted(missing)}"
             )
+    # Ingestion takes the per-call model settings through a typed keyword bundle rather than
+    # named parameters, so the bundle is what pins them.
+    from cognee.api.v1.remember.remember import RememberKwargs
+
+    bundled = set(getattr(RememberKwargs, "__annotations__", {}))
+    if not {"llm_config", "embedding_config"} <= bundled:
+        raise RuntimeError("Pinned provider ingestion no longer takes per-call model settings")
     from cognee.modules.users import methods as user_methods
     from cognee.modules.users.permissions import methods as permission_methods
 

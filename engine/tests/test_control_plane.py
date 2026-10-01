@@ -22,6 +22,7 @@ def _repository(tmp_path):
         "0005_partitions_and_backend_state",
         "0006_provider_pipeline",
         "0007_written_versions",
+        "0008_space_configurations",
     )
     assert database.migrate() == ()
     return database, ControlPlaneRepository(database)

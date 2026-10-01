@@ -22,6 +22,8 @@ from context_engine.knowledge_backend import (
     EnrichmentRequest,
     ExpectedRecord,
     IndexingProgressRequest,
+    ModelSelection,
+    ModelSettings,
     PrincipalContext,
     QueryRequest,
 )
@@ -49,7 +51,7 @@ class FakeCogneeRuntime:
         self.written = {}
         self.states = {}
 
-    async def remember(self, record, binding, user):
+    async def remember(self, record, binding, user, models=None):
         self.calls.append(("remember", record, binding, user))
         native_id = binding.dataset_id or str(uuid5(NAMESPACE_URL, binding.dataset_name))
         self.items.setdefault(native_id, []).append(
@@ -85,7 +87,7 @@ class FakeCogneeRuntime:
             if item.dataset_id in self.states
         }
 
-    async def recall(self, request, bindings, user):
+    async def recall(self, request, bindings, user, models=None):
         self.calls.append(("recall", request, bindings, user))
         # The live-verified shape of the pinned chunk retriever: one entry per chunk.
         return [
@@ -106,7 +108,7 @@ class FakeCogneeRuntime:
     async def update(self, record, binding, data_id, user):
         self.calls.append(("update", record, binding, data_id, user))
 
-    async def improve(self, binding, user):
+    async def improve(self, binding, user, models=None):
         self.calls.append(("improve", binding, user))
 
     async def forget(self, binding, data_id, user):
@@ -302,7 +304,7 @@ async def test_adapter_attributes_native_processing_state_to_source_records(reco
 class _VersionedItemRuntime(FakeCogneeRuntime):
     """Give every version its own native item, as the real provider does for new content."""
 
-    async def remember(self, record, binding, user):
+    async def remember(self, record, binding, user, models=None):
         result = await super().remember(record, binding, user)
         item_id = str(uuid5(NAMESPACE_URL, f"{result.data_id}:{record.version}"))
         return _NativeIngestion(result.dataset_id, item_id, True)
@@ -355,7 +357,7 @@ class _StructuredRuntime(FakeCogneeRuntime):
         super().__init__()
         self.entries = []
 
-    async def recall(self, request, bindings, user):
+    async def recall(self, request, bindings, user, models=None):
         self.calls.append(("recall", request, bindings, user))
         return self.entries
 
@@ -540,3 +542,130 @@ def test_runtime_refuses_a_second_storage_root_in_one_process(monkeypatch, tmp_p
     with pytest.raises(BackendError) as refused:
         runtime._module()
     assert refused.value.code == BackendErrorCode.UNSUPPORTED
+
+
+def _fake_model_modules(monkeypatch, fake):
+    """Register the provider's configuration classes as simple recorders."""
+
+    class _Config:
+        def __init__(self, **fields):
+            self.__dict__.update(fields)
+
+    for name in (
+        "cognee",
+        "cognee.infrastructure",
+        "cognee.infrastructure.llm",
+        "cognee.infrastructure.databases",
+        "cognee.infrastructure.databases.vector",
+        "cognee.infrastructure.databases.vector.embeddings",
+        "cognee.tasks",
+        "cognee.tasks.ingestion",
+    ):
+        monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
+    llm_config = types.ModuleType("cognee.infrastructure.llm.config")
+    llm_config.LLMConfig = _Config
+    monkeypatch.setitem(sys.modules, "cognee.infrastructure.llm.config", llm_config)
+    embedding_config = types.ModuleType("cognee.infrastructure.databases.vector.embeddings.config")
+    embedding_config.EmbeddingConfig = _Config
+    monkeypatch.setitem(
+        sys.modules, "cognee.infrastructure.databases.vector.embeddings.config", embedding_config
+    )
+    data_item = types.ModuleType("cognee.tasks.ingestion.data_item")
+
+    @dataclass
+    class DataItem:
+        data: object
+        data_id: object = None
+        label: object = None
+        external_metadata: object = None
+
+    data_item.DataItem = DataItem
+    monkeypatch.setitem(sys.modules, "cognee.tasks.ingestion.data_item", data_item)
+    monkeypatch.setitem(sys.modules, "cognee", fake)
+
+
+@pytest.mark.asyncio
+async def test_runtime_translates_the_selected_models(monkeypatch, record_factory):
+    captured = {}
+
+    async def remember(**kwargs):
+        captured.update(kwargs)
+        item_id = kwargs["data"].data_id
+        return types.SimpleNamespace(
+            status="completed", dataset_id=str(uuid4()), items=[{"id": str(item_id)}]
+        )
+
+    fake = types.ModuleType("cognee")
+    fake.remember = remember
+    _fake_model_modules(monkeypatch, fake)
+    runtime = CogneeRuntime(KnowledgeBackendSettings())
+    monkeypatch.setattr(runtime, "_module", lambda: fake)
+    monkeypatch.setattr(runtime, "_prepared", True)
+    models = ModelSelection(
+        language_model=ModelSettings(
+            "azure_openai",
+            "gpt-5-mini",
+            "sk-language",
+            endpoint="https://example.openai.azure.com",
+            api_version="2025-04-01-preview",
+        ),
+        embedding_model=ModelSettings(
+            "openai", "text-embedding-3-small", "sk-embed", dimensions=1536
+        ),
+    )
+
+    await runtime.remember(
+        record_factory("doc", "1", "text"), _CogneeBinding("n"), object(), models
+    )
+
+    language = captured["llm_config"]
+    assert (language.llm_provider, language.llm_model) == ("azure", "azure/gpt-5-mini")
+    assert language.llm_api_key == "sk-language"
+    assert language.llm_endpoint == "https://example.openai.azure.com"
+    assert language.llm_api_version == "2025-04-01-preview"
+    embedding = captured["embedding_config"]
+    assert embedding.embedding_model == "openai/text-embedding-3-small"
+    assert embedding.embedding_dimensions == 1536 and embedding.embedding_api_key == "sk-embed"
+
+    captured.clear()
+    await runtime.remember(record_factory("doc", "2", "text"), _CogneeBinding("n"), object(), None)
+    assert "llm_config" not in captured and "embedding_config" not in captured
+
+    with pytest.raises(BackendError) as unsupported:
+        await runtime.remember(
+            record_factory("doc", "3", "text"),
+            _CogneeBinding("n"),
+            object(),
+            ModelSelection(language_model=ModelSettings("mystery", "m", "k")),
+        )
+    assert unsupported.value.code == BackendErrorCode.UNSUPPORTED
+
+
+@pytest.mark.asyncio
+async def test_enrichment_applies_the_models_through_context_variables(monkeypatch):
+    from contextvars import ContextVar
+
+    observed = {}
+    variables = types.ModuleType("cognee.context_global_variables")
+    variables.llm_config = ContextVar("llm_config", default=None)
+    variables.embedding_config = ContextVar("embedding_config", default=None)
+
+    async def improve(**kwargs):
+        observed["during"] = (variables.llm_config.get(), variables.embedding_config.get())
+        return {"status": "ok"}
+
+    fake = types.ModuleType("cognee")
+    fake.improve = improve
+    _fake_model_modules(monkeypatch, fake)
+    monkeypatch.setitem(sys.modules, "cognee.context_global_variables", variables)
+    runtime = CogneeRuntime(KnowledgeBackendSettings())
+    monkeypatch.setattr(runtime, "_module", lambda: fake)
+    monkeypatch.setattr(runtime, "_prepared", True)
+    models = ModelSelection(language_model=ModelSettings("mistral", "mistral-large", "sk-m"))
+
+    await runtime.improve(_CogneeBinding("n", str(uuid4())), object(), models)
+
+    language, embedding = observed["during"]
+    assert language.llm_model == "mistral/mistral-large" and embedding is None
+    # The variables are reset once the call returns, so nothing leaks into the next call.
+    assert variables.llm_config.get() is None and variables.embedding_config.get() is None

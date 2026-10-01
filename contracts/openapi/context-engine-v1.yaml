@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Context Engine API
-  version: 0.8.0
+  version: 0.9.0
   description: Provider-neutral API draft for governed context spaces.
 servers:
   - url: /v1
@@ -71,6 +71,61 @@ paths:
       responses:
         "202":
           $ref: "#/components/responses/JobAccepted"
+  /spaces/{spaceId}/configuration:
+    parameters:
+      - $ref: "#/components/parameters/SpaceId"
+    get:
+      operationId: getSpaceConfiguration
+      description: >-
+        The space's embedding and language models without their keys, whether the embedding
+        model is locked because the space holds indexed content, and where the engine's
+        stores run. Requires source.manage or space.manage on the space.
+      responses:
+        "200":
+          description: Space configuration
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SpaceConfiguration"
+        "401":
+          $ref: "#/components/responses/Error"
+        "403":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
+    put:
+      operationId: putSpaceConfiguration
+      description: >-
+        Replace the space's models. Each key is sent once as apiKey, which the engine encrypts
+        before storing, or as apiKeyRef, a reference the engine resolves at call time from
+        the control plane or its environment; a model resent without either keeps its key.
+        The space's models drive answers, extraction, and embeddings. The embedding model
+        cannot change once the space holds indexed content. Requires space.manage.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SpaceConfigurationUpdate"
+      responses:
+        "200":
+          description: Updated configuration
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SpaceConfiguration"
+        "400":
+          $ref: "#/components/responses/Error"
+        "401":
+          $ref: "#/components/responses/Error"
+        "403":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
+        "409":
+          $ref: "#/components/responses/Error"
+        "503":
+          $ref: "#/components/responses/Error"
   /spaces/{spaceId}/sources:
     parameters:
       - $ref: "#/components/parameters/SpaceId"
@@ -826,6 +881,94 @@ components:
       type: string
       minLength: 1
       maxLength: 200
+    ModelConfiguration:
+      type: object
+      additionalProperties: false
+      required: [provider, model]
+      properties:
+        provider:
+          type: string
+          enum: [openai, anthropic, azure_openai, mistral]
+        model:
+          type: string
+          maxLength: 200
+        apiKey:
+          type: string
+          maxLength: 4000
+          description: A literal key, encrypted by the engine before storage. Standalone deployments hold keys this way; under the control plane, prefer apiKeyRef.
+        apiKeyRef:
+          type: string
+          maxLength: 500
+          description: A reference such as cp:<id> or env:<NAME>, resolved at call time.
+        baseUrl:
+          type: string
+          format: uri
+        apiVersion:
+          type: string
+        dimensions:
+          type: integer
+          minimum: 1
+    SpaceConfigurationUpdate:
+      type: object
+      additionalProperties: false
+      properties:
+        embedding:
+          $ref: "#/components/schemas/ModelConfiguration"
+        llm:
+          $ref: "#/components/schemas/ModelConfiguration"
+        storage:
+          type: object
+          description: Accepted and ignored until per-space storage is decided.
+        sources:
+          type: array
+          description: Accepted and ignored; sources are registered through their own route.
+          items:
+            type: object
+    ModelSummary:
+      type: object
+      additionalProperties: false
+      required: [provider, model, keyKind]
+      properties:
+        provider:
+          type: string
+        model:
+          type: string
+        keyKind:
+          type: string
+          enum: [encrypted, reference, unknown]
+        baseUrl:
+          type: string
+        apiVersion:
+          type: string
+        dimensions:
+          type: integer
+    StorePlacement:
+      type: object
+      additionalProperties: false
+      required: [provider]
+      properties:
+        provider:
+          type: string
+    SpaceConfiguration:
+      type: object
+      additionalProperties: false
+      required: [embeddingLocked, storage]
+      properties:
+        embedding:
+          $ref: "#/components/schemas/ModelSummary"
+        llm:
+          $ref: "#/components/schemas/ModelSummary"
+        embeddingLocked:
+          type: boolean
+        version:
+          type: integer
+        updatedAt:
+          type: string
+          format: date-time
+        storage:
+          type: object
+          additionalProperties:
+            $ref: "#/components/schemas/StorePlacement"
     ContextSpace:
       type: object
       additionalProperties: false

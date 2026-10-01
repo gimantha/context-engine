@@ -1,0 +1,15 @@
+{
+  "embedding": {
+    "provider": "openai",
+    "model": "text-embedding-3-small",
+    "apiKeyRef": "cp:secret-01J8M0EMBED",
+    "dimensions": 1536
+  },
+  "llm": {
+    "provider": "azure_openai",
+    "model": "gpt-5-mini",
+    "apiKeyRef": "cp:secret-01J8M0LLM",
+    "baseUrl": "https://example.openai.azure.com",
+    "apiVersion": "2025-04-01-preview"
+  }
+}

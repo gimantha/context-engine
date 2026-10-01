@@ -8,6 +8,7 @@ from typing import Any, Protocol
 from context_engine.domain import (
     AccessPartition,
     Action,
+    ConfiguredModel,
     ContextSpace,
     Grant,
     IndexingSnapshot,
@@ -22,6 +23,7 @@ from context_engine.domain import (
     Source,
     SourceCheckpoint,
     SourceState,
+    SpaceConfiguration,
     StagedUpload,
     SyncRun,
     VersionOrdering,
@@ -43,6 +45,22 @@ class ControlPlaneStore(Protocol):
 
     def get_space(self, space_id: str) -> ContextSpace | None:
         """Return one context space when it exists."""
+
+        ...
+
+    def get_space_configuration(self, space_id: str) -> SpaceConfiguration | None:
+        """Return the space's model configuration when one has been set."""
+
+        ...
+
+    def put_space_configuration(
+        self,
+        space_id: str,
+        embedding_model: ConfiguredModel | None,
+        language_model: ConfiguredModel | None,
+        updated_by: str,
+    ) -> SpaceConfiguration:
+        """Replace the space's model configuration and record who changed it."""
 
         ...
 

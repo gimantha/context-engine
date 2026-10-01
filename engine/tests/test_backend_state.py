@@ -89,7 +89,7 @@ async def test_adapter_bindings_and_references_survive_a_restart(tmp_path, recor
 
 
 class _RebindingRuntime(FakeCogneeRuntime):
-    async def remember(self, record, binding, user):
+    async def remember(self, record, binding, user, models=None):
         result = await super().remember(record, binding, user)
         return _NativeIngestion(str(uuid4()), result.data_id, True)
 

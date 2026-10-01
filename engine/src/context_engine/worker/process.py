@@ -8,6 +8,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from uuid import uuid4
 
+from context_engine.application.space_models import SpaceModelResolver
 from context_engine.config import KnowledgeBackendSettings, Settings
 from context_engine.domain import JobOperation
 from context_engine.knowledge_backend import KnowledgeBackend
@@ -24,6 +25,7 @@ from context_engine.persistence import (
 )
 from context_engine.security.authorization import Authorizer
 from context_engine.security.identity import build_token_verifier
+from context_engine.security.secrets import build_secret_store
 
 from .enrichment import EnrichmentJobHandler
 from .handler import JobHandler, LifecycleJobHandler, OperationDispatcher
@@ -73,6 +75,13 @@ def build_worker_runtime(
     if settings.knowledge_backend == "provider":
         backend_settings = KnowledgeBackendSettings.from_env()
         backend = build_knowledge_backend(backend_settings, SqliteBackendState(database))
+        # Each space's own models, with keys revealed per call from the secret store.
+        models_for = SpaceModelResolver(
+            repository,
+            build_secret_store(
+                settings.secrets_key, settings.control_plane_url, settings.control_plane_token
+            ),
+        ).resolve
         read_access = ReadAccessSynchronizer(
             authorization,
             sources,
@@ -89,12 +98,13 @@ def build_worker_runtime(
             backend_settings.service_principal_id,
             metrics,
             on_partition_bound=read_access.sync_partition,
+            models_for=models_for,
         )
         collector = IndexingCollector(
             sources, backend, backend_settings.service_principal_id, metrics
         )
         enrichment = EnrichmentJobHandler(
-            sources, backend, backend_settings.service_principal_id, metrics
+            sources, backend, backend_settings.service_principal_id, metrics, models_for=models_for
         )
     lifecycle = LifecycleJobHandler(sources, indexer=indexer, staging=staging)
     handlers: dict[JobOperation, JobHandler] = {

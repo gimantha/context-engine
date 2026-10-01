@@ -14,6 +14,7 @@ from .types import (
     IndexingProgress,
     IndexingProgressRequest,
     IngestionResult,
+    ModelSelection,
     PrincipalContext,
     QueryRequest,
     QueryResult,
@@ -29,6 +30,7 @@ class KnowledgeBackend(Protocol):
         record: SourceRecord,
         principal: PrincipalContext,
         partition: AccessPartitionRef,
+        models: ModelSelection | None = None,
     ) -> IngestionResult:
         """Store a new source record in one explicit access partition."""
 
@@ -39,6 +41,7 @@ class KnowledgeBackend(Protocol):
         request: QueryRequest,
         principal: PrincipalContext,
         authorized_partitions: tuple[AccessPartitionRef, ...],
+        models: ModelSelection | None = None,
     ) -> QueryResult:
         """Retrieve evidence from explicitly authorized partitions."""
 
@@ -49,6 +52,7 @@ class KnowledgeBackend(Protocol):
         record: SourceRecord,
         principal: PrincipalContext,
         partition: AccessPartitionRef,
+        models: ModelSelection | None = None,
     ) -> IngestionResult:
         """Replace an existing source record in its access partition.
 
@@ -63,6 +67,7 @@ class KnowledgeBackend(Protocol):
         request: EnrichmentRequest,
         principal: PrincipalContext,
         authorized_partitions: tuple[AccessPartitionRef, ...],
+        models: ModelSelection | None = None,
     ) -> EnrichmentResult:
         """Run explicit enrichment within authorized partitions."""
 

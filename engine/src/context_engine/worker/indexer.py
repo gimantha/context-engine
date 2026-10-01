@@ -30,6 +30,7 @@ from context_engine.knowledge_backend import (
     ExpectedRecord,
     IndexingProgressRequest,
     KnowledgeBackend,
+    ModelSelection,
     PrincipalContext,
     SourceRecord,
 )
@@ -41,6 +42,8 @@ from .handler import TerminalJobError
 logger = get_logger(__name__)
 
 PartitionBound = Callable[[str, str], Awaitable[object]]
+# Resolves the models a space is configured with, keys included, for one backend call.
+ModelsFor = Callable[[str], Awaitable[ModelSelection | None]]
 
 
 class _Failure(Exception):
@@ -64,6 +67,7 @@ class RecordIndexer:
         service_principal_id: str,
         metrics: MetricsRegistry,
         on_partition_bound: PartitionBound | None = None,
+        models_for: ModelsFor | None = None,
     ) -> None:
         self._sources = sources
         self._backend = backend
@@ -71,6 +75,8 @@ class RecordIndexer:
         self._service_principal_id = service_principal_id
         self._metrics = metrics
         self._on_partition_bound = on_partition_bound
+        # Resolves a space's configured models for each write; None keeps the backend default.
+        self._models_for = models_for
 
     async def converge(self, source: Source, source_record_id: str, trace_id: str) -> IndexState:
         """Bring one record's backend copies in line with the ledger and return its state.
@@ -224,11 +230,17 @@ class RecordIndexer:
             partition_id,
             record.current_version,
         )
+        # The space's models are revealed just before the write and live only for the call.
+        models = await self._models_for(source.space_id) if self._models_for else None
         try:
             if replacing:
-                result = await self._backend.update(backend_record, principal, partition)
+                result = await self._backend.update(
+                    backend_record, principal, partition, models=models
+                )
             else:
-                result = await self._backend.ingest(backend_record, principal, partition)
+                result = await self._backend.ingest(
+                    backend_record, principal, partition, models=models
+                )
         except BackendError as exc:
             self._handle_write_error(source, record, partition_id, exc)
             raise

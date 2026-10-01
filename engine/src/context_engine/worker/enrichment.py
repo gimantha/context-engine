@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 from context_engine.domain import Job
@@ -10,6 +11,7 @@ from context_engine.knowledge_backend import (
     BackendError,
     EnrichmentRequest,
     KnowledgeBackend,
+    ModelSelection,
     PrincipalContext,
 )
 from context_engine.observability import MetricsRegistry
@@ -27,11 +29,14 @@ class EnrichmentJobHandler:
         backend: KnowledgeBackend,
         service_principal_id: str,
         metrics: MetricsRegistry,
+        models_for: Callable[[str], Awaitable[ModelSelection | None]] | None = None,
     ) -> None:
         self._sources = sources
         self._backend = backend
         self._service_principal_id = service_principal_id
         self._metrics = metrics
+        # Resolves the space's configured models for the job; None keeps the backend default.
+        self._models_for = models_for
 
     async def handle(self, job: Job) -> dict[str, Any]:
         """Enrich every partition that holds content and return what was produced.
@@ -51,12 +56,13 @@ class EnrichmentJobHandler:
             if item.id in indexed
         ]
         principal = PrincipalContext(self._service_principal_id, job.trace_id)
+        models = await self._models_for(space_id) if self._models_for else None
         affected = 0
         artifacts = 0
         for partition in partitions:
             try:
                 result = await self._backend.enrich(
-                    EnrichmentRequest(job.id, version), principal, (partition,)
+                    EnrichmentRequest(job.id, version), principal, (partition,), models=models
                 )
             except BackendError as exc:
                 if exc.retryable:
