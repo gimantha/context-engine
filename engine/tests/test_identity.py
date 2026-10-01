@@ -109,6 +109,7 @@ def test_build_token_verifier_rejects_unknown_modes(tmp_path):
         database_path=tmp_path / "control.db",
         migrations_path=MIGRATIONS,
         static_tokens_path=tmp_path / "tokens.json",
+        staging_path=tmp_path / "staging",
     )
     assert build_token_verifier(settings).identities == ()
     with pytest.raises(RuntimeError):

@@ -52,10 +52,13 @@ def _tokens(tmp_path: Path, member_groups: tuple[str, ...] = ("readers",)) -> Pa
 
 
 def _settings(tmp_path: Path, tokens: Path) -> Settings:
+    # Every path stays under tmp_path: the defaults are relative to the working directory,
+    # which from engine/ is a developer's real local engine.
     return Settings(
         database_path=tmp_path / "control.db",
         migrations_path=MIGRATIONS,
         static_tokens_path=tokens,
+        staging_path=tmp_path / "staging",
     )
 
 
