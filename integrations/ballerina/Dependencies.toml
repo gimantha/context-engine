@@ -131,6 +131,9 @@ dependencies = [
 	{org = "ballerina", name = "log"},
 	{org = "ballerina", name = "time"}
 ]
+modules = [
+	{org = "ballerina", packageName = "jwt", moduleName = "jwt"}
+]
 
 [[package]]
 org = "ballerina"
@@ -354,6 +357,9 @@ version = "2.6.2"
 dependencies = [
 	{org = "ballerina", name = "jballerina.java"}
 ]
+modules = [
+	{org = "ballerina", packageName = "url", moduleName = "url"}
+]
 
 [[package]]
 org = "ballerina"
@@ -376,6 +382,33 @@ dependencies = [
 ]
 modules = [
 	{org = "ballerinai", packageName = "observe", moduleName = "observe"}
+]
+
+[[package]]
+org = "ballerinax"
+name = "client.config"
+version = "1.0.1"
+dependencies = [
+	{org = "ballerina", name = "http"},
+	{org = "ballerina", name = "oauth2"}
+]
+
+[[package]]
+org = "ballerinax"
+name = "googleapis.drive"
+version = "3.5.0"
+dependencies = [
+	{org = "ballerina", name = "file"},
+	{org = "ballerina", name = "http"},
+	{org = "ballerina", name = "io"},
+	{org = "ballerina", name = "log"},
+	{org = "ballerina", name = "os"},
+	{org = "ballerina", name = "url"},
+	{org = "ballerinai", name = "observe"},
+	{org = "ballerinax", name = "client.config"}
+]
+modules = [
+	{org = "ballerinax", packageName = "googleapis.drive", moduleName = "googleapis.drive"}
 ]
 
 [[package]]
@@ -419,6 +452,7 @@ version = "0.1.0"
 dependencies = [
 	{org = "ballerina", name = "crypto"},
 	{org = "ballerina", name = "http"},
+	{org = "ballerina", name = "jwt"},
 	{org = "ballerina", name = "lang.regexp"},
 	{org = "ballerina", name = "lang.runtime"},
 	{org = "ballerina", name = "log"},
@@ -428,13 +462,16 @@ dependencies = [
 	{org = "ballerina", name = "task"},
 	{org = "ballerina", name = "test"},
 	{org = "ballerina", name = "time"},
+	{org = "ballerina", name = "url"},
 	{org = "ballerinai", name = "observe"},
+	{org = "ballerinax", name = "googleapis.drive"},
 	{org = "ballerinax", name = "salesforce"}
 ]
 modules = [
 	{org = "wso2", packageName = "context_engine_connectors", moduleName = "context_engine_connectors"},
 	{org = "wso2", packageName = "context_engine_connectors", moduleName = "context_engine_connectors.core"},
 	{org = "wso2", packageName = "context_engine_connectors", moduleName = "context_engine_connectors.file_source"},
+	{org = "wso2", packageName = "context_engine_connectors", moduleName = "context_engine_connectors.google_drive"},
 	{org = "wso2", packageName = "context_engine_connectors", moduleName = "context_engine_connectors.manager"},
 	{org = "wso2", packageName = "context_engine_connectors", moduleName = "context_engine_connectors.salesforce"}
 ]

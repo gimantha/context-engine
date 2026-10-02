@@ -4,8 +4,6 @@
 // by a backfill poll and by a change-triggered re-fetch must be byte-identical, so the
 // second delivery is a clean replay rather than a conflict.
 
-import ballerina/time;
-
 import ballerinax/salesforce;
 
 import context_engine_connectors.core;
@@ -86,16 +84,10 @@ isolated function toRfc3339(string datetime) returns string {
     return datetime;
 }
 
-// A Salesforce datetime as milliseconds since the epoch.
+// A Salesforce datetime as milliseconds since the epoch, normalizing the REST "+0000" form to
+// the RFC 3339 "Z" form first. The conversion itself is the shared core utility.
 isolated function epochMillis(string datetime) returns int|error {
-    time:Utc utc = check time:utcFromString(toRfc3339(datetime));
-    return utc[0] * 1000 + <int>(utc[1] * 1000d).floor();
-}
-
-// Epoch milliseconds as an RFC 3339 timestamp.
-isolated function millisToRfc3339(int millis) returns string {
-    time:Utc utc = [millis / 1000, <decimal>(millis % 1000) / 1000d];
-    return time:utcToString(utc);
+    return core:epochMillis(toRfc3339(datetime));
 }
 
 // Salesforce record ids are 15 or 18 letters and digits. Ids are checked before they are

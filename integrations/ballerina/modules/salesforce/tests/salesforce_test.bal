@@ -10,7 +10,7 @@ import context_engine_connectors.core;
 @test:Config {}
 function versionsAreEpochMillisOnOneAxis() returns error? {
     test:assertEquals(check epochMillis("2026-09-25T10:00:00.123+0000"), 1790330400123);
-    test:assertEquals(millisToRfc3339(1790330400123), "2026-09-25T10:00:00.123Z");
+    test:assertEquals(core:millisToRfc3339(1790330400123), "2026-09-25T10:00:00.123Z");
     // A delete committed after the last modification orders after it numerically.
     int modified = check epochMillis("2026-09-25T10:00:00.123+0000");
     int deleted = check epochMillis("2026-09-25T10:00:05.000+0000");
