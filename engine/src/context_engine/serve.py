@@ -17,6 +17,7 @@ from fastapi import FastAPI
 
 from context_engine.api import create_app
 from context_engine.api.main import refuse_static_auth_off_loopback
+from context_engine.application import build_answer_generator
 from context_engine.config import Settings
 from context_engine.observability import MetricsRegistry, configure_logging, get_logger, log_event
 from context_engine.persistence import ControlDatabase
@@ -117,6 +118,8 @@ def create_serve_app(settings: Settings | None = None) -> FastAPI:
         metrics=metrics,
         knowledge_backend=runtime.backend,
         readiness_checks=(background.healthy,),
+        # Built from the same environment settings as the worker's backend.
+        answer_generator=build_answer_generator(settings),
     )
     serving = app.router.lifespan_context
 

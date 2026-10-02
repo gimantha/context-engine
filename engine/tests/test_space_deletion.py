@@ -167,6 +167,7 @@ class _DeletionStack(_Stack):
             ).fetchone()[0]
             # Each test database holds one space, so every link belongs to it.
             count += connection.execute("SELECT COUNT(*) FROM query_evidence").fetchone()[0]
+            count += connection.execute("SELECT COUNT(*) FROM query_answers").fetchone()[0]
             return count
         finally:
             connection.close()
@@ -201,6 +202,8 @@ async def test_deleting_a_space_removes_content_rows_bytes_and_grants(tmp_path, 
         assert stack.rows(space, source) > 0 and stack.staged_files()
         found = stack.query(MEMBER, space, "rollback")
         assert found.status_code == 200 and found.json()["evidence"], found.text
+        answered = stack.query(MEMBER, space, "rollback", mode="answer")
+        assert answered.status_code == 200 and answered.json()["answer"], answered.text
 
         accepted = stack.delete_space(space)
         assert accepted.status_code == 202, accepted.text

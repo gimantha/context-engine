@@ -17,6 +17,7 @@ import pytest
 from context_engine.config import KnowledgeBackendSettings
 from context_engine.knowledge_backend import (
     AccessPartitionRef,
+    AnswerRequest,
     BackendError,
     BackendErrorCode,
     EnrichmentRequest,
@@ -28,6 +29,7 @@ from context_engine.knowledge_backend import (
     QueryRequest,
 )
 from context_engine.knowledge_backend.providers.cognee import (
+    CogneeAnswerWriter,
     CogneeBackend,
     CogneeRuntime,
     _apply_native_environment,
@@ -672,3 +674,61 @@ async def test_enrichment_applies_the_models_through_context_variables(monkeypat
     assert language.llm_model == "mistral/mistral-large" and embedding is None
     # The variables are reset once the call returns, so nothing leaks into the next call.
     assert variables.llm_config.get() is None and variables.embedding_config.get() is None
+
+
+@pytest.mark.asyncio
+async def test_answers_use_the_bare_model_client_with_the_space_model(monkeypatch):
+    from contextvars import ContextVar
+
+    observed = {}
+    variables = types.ModuleType("cognee.context_global_variables")
+    variables.llm_config = ContextVar("llm_config", default=None)
+    variables.embedding_config = ContextVar("embedding_config", default=None)
+    gateway = types.ModuleType("cognee.infrastructure.llm.LLMGateway")
+
+    class LLMGateway:
+        @staticmethod
+        async def acreate_structured_output(text_input, system_prompt, response_model, **kwargs):
+            observed.update(
+                prompt=text_input,
+                instructions=system_prompt,
+                reply_type=response_model,
+                language=variables.llm_config.get(),
+            )
+            return "The checkpoint comes first [1]."
+
+    gateway.LLMGateway = LLMGateway
+    fake = types.ModuleType("cognee")
+    _fake_model_modules(monkeypatch, fake)
+    monkeypatch.setitem(sys.modules, "cognee.context_global_variables", variables)
+    monkeypatch.setitem(sys.modules, "cognee.infrastructure.llm.LLMGateway", gateway)
+    runtime = CogneeRuntime(KnowledgeBackendSettings())
+    monkeypatch.setattr(runtime, "_module", lambda: fake)
+    models = ModelSelection(language_model=ModelSettings("anthropic", "claude-sonnet-5", "sk-a"))
+
+    reply = await CogneeAnswerWriter(runtime).write(
+        AnswerRequest("q", ("passage",), "the instructions", "the prompt"), models
+    )
+
+    assert reply == "The checkpoint comes first [1]."
+    # The engine's prompt goes to the bare client as plain text; nothing retrieves here.
+    assert (observed["prompt"], observed["instructions"]) == ("the prompt", "the instructions")
+    assert observed["reply_type"] is str
+    assert observed["language"].llm_model == "anthropic/claude-sonnet-5"
+    assert variables.llm_config.get() is None, "the space's model does not outlive the call"
+
+
+@pytest.mark.asyncio
+async def test_answer_errors_never_carry_the_prompt():
+    class _Runtime:
+        async def write_answer(self, instructions, prompt, models=None):
+            # The provider's content-policy error quotes the whole input.
+            raise RuntimeError(f"input not aligned with policy: {prompt}")
+
+    with pytest.raises(BackendError) as error:
+        await CogneeAnswerWriter(_Runtime()).write(
+            AnswerRequest("q", ("secret passage",), "i", "secret passage in the prompt")
+        )
+
+    assert "secret" not in str(error.value) and "secret" not in repr(error.value)
+    assert error.value.__cause__ is None and error.value.__suppress_context__

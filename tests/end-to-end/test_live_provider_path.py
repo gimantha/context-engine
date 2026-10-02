@@ -9,6 +9,7 @@ README.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import replace
 from itertools import count
 from pathlib import Path
@@ -20,7 +21,7 @@ import pytest
 from context_engine.api import create_app
 from context_engine.config import KnowledgeBackendSettings, Settings
 from context_engine.domain import JobOperation
-from context_engine.knowledge_backend.factory import build_knowledge_backend
+from context_engine.knowledge_backend.factory import build_answer_writer, build_knowledge_backend
 from context_engine.observability import MetricsRegistry
 from context_engine.persistence import (
     AuthorizationRepository,
@@ -154,7 +155,11 @@ class _Engine:
             JobAuthorizer(Authorizer(authorization, metrics), authorization, verifier),
             lease_seconds=600,
         )
-        self.app = create_app(self.settings, knowledge_backend=backend)
+        self.app = create_app(
+            self.settings,
+            knowledge_backend=backend,
+            answer_generator=build_answer_writer(backend_settings),
+        )
         self.client = httpx.AsyncClient(
             transport=httpx.ASGITransport(app=self.app), base_url="http://engine.local", timeout=600
         )
@@ -320,6 +325,22 @@ async def test_live_provider_path_through_the_api_and_worker(tmp_path, tmp_path_
         _, alpha_after_enrichment = await engine.ask("alpha", space, "Gateway canary")
         _, beta_after_enrichment = await engine.ask("beta", space, "Gateway canary")
 
+        # Answer mode with the real model, while alpha can read exactly one record (M5 slice 3).
+        answer_body = (
+            await engine.client.post(
+                "/v1/queries",
+                headers=_auth("alpha"),
+                json={
+                    "spaceId": space["id"],
+                    "question": "What is the gateway canary code?",
+                    "mode": "answer",
+                },
+            )
+        ).json()
+        answer_reopened = (
+            await engine.client.get(f"/v1/queries/{answer_body['queryId']}", headers=_auth("alpha"))
+        ).json()
+
         await engine.collect()
         progress = (
             await engine.client.get(
@@ -383,6 +404,14 @@ async def test_live_provider_path_through_the_api_and_worker(tmp_path, tmp_path_
     assert enrichment.status_code == 202 and enriched["state"] == "succeeded"
     assert moved in alpha_after_enrichment and replacement not in alpha_after_enrichment
     assert moved not in beta_after_enrichment
+    # The real model answers from the one passage alpha may read, citing it, and the stored
+    # answer reopens unchanged; every citation names a passage the model was given.
+    assert answer_body["state"] == "completed", answer_body
+    assert [item["recordId"] for item in answer_body["evidence"]] == ["runbook-b"]
+    assert moved in answer_body["answer"] and beta not in answer_body["answer"]
+    markers = [int(n) for n in re.findall(r"\[(\d+)\]", answer_body["answer"])]
+    assert markers and all(1 <= n <= len(answer_body["evidence"]) for n in markers)
+    assert answer_reopened == answer_body
     # Progress reports collected indexing, and nothing failed along the way.
     assert progress["indexing"]["state"] != "not_collected"
     assert moved_status["indexState"] == "indexed"

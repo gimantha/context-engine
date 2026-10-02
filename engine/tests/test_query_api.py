@@ -21,6 +21,7 @@ from test_api import (
 )
 
 from context_engine.api import create_app
+from context_engine.application import ExtractiveAnswerGenerator
 from context_engine.config import Settings
 from context_engine.domain import IndexState, JobOperation
 from context_engine.knowledge_backend import BackendError, BackendErrorCode, DummyKnowledgeBackend
@@ -60,8 +61,13 @@ class _Stack:
             staging_path=tmp_path / "staging",
             knowledge_backend="provider" if provider else "none",
         )
+        # The extractive generator calls no model, so no test can reach a real one.
         self.client = TestClient(
-            create_app(settings, knowledge_backend=self.backend if provider else None)
+            create_app(
+                settings,
+                knowledge_backend=self.backend if provider else None,
+                answer_generator=ExtractiveAnswerGenerator(),
+            )
         )
         self.sequence = count()
 
@@ -205,7 +211,7 @@ async def test_access_rules_for_queries(tmp_path):
         outside_audience = stack.query(READER, space, "rollback checkpoint")
         no_read_action = stack.query(ADMIN, space, "rollback checkpoint")
         invisible = stack.query(MEMBER, other, "rollback checkpoint")
-        answer_mode = stack.query(MEMBER, space, "rollback checkpoint", mode="answer")
+        unknown_mode = stack.query(MEMBER, space, "rollback checkpoint", mode="summary")
         blank = stack.query(MEMBER, space, "   ")
         unauthenticated = stack.client.post("/v1/queries", json={"spaceId": space["id"]})
 
@@ -215,7 +221,7 @@ async def test_access_rules_for_queries(tmp_path):
     assert outside_audience.json()["evidence"] == []
     assert no_read_action.status_code == 403
     assert invisible.status_code == 404
-    assert answer_mode.status_code == 400 and blank.status_code == 400
+    assert unknown_mode.status_code == 400 and blank.status_code == 400
     assert unauthenticated.status_code == 401
 
 

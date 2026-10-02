@@ -24,6 +24,7 @@ from context_engine.application import (
     UnsupportedContentTypeError,
     UploadPolicy,
     ValidationError,
+    build_answer_generator,
     build_query_backend,
 )
 from context_engine.config import KnowledgeBackendSettings, Settings
@@ -134,13 +135,17 @@ def create_app(
     verifier: TokenVerifier | None = None,
     knowledge_backend: object | None = None,
     readiness_checks: Sequence[Callable[[], bool]] = (),
+    answer_generator: object | None = None,
 ) -> FastAPI:
     """Build the REST application and wire its control-plane dependencies.
 
     `knowledge_backend` lets tests inject a backend; it is typed opaquely because this package
     never depends on the backend port. Otherwise the application layer builds it from settings.
     `readiness_checks` lets the process that serves the app add conditions to readiness, such
-    as a worker loop running in the same process.
+    as a worker loop running in the same process. `answer_generator` writes answers; whoever
+    injects a backend injects the generator built from the same provider settings, because the
+    provider binds one storage root per process. Without either, provider mode builds both
+    from the environment.
     """
 
     settings = settings or Settings.from_env()
@@ -178,6 +183,10 @@ def create_app(
             ),
             queries=QueryRepository(database),
             default_models=_default_models(settings),
+            answers=answer_generator  # type: ignore[arg-type]
+            if answer_generator is not None or knowledge_backend is not None
+            else build_answer_generator(settings),
+            answer_context_chars=settings.answer_context_chars,
         )
 
     app = FastAPI(title="Context Engine API", version="0.4.0")

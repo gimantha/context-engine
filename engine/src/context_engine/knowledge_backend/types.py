@@ -144,6 +144,21 @@ class EvidenceItem:
 
 
 @dataclass(frozen=True, slots=True)
+class AnswerRequest:
+    """What a language model is asked to answer from, built by the engine (M5 slice 3).
+
+    `instructions` and `prompt` are the complete text the model receives; `passages` are the
+    evidence passages it holds, in the order the prompt numbers them, so a generator that
+    calls no model can still answer from them.
+    """
+
+    question: str
+    passages: tuple[str, ...]
+    instructions: str
+    prompt: str
+
+
+@dataclass(frozen=True, slots=True)
 class IngestionResult:
     """Result of storing or replaying one source record."""
 

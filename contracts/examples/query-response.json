@@ -1,7 +1,7 @@
 {
   "queryId": "query-01J8M0",
   "state": "completed",
-  "answer": "Use the rollback checkpoint from the cited runbook.",
+  "answer": "Confirm the rollback checkpoint before remediation [1].",
   "evidence": [
     {
       "id": "evidence-01J8M0",

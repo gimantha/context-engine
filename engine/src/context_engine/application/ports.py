@@ -277,8 +277,18 @@ class StagedBytes(Protocol):
 class QueryStore(Protocol):
     """Durable stored queries and the evidence they returned (M5 slice 2)."""
 
-    def record_query(self, query: StoredQuery, evidence: Sequence[PublicEvidence]) -> None:
-        """Store a query and its evidence, in order, in one transaction."""
+    def record_query(
+        self,
+        query: StoredQuery,
+        evidence: Sequence[PublicEvidence],
+        answer: str | None = None,
+    ) -> None:
+        """Store a query, its evidence in order, and its answer, in one transaction."""
+
+        ...
+
+    def get_answer(self, query_id: str) -> str | None:
+        """Return a query's stored answer, or None when it had none or it was erased."""
 
         ...
 

@@ -6,6 +6,7 @@ from typing import Protocol
 
 from .types import (
     AccessPartitionRef,
+    AnswerRequest,
     BackendHealth,
     BackendReference,
     DeletionResult,
@@ -20,6 +21,20 @@ from .types import (
     QueryResult,
     SourceRecord,
 )
+
+
+class AnswerWriter(Protocol):
+    """A model client that writes answer text from a prompt the engine built (M5 slice 3).
+
+    This is the answer-generation port the application layer calls. The private provider's
+    writer is one implementation and the application's extractive generator another; the
+    engine checks every reply before anyone sees it.
+    """
+
+    async def write(self, request: AnswerRequest, models: ModelSelection | None = None) -> str:
+        """Return the model's reply, with the space's models applied when given."""
+
+        ...
 
 
 class KnowledgeBackend(Protocol):

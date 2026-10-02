@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Context Engine API
-  version: 0.11.0
+  version: 0.12.0
   description: Provider-neutral API draft for governed context spaces.
 servers:
   - url: /v1
@@ -575,8 +575,11 @@ paths:
         space; only records whose audiences include one of the caller's groups can appear, and
         every passage is checked against the ledger before it is returned. Each passage carries
         a locator placing it in its record version. The query is stored with its evidence, so
-        its asker can reopen it. Answer mode is not available yet and is rejected. A deployment
-        without the knowledge backend answers 503.
+        its asker can reopen it. Answer mode also has the space's language model write an answer
+        from those passages alone: the evidence is exactly the passages the model was given,
+        each citation `[n]` names `evidence[n - 1]`, citations of anything else are removed, and
+        a reply left with none is insufficient evidence. A deployment without the knowledge
+        backend answers 503, as does answer mode when the model call fails.
       requestBody:
         required: true
         content:
@@ -1244,6 +1247,15 @@ components:
           enum: [completed, insufficient_evidence]
         answer:
           type: string
+          description: >-
+            Answer mode only. Each citation `[n]` names `evidence[n - 1]`; every citation names
+            a passage the model was given.
+        answerWithheld:
+          type: boolean
+          description: >-
+            Present and true when a stored answer exists but is not shown: a passage it was
+            written from is no longer visible to the reader, or was erased with its record
+            version. The remaining visible evidence is still returned.
         evidence:
           type: array
           items:

@@ -86,6 +86,27 @@ provider boundary check: passed
 
 Live verification on 2026-10-01: both live tests passed in 8 min 39 s. The end-to-end test now also delivers a 43,583-character record that the provider split into several chunks; every returned passage matched the record's text at the engine's offsets, chunk order matched text order, source lines were correct, and the stored query reopened with the same evidence. This confirms against the pinned provider that its chunks are exact slices of the text the engine sends.
 
+## Slice 3 delivered
+
+- **Answer mode.** `POST /v1/queries` with `"mode": "answer"` runs the context query, then has the space's language model answer from the passages that passed the barrier, through the provider's bare model client; its completion mode stays unused because it retrieves on its own. The response lists exactly the passages sent, so each `[n]` names `evidence[n - 1]`.
+- **Checked citations.** Markers are rewritten as `[n]`, numbers outside the passages sent are removed, and a reply with no surviving citation, or one saying the passages do not answer, is insufficient evidence with no answer. With no evidence the model is not called; a failed call answers 503 and stores nothing.
+- **Bounded prompts.** Passages are sent while they fit whole within `CONTEXT_ENGINE_ANSWER_CONTEXT_CHARS` (32,000); only the first is ever cut. Passages are marked as quoted material and their tags defused (threat model T21).
+- **Withholding and erasure** (your decisions of 2026-10-01). A stored answer reopens only while the reader can still see every passage it was written from; otherwise `answerWithheld` is set and the remaining evidence returned. Answers are erased with any of those passages' content, and with their space. Both rules cover every passage sent, not only cited ones, because a model can repeat a passage without citing it.
+- **Models recorded.** Answered queries record the language model that wrote them beside the embedding model, the space's or the environment's.
+- **Errors carry no prompt.** The provider's content-policy error quotes its whole input; the writer reduces provider errors to engine codes without chaining them.
+- **Wiring.** `AnswerWriter` is the port. The provider's writer is built from the same provider settings as the backend: `create_app` builds both from the environment, and a caller that injects a backend, as `context-engine-serve` does, injects the writer too. The live run found this: a writer built from different settings is refused, because the provider binds one storage root per process. Tests inject `ExtractiveAnswerGenerator`, which calls no model.
+- **Contract 0.12.0** documents answer mode and adds `answerWithheld`. Migration `0010_query_answers.sql` adds `query_answers`. ADR 0015 records the decisions.
+
+Validation performed on 2026-10-01 from `engine/`:
+
+```text
+ruff format --check and ruff check: passed
+pytest -m "not live_provider": 189 passed, 2 live tests deselected
+provider boundary check: passed
+```
+
+Live verification on 2026-10-01: the end-to-end live test passed in 7 min 33 s. Asked "What is the gateway canary code?" while able to read one record, the real model answered from that record alone, quoted its canary, and cited it with markers that all named passages it was given; the stored answer reopened unchanged. The adapter live test passed in the preceding run, including the pinned check of the model client's signature.
+
 ## Decisions
 
 - **Answers use the space's models** (user, 2026-09-29), and so do extraction and embeddings.

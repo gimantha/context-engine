@@ -47,6 +47,7 @@ from context_engine.domain import (
 from context_engine.ingestion.extraction import ExtractionError, extract
 from context_engine.knowledge_backend import (
     AccessPartitionRef,
+    AnswerWriter,
     BackendError,
     BackendErrorCode,
     EvidenceItem,
@@ -63,6 +64,7 @@ from context_engine.security.identity import AuthenticatedPrincipal
 from context_engine.security.policy import PolicyDecision, PolicyInput, authorize
 from context_engine.security.secrets import SecretError, SecretStore
 
+from .answers import build_answer_request, check_citations
 from .errors import (
     AccessDeniedError,
     ConflictError,
@@ -131,6 +133,8 @@ class ContextEngineService:
         secrets: SecretStore | None = None,
         queries: QueryStore | None = None,
         default_models: Mapping[str, ModelUse] | None = None,
+        answers: AnswerWriter | None = None,
+        answer_context_chars: int = 32_000,
     ) -> None:
         """Wire the service to its stores, authorizer, and policies.
 
@@ -142,7 +146,8 @@ class ContextEngineService:
         keys of a space's models; without one, only key references can be configured.
         `queries` stores each query with its evidence; without it, queries are not kept and
         cannot be reopened. `default_models` names the environment's models, recorded on queries
-        of spaces that configure none.
+        of spaces that configure none. `answers` writes answer text for answer mode, and
+        `answer_context_chars` bounds how much evidence one answer sends to the model.
         """
 
         self._store = store
@@ -160,6 +165,8 @@ class ContextEngineService:
         self._models = SpaceModelResolver(store, self._secrets)
         self._queries = queries
         self._default_models = dict(default_models or {})
+        self._answers = answers
+        self._answer_context_chars = answer_context_chars
 
     # Authorization helpers
 
@@ -915,24 +922,28 @@ class ContextEngineService:
         mode: str,
         limit: int,
     ) -> ContextQueryResult:
-        """Return authorized, source-linked passages for a question in one space, and store them.
+        """Return authorized, source-linked passages for a question, or an answer from them.
 
         Engine policy picks the partitions first, the backend is asked as the caller so its own
         read checks apply as a second layer, and every passage then passes the visibility
         barrier against the ledger. Each surviving passage is placed in the text the engine
         indexed, and the query is stored with its evidence so the asker can reopen it (M5 slice
-        2). A caller outside every audience gets insufficient evidence with no hint of what
-        exists; that query is stored too, with no partitions and no evidence.
+        2). In answer mode the space's language model then writes an answer from those passages
+        alone, and only citations of them survive (slice 3, ADR 0015). A caller outside every
+        audience gets insufficient evidence with no hint of what exists; that query is stored
+        too, with no partitions and no evidence.
         """
 
         self._accepting_space(principal, space_id)
         self._require(principal, Action.CONTEXT_READ, space_id)
-        if mode != "context":
-            raise ValidationError("Answer mode is not available yet; use context mode")
+        if mode not in {"context", "answer"}:
+            raise ValidationError("Mode must be context or answer")
         if not question.strip():
             raise ValidationError("Question is required")
         if self._backend is None:
             raise ServiceUnavailableError("Context queries need the knowledge backend")
+        if mode == "answer" and self._answers is None:
+            raise ServiceUnavailableError("Answer mode needs a language model")
         query_id = f"qry_{uuid4().hex}"
         decision = self._read_decision(principal, space_id, Action.CONTEXT_READ)
         partitions = decision.partitions if decision.allowed else ()
@@ -950,6 +961,12 @@ class ContextEngineService:
             )
         passed = self._visible_evidence(space_id, partitions, retrieved)
         evidence = (await self._placed_evidence(space_id, passed))[:limit]
+        answer: str | None = None
+        if mode == "answer":
+            answer, evidence = await self._answer(question, evidence, models)
+            insufficient = answer is None
+        else:
+            insufficient = not evidence
         if self._queries is not None:
             self._queries.record_query(
                 StoredQuery(
@@ -962,15 +979,54 @@ class ContextEngineService:
                     limit=limit,
                     policy_version=decision.policy_version,
                     partitions=tuple(item.value for item in partitions),
-                    outcome="completed" if evidence else "insufficient_evidence",
+                    outcome="insufficient_evidence" if insufficient else "completed",
                     retrieved=len(retrieved),
                     suppressed=len(retrieved) - len(passed),
-                    models=self._models_used(models) if partitions else (),
+                    models=self._models_used(models, language=mode == "answer" and bool(evidence))
+                    if partitions
+                    else (),
                     created_at=utc_now(),
                 ),
                 evidence,
+                answer,
             )
-        return ContextQueryResult(query_id, evidence, not evidence, principal.trace_id)
+        return ContextQueryResult(
+            query_id, evidence, insufficient, principal.trace_id, answer=answer
+        )
+
+    async def _answer(
+        self,
+        question: str,
+        evidence: tuple[PublicEvidence, ...],
+        models: ModelSelection | None,
+    ) -> tuple[str | None, tuple[PublicEvidence, ...]]:
+        """Have the space's language model answer from the evidence, and check its citations.
+
+        Only passages that passed the barrier and fit the character budget are sent, and the
+        result lists exactly those, in the order the prompt numbers them, so `[n]` in the
+        answer always names `evidence[n - 1]`. With no evidence the model is not called. A
+        reply whose citations all name passages it was not given, or that says the passages do
+        not answer the question, becomes insufficient evidence; the passages are still returned
+        so the caller sees what was considered.
+        """
+
+        if not evidence:
+            return None, ()
+        assert self._answers is not None
+        request = build_answer_request(
+            question, [item.passage for item in evidence], self._answer_context_chars
+        )
+        given = evidence[: len(request.passages)]
+        try:
+            reply = await self._answers.write(request, models)
+        except BackendError as exc:
+            raise ServiceUnavailableError("Answer generation failed") from exc
+        checked = check_citations(reply, len(given))
+        self._metrics.increment("context_engine_answers_total")
+        if checked is None:
+            self._metrics.increment("context_engine_answers_insufficient_total")
+            return None, given
+        return checked.text, given
 
     def get_query(self, principal: AuthenticatedPrincipal, query_id: str) -> ContextQueryResult:
         """Reopen a stored query for the principal who asked it, with its evidence re-checked.
@@ -988,10 +1044,24 @@ class ContextEngineService:
         self.get_context_space(principal, query.space_id)
         self._require(principal, Action.CONTEXT_READ, query.space_id)
         assert self._queries is not None
-        evidence = self._still_visible(
-            principal, query.space_id, self._queries.query_evidence(query.id), Action.CONTEXT_READ
+        stored = self._queries.query_evidence(query.id)
+        evidence = self._still_visible(principal, query.space_id, stored, Action.CONTEXT_READ)
+        if query.mode != "answer":
+            return ContextQueryResult(query.id, evidence, not evidence, query.trace_id)
+        # An answer may repeat any passage it was written from, so it is shown only while the
+        # reader can still see all of them and none was erased with its version (slice 3).
+        answered = query.outcome == "completed"
+        answer = self._queries.get_answer(query.id) if answered else None
+        complete = bool(stored) and len(evidence) == len(stored)
+        shown = answer if answer is not None and complete else None
+        return ContextQueryResult(
+            query.id,
+            evidence,
+            not answered,
+            query.trace_id,
+            answer=shown,
+            answer_withheld=answered and shown is None,
         )
-        return ContextQueryResult(query.id, evidence, not evidence, query.trace_id)
 
     def get_evidence(self, principal: AuthenticatedPrincipal, evidence_id: str) -> PublicEvidence:
         """Open one evidence item for any principal who could retrieve that passage now.
@@ -1235,18 +1305,24 @@ class ContextEngineService:
                 visible.append(item)
         return tuple(visible)
 
-    def _models_used(self, models: ModelSelection | None) -> tuple[tuple[str, ModelUse], ...]:
-        """Name the model that served retrieval: the space's, or the engine's default.
+    def _models_used(
+        self, models: ModelSelection | None, *, language: bool = False
+    ) -> tuple[tuple[str, ModelUse], ...]:
+        """Name the models that served a query: the space's, or the engine's defaults.
 
-        Context mode embeds the question and calls no language model, so only the embedding
-        model is recorded; answer mode adds the language model in slice 3.
+        Retrieval always embeds the question, so the embedding model is always recorded. The
+        language model is recorded only when it actually wrote an answer.
         """
 
-        chosen = models.embedding_model if models is not None else None
-        if chosen is not None:
-            return (("embedding", ModelUse(chosen.provider, chosen.model, "space")),)
-        default = self._default_models.get("embedding")
-        return (("embedding", default),) if default is not None else ()
+        used: list[tuple[str, ModelUse]] = []
+        kinds = (("embedding", "embedding_model"), ("language", "language_model"))
+        for kind, field in kinds if language else kinds[:1]:
+            chosen = getattr(models, field) if models is not None else None
+            if chosen is not None:
+                used.append((kind, ModelUse(chosen.provider, chosen.model, "space")))
+            elif (default := self._default_models.get(kind)) is not None:
+                used.append((kind, default))
+        return tuple(used)
 
     # Enrichment
 

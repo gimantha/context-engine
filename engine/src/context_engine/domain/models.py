@@ -446,12 +446,20 @@ class StoredEvidence:
 
 @dataclass(frozen=True, slots=True)
 class ContextQueryResult:
-    """Outcome of one context-mode query; answers arrive with M5."""
+    """Outcome of one query: its evidence and, in answer mode, the checked answer.
+
+    In an answer, each citation `[n]` names `evidence[n - 1]`. `answer_withheld` is set when a
+    stored answer exists but cannot be shown: some passage it was written from is no longer
+    visible to the reader, or was erased with its version, and the answer may repeat it (M5
+    slice 3 decision).
+    """
 
     query_id: str
     evidence: tuple[PublicEvidence, ...]
     insufficient_evidence: bool
     trace_id: str
+    answer: str | None = None
+    answer_withheld: bool = False
 
 
 @dataclass(frozen=True, slots=True)

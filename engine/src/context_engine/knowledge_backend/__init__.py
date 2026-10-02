@@ -2,10 +2,11 @@
 
 from .dummy import DummyKnowledgeBackend
 from .errors import BackendError, BackendErrorCode
-from .port import KnowledgeBackend
+from .port import AnswerWriter, KnowledgeBackend
 from .state import BackendStateStore, InMemoryBackendState
 from .types import (
     AccessPartitionRef,
+    AnswerRequest,
     BackendCapabilities,
     BackendHealth,
     BackendReference,
@@ -27,6 +28,8 @@ from .types import (
 
 __all__ = [
     "AccessPartitionRef",
+    "AnswerRequest",
+    "AnswerWriter",
     "BackendCapabilities",
     "BackendError",
     "BackendErrorCode",

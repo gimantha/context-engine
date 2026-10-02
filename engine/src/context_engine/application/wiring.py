@@ -7,8 +7,8 @@ a provider. The backend reads and writes its durable state in the control databa
 from __future__ import annotations
 
 from context_engine.config import KnowledgeBackendSettings, Settings
-from context_engine.knowledge_backend import KnowledgeBackend
-from context_engine.knowledge_backend.factory import build_knowledge_backend
+from context_engine.knowledge_backend import AnswerWriter, KnowledgeBackend
+from context_engine.knowledge_backend.factory import build_answer_writer, build_knowledge_backend
 from context_engine.persistence import ControlDatabase, SqliteBackendState
 
 KNOWLEDGE_BACKEND_MODES = ("none", "provider")
@@ -27,3 +27,15 @@ def build_query_backend(settings: Settings, database: ControlDatabase) -> Knowle
     return build_knowledge_backend(
         KnowledgeBackendSettings.from_env(), SqliteBackendState(database)
     )
+
+
+def build_answer_generator(settings: Settings) -> AnswerWriter | None:
+    """Return the provider's answer writer, or None while the engine runs ledger-only.
+
+    Answers need a language model, which only provider mode configures; without one, answer
+    mode answers unavailable rather than inventing text.
+    """
+
+    if settings.knowledge_backend != "provider":
+        return None
+    return build_answer_writer(KnowledgeBackendSettings.from_env())

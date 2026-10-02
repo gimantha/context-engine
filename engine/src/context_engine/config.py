@@ -58,6 +58,8 @@ class Settings:
     # Where `cp:` key references are resolved; unset means such references are refused.
     control_plane_url: str = ""
     control_plane_token: str = ""
+    # Characters of evidence one answer may send to the model; bounds the cost of an answer.
+    answer_context_chars: int = 32_000
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -95,6 +97,7 @@ class Settings:
             secrets_key=os.getenv("CONTEXT_ENGINE_SECRETS_KEY", "").strip(),
             control_plane_url=os.getenv("CONTEXT_ENGINE_CONTROL_PLANE_URL", "").strip(),
             control_plane_token=os.getenv("CONTEXT_ENGINE_CONTROL_PLANE_TOKEN", "").strip(),
+            answer_context_chars=int(os.getenv("CONTEXT_ENGINE_ANSWER_CONTEXT_CHARS", "32000")),
         )
 
 

@@ -797,10 +797,17 @@ class EvidenceResponse(_ApiModel):
 
 
 class ContextQueryResponse(_ApiModel):
-    """Evidence for a question, or an explicit insufficient-evidence state."""
+    """Evidence for a question and, in answer mode, the checked answer, or insufficient evidence.
+
+    Each `[n]` in the answer cites `evidence[n - 1]`. `answerWithheld` appears when a stored
+    answer can no longer be shown because a passage it was written from is out of the reader's
+    reach or was erased.
+    """
 
     query_id: str = Field(alias="queryId")
     state: Literal["completed", "insufficient_evidence"]
+    answer: str | None = None
+    answer_withheld: bool | None = Field(default=None, alias="answerWithheld")
     evidence: list[EvidenceResponse]
     insufficient_evidence: bool = Field(alias="insufficientEvidence")
     trace_id: str = Field(alias="traceId")
@@ -812,6 +819,8 @@ class ContextQueryResponse(_ApiModel):
         return cls(
             queryId=value.query_id,
             state="insufficient_evidence" if value.insufficient_evidence else "completed",
+            answer=value.answer,
+            answerWithheld=True if value.answer_withheld else None,
             evidence=[EvidenceResponse.from_domain(item) for item in value.evidence],
             insufficientEvidence=value.insufficient_evidence,
             traceId=value.trace_id,

@@ -173,6 +173,14 @@ curl -H "Authorization: Bearer <reader token>" http://127.0.0.1:8000/v1/evidence
 
 Reads check access again, so evidence whose record moved out of the reader's audiences, or was replaced or deleted, is left out. Stored evidence is erased when the worker releases its version's content.
 
+With `"mode": "answer"`, the space's language model answers from those passages alone (ADR 0015). The response lists exactly the passages the model was given, and each citation `[n]` names `evidence[n - 1]`; citations of anything else are removed, and a reply left with none comes back as insufficient evidence. `CONTEXT_ENGINE_ANSWER_CONTEXT_CHARS` bounds how much evidence one answer sends. A stored answer reopens only while the reader can still see every passage it was written from; otherwise `answerWithheld` is set and the remaining evidence is returned. Answers are erased with the content they were written from:
+
+```bash
+curl -H "Authorization: Bearer <reader token>" -H "Content-Type: application/json" \
+  -d '{"spaceId": "<space id>", "question": "What comes before remediation?", "mode": "answer"}' \
+  http://127.0.0.1:8000/v1/queries
+```
+
 See [the M4 report](docs/m4/implementation-report.md) for the live verification and its open items.
 
 Interactive API documentation is available at `http://127.0.0.1:8000/docs`. Identity-provider integrations arrive in M6.

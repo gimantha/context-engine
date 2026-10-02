@@ -15,6 +15,7 @@ from test_api import ADMIN, MEMBER, MIGRATIONS, READER, SERVICE, _auth, _grant, 
 from test_query_api import ROOT, _Stack
 
 from context_engine.api import create_app
+from context_engine.application import ExtractiveAnswerGenerator
 from context_engine.config import Settings
 from context_engine.knowledge_backend import DummyKnowledgeBackend
 
@@ -78,9 +79,10 @@ def _tokens(tmp_path):
 
 
 class _StoredStack(_Stack):
-    """The query stack with a line-chunking backend and the extra identities."""
+    """The query stack with a line-chunking backend, the extra identities, and an answer
+    generator that calls no model; answer tests pass their own generator or budget."""
 
-    def __init__(self, tmp_path):
+    def __init__(self, tmp_path, *, answers=None, answer_context_chars=32_000):
         self.tmp_path = tmp_path
         self.backend = DummyKnowledgeBackend(chunk_lines=1)
         settings = Settings(
@@ -89,8 +91,15 @@ class _StoredStack(_Stack):
             static_tokens_path=_tokens(tmp_path),
             staging_path=tmp_path / "staging",
             knowledge_backend="provider",
+            answer_context_chars=answer_context_chars,
         )
-        self.client = TestClient(create_app(settings, knowledge_backend=self.backend))
+        self.client = TestClient(
+            create_app(
+                settings,
+                knowledge_backend=self.backend,
+                answer_generator=answers or ExtractiveAnswerGenerator(),
+            )
+        )
         self.sequence = count()
 
     def get(self, path, token):

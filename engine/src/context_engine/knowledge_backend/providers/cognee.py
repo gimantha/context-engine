@@ -23,6 +23,7 @@ from ..errors import BackendError, BackendErrorCode
 from ..state import BackendStateStore, InMemoryBackendState
 from ..types import (
     AccessPartitionRef,
+    AnswerRequest,
     BackendCapabilities,
     BackendHealth,
     BackendReference,
@@ -625,6 +626,31 @@ class CogneeBackend:
 _loaded_storage: Path | None = None
 
 
+class CogneeAnswerWriter:
+    """Write answers with the provider's model client (M5 slice 3, ADR 0015).
+
+    Errors leave as engine errors that name no provider detail. That matters here more than
+    anywhere: the provider's content-policy error carries the whole prompt, passages included,
+    in its message.
+    """
+
+    def __init__(self, runtime: CogneeRuntime) -> None:
+        """Use a runtime bound to the engine's provider settings."""
+
+        self._runtime = runtime
+
+    async def write(self, request: AnswerRequest, models: ModelSelection | None = None) -> str:
+        """Return the model's reply to the engine's prompt."""
+
+        try:
+            return await self._runtime.write_answer(request.instructions, request.prompt, models)
+        except BackendError:
+            raise
+        except Exception as exc:
+            # Not chained: the original exception's message may hold the prompt.
+            raise _translate_error(exc) from None
+
+
 class CogneeRuntime:
     """Lazy SDK wrapper. All Cognee imports and native calls stay in this module."""
 
@@ -814,6 +840,26 @@ class CogneeRuntime:
 
         cognee = await self._ready()
         return await cognee.forget(dataset_id=UUID(binding.dataset_id), user=user)
+
+    async def write_answer(
+        self, instructions: str, prompt: str, models: ModelSelection | None = None
+    ) -> str:
+        """Ask the provider's model client for a plain-text reply, with the space's models.
+
+        This is the provider's bare model client, not its completion mode: the engine has
+        already chosen the passages, so nothing here retrieves. The client needs the
+        provider's configuration but none of its stores. No usage session is open, so the
+        provider records token counts only, never the prompt.
+        """
+
+        self._module()
+        from cognee.infrastructure.llm.LLMGateway import LLMGateway
+
+        with _native_model_context(models):
+            reply = await LLMGateway.acreate_structured_output(
+                text_input=prompt, system_prompt=instructions, response_model=str
+            )
+        return str(reply)
 
     async def ensure_user(self, handle: str) -> Any:
         """Find the ordinary native account for a handle, creating it on first use."""
@@ -1159,6 +1205,12 @@ def assert_runtime_matches_pinned_sdk(runtime: CogneeRuntime | None = None) -> N
             raise RuntimeError(
                 f"Pinned provider {operation} signature is missing {sorted(missing)}"
             )
+    # Answers go through the bare model client, with the reply as plain text.
+    from cognee.infrastructure.llm.LLMGateway import LLMGateway
+
+    gateway = set(inspect.signature(LLMGateway.acreate_structured_output).parameters)
+    if not {"text_input", "system_prompt", "response_model"} <= gateway:
+        raise RuntimeError("Pinned provider model client no longer takes a prompt and a reply type")
     # Ingestion takes the per-call model settings through a typed keyword bundle rather than
     # named parameters, so the bundle is what pins them.
     from cognee.api.v1.remember.remember import RememberKwargs

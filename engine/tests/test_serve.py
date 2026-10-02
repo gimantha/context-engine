@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import httpx
@@ -182,6 +183,18 @@ def test_serve_startup_check_in_both_backend_modes(tmp_path, monkeypatch, capsys
     monkeypatch.setenv("CONTEXT_ENGINE_KNOWLEDGE_BACKEND", "everything")
     with pytest.raises(RuntimeError):
         serve_main()
+
+
+def test_serve_gives_the_api_an_answer_writer_in_provider_mode(tmp_path):
+    for name in ("ledger", "provider"):
+        (tmp_path / name).mkdir()
+    ledger_only = create_serve_app(_settings(tmp_path / "ledger"))
+    provider = create_serve_app(
+        replace(_settings(tmp_path / "provider"), knowledge_backend="provider")
+    )
+    # Answer mode in the single process uses a writer built from the worker's settings.
+    assert ledger_only.state.service._answers is None
+    assert provider.state.service._answers is not None
 
 
 def test_serve_refuses_static_tokens_off_loopback(monkeypatch):

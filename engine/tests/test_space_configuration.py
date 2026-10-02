@@ -14,6 +14,7 @@ from test_query_api import SERVICE_ID, _Stack
 
 from context_engine.api import create_app
 from context_engine.api.schemas import SpaceConfigurationRequest
+from context_engine.application import ExtractiveAnswerGenerator
 from context_engine.application.space_models import SpaceModelResolver
 from context_engine.config import Settings
 from context_engine.domain import JobOperation
@@ -76,7 +77,7 @@ class RecordingBackend(DummyKnowledgeBackend):
 class _ConfiguredStack(_Stack):
     """The query stack with a secrets key and a worker that resolves each space's models."""
 
-    def __init__(self, tmp_path, *, secrets_key=SECRETS_KEY, provider=True):
+    def __init__(self, tmp_path, *, secrets_key=SECRETS_KEY, provider=True, answers=None):
         self.tmp_path = tmp_path
         self.backend = RecordingBackend()
         self.settings = Settings(
@@ -88,7 +89,11 @@ class _ConfiguredStack(_Stack):
             secrets_key=secrets_key,
         )
         self.client = TestClient(
-            create_app(self.settings, knowledge_backend=self.backend if provider else None)
+            create_app(
+                self.settings,
+                knowledge_backend=self.backend if provider else None,
+                answer_generator=answers or ExtractiveAnswerGenerator(),
+            )
         )
         self.sequence = count()
 
@@ -323,6 +328,49 @@ async def test_configured_models_reach_every_backend_call(tmp_path, monkeypatch)
             "configuredBy": "space",
         }
     }
+
+
+class _ModelSpy(ExtractiveAnswerGenerator):
+    """The extractive generator, keeping the models each answer was written with."""
+
+    def __init__(self):
+        super().__init__()
+        self.models = []
+
+    async def write(self, request, models=None):
+        self.models.append(models)
+        return await super().write(request, models)
+
+
+async def test_answers_use_the_space_language_model(tmp_path, monkeypatch):
+    monkeypatch.setenv("CONTEXT_ENGINE_TEST_LLM_KEY", "sk-resolved-language")
+    spy = _ModelSpy()
+    stack = _ConfiguredStack(tmp_path, answers=spy)
+    with stack.client:
+        space, source = stack.setup()
+        stack.put(
+            space,
+            {"llm": {**LANGUAGE, "apiKey": None, "apiKeyRef": "env:CONTEXT_ENGINE_TEST_LLM_KEY"}},
+        )
+        stack.deliver(space, source, "runbook-1", "1", content=b"Confirm the rollback checkpoint.")
+        await stack.drain()
+        response = stack.query(MEMBER, space, "rollback checkpoint", mode="answer")
+
+    assert response.status_code == 200 and response.json()["answer"], response.text
+    [models] = spy.models
+    assert models.language_model.model == "claude-sonnet-5"
+    assert models.language_model.api_key == "sk-resolved-language"
+    stored = json.loads(
+        sqlite3.connect(tmp_path / "control.db")
+        .execute("SELECT models_json FROM queries")
+        .fetchone()[0]
+    )
+    assert stored["language"] == {
+        "provider": "anthropic",
+        "model": "claude-sonnet-5",
+        "configuredBy": "space",
+    }
+    assert "sk-" not in json.dumps(stored)
 
 
 async def test_unconfigured_spaces_use_the_backend_default(tmp_path):
