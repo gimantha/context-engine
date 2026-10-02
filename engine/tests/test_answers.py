@@ -144,7 +144,9 @@ async def test_the_budget_bounds_what_one_answer_sends(tmp_path):
         space, source = stack.setup()
         stack.deliver(space, source, "runbook-84", "84", content=RUNBOOK)
         await stack.drain()
-        body = _ask(stack, MEMBER, space, "rollback checkpoint restart gateway").json()
+        # The restart passage matches two words and the checkpoint passage one, so their
+        # order never depends on a tie.
+        body = _ask(stack, MEMBER, space, "restart gateway checkpoint").json()
 
     [request] = scripted.requests
     # Two passages match; the first fits the budget whole and the second does not.

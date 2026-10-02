@@ -163,6 +163,8 @@ curl -X POST -H "Authorization: Bearer <enricher token>" -H "Idempotency-Key: en
   http://127.0.0.1:8000/v1/spaces/<space id>/enrichments
 ```
 
+Passages are the provider's chunks: whole sentences joined into slices of the record's text, with no overlap. By default a chunk is as large as the models accept, about 8,000 tokens with the default embedding model. Set `CONTEXT_ENGINE_CHUNK_TOKENS` (at least 128) for finer passages and citations, for example `1024`. The engine never sends a chunk larger than the space's models accept, and the setting applies to content written after it changes; existing records keep their chunks until their next version.
+
 Each passage carries a `locator` that places it in its record version: the chunk index, the character range in the extracted text, the sentence range, and, by type, source lines (text, Markdown), the nearest heading (Markdown, HTML), or the JSON path. Every query is stored. Its asker can reopen it, and anyone who could retrieve a passage now, with `context.read` or `evidence.read`, can open it by id, for example from a citation:
 
 ```bash

@@ -112,7 +112,11 @@ class _Engine:
         )
         database = ControlDatabase(self.settings.database_path, self.settings.migrations_path)
         database.migrate()
-        backend_settings = replace(KnowledgeBackendSettings.from_env(), storage_path=storage)
+        # A set chunk size, so the multi-chunk record below is cut by it (the adapter's live
+        # test keeps the provider's own sizing).
+        backend_settings = replace(
+            KnowledgeBackendSettings.from_env(), storage_path=storage, chunk_tokens=1024
+        )
         backend = build_knowledge_backend(backend_settings, SqliteBackendState(database))
         sources = SourceRepository(database)
         authorization = AuthorizationRepository(database)
@@ -420,7 +424,9 @@ async def test_live_provider_path_through_the_api_and_worker(tmp_path, tmp_path_
     # chunk order, with source lines; the stored query reopens with the same evidence.
     assert long_status["indexState"] == "indexed"
     long_evidence = [item for item in long_body["evidence"] if item["recordId"] == "runbook-long"]
-    assert len({item["locator"]["chunkIndex"] for item in long_evidence}) >= 2, long_body
+    # At 1,024 tokens the record splits into about ten chunks; the provider's own sizing,
+    # about 8,000 tokens, would give two or three.
+    assert len({item["locator"]["chunkIndex"] for item in long_evidence}) >= 4, long_body
     for item in long_evidence:
         characters = item["locator"]["characters"]
         assert long_text[characters["start"] : characters["end"]] == item["passage"]

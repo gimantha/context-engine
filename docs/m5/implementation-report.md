@@ -107,6 +107,20 @@ provider boundary check: passed
 
 Live verification on 2026-10-01: the end-to-end live test passed in 7 min 33 s. Asked "What is the gateway canary code?" while able to read one record, the real model answered from that record alone, quoted its canary, and cited it with markers that all named passages it was given; the stored answer reopened unchanged. The adapter live test passed in the preceding run, including the pinned check of the model client's signature.
 
+## Chunk size setting (2026-10-02)
+
+Passages had always been the provider's default chunks, about 8,000 tokens, which made citations long and let one passage fill most of an answer's budget. `CONTEXT_ENGINE_CHUNK_TOKENS`, at least 128, now sets the target chunk size for new writes, passed to the provider's write call and capped at the limit the space's own models accept; unset keeps the default. The provider's `set_chunk_*` setters were checked first and are inert in the pinned version (ADR 0008 revision of 2026-10-02). The end-to-end live test now indexes with 1,024-token chunks and passed in 2 min 35 s, against 7 min 33 s at the default size: the long record came back as at least four distinct chunks, all exact slices at the engine's offsets.
+
+A flaky slice 3 test was fixed in the same change: the budget test's two passages could tie in the deterministic backend's ranking, which then depends on a random partition id.
+
+Validation performed on 2026-10-02 from `engine/`:
+
+```text
+ruff format --check and ruff check: passed
+pytest -m "not live_provider": 191 passed, 2 live tests deselected
+provider boundary check: passed
+```
+
 ## Decisions
 
 - **Answers use the space's models** (user, 2026-09-29), and so do extraction and embeddings.

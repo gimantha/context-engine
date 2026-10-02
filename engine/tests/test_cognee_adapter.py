@@ -732,3 +732,57 @@ async def test_answer_errors_never_carry_the_prompt():
 
     assert "secret" not in str(error.value) and "secret" not in repr(error.value)
     assert error.value.__cause__ is None and error.value.__suppress_context__
+
+
+@pytest.mark.asyncio
+async def test_a_configured_chunk_size_is_capped_at_the_space_models_limit(
+    monkeypatch, record_factory
+):
+    from contextvars import ContextVar
+
+    captured = {}
+    variables = types.ModuleType("cognee.context_global_variables")
+    variables.llm_config = ContextVar("llm_config", default=None)
+    variables.embedding_config = ContextVar("embedding_config", default=None)
+
+    async def remember(**kwargs):
+        captured.update(kwargs)
+        item_id = kwargs["data"].data_id
+        return types.SimpleNamespace(
+            status="completed", dataset_id=str(uuid4()), items=[{"id": str(item_id)}]
+        )
+
+    async def get_max_chunk_tokens():
+        # The provider's limit follows the per-call embedding model; a small one takes 512.
+        embedding = variables.embedding_config.get()
+        return 512 if embedding is not None else 8191
+
+    fake = types.ModuleType("cognee")
+    fake.remember = remember
+    _fake_model_modules(monkeypatch, fake)
+    sys.modules["cognee.infrastructure.llm"].get_max_chunk_tokens = get_max_chunk_tokens
+    monkeypatch.setitem(sys.modules, "cognee.context_global_variables", variables)
+
+    def runtime_with(chunk_tokens):
+        runtime = CogneeRuntime(KnowledgeBackendSettings(chunk_tokens=chunk_tokens))
+        monkeypatch.setattr(runtime, "_module", lambda: fake)
+        monkeypatch.setattr(runtime, "_prepared", True)
+        return runtime
+
+    small = ModelSelection(embedding_model=ModelSettings("ollama", "tiny-embed", "k"))
+
+    await runtime_with(None).remember(record_factory("d", "1", "t"), _CogneeBinding("n"), object())
+    assert "chunk_size" not in captured, "unset keeps the provider's own sizing"
+    await runtime_with(1024).remember(record_factory("d", "2", "t"), _CogneeBinding("n"), object())
+    assert captured["chunk_size"] == 1024
+    await runtime_with(1024).remember(
+        record_factory("d", "3", "t"), _CogneeBinding("n"), object(), small
+    )
+    assert captured["chunk_size"] == 512, "never above what the space's models accept"
+    assert variables.embedding_config.get() is None
+
+
+def test_chunk_sizes_below_the_floor_are_refused():
+    with pytest.raises(ValueError):
+        KnowledgeBackendSettings(chunk_tokens=64)
+    assert KnowledgeBackendSettings(chunk_tokens=128).chunk_tokens == 128

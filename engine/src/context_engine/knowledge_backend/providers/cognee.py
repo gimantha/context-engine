@@ -739,6 +739,9 @@ class CogneeRuntime:
         if binding.dataset_id:
             kwargs["dataset_id"] = UUID(binding.dataset_id)
         kwargs.update(_native_model_kwargs(models))
+        chunk_size = await self._chunk_size(models)
+        if chunk_size is not None:
+            kwargs["chunk_size"] = chunk_size
         result = await cognee.remember(**kwargs)
         if getattr(result, "status", None) == "errored":
             raise BackendError(BackendErrorCode.PARTIAL_WRITE, "Provider ingestion failed")
@@ -840,6 +843,26 @@ class CogneeRuntime:
 
         cognee = await self._ready()
         return await cognee.forget(dataset_id=UUID(binding.dataset_id), user=user)
+
+    async def _chunk_size(self, models: ModelSelection | None) -> int | None:
+        """Return the configured chunk size, capped at the limit the models accept.
+
+        Without a setting the provider sizes chunks itself, to the smaller of the embedding
+        model's input limit and half the language model's output budget. With one, the engine
+        asks the provider for that same limit with the space's models applied and never goes
+        above it, so a space whose embedding model takes less input still gets chunks it can
+        embed. Chunks stay the provider's sentence-joining slices, with no overlap, as evidence
+        placement assumes (M5 slice 2).
+        """
+
+        configured = self._settings.chunk_tokens
+        if configured is None:
+            return None
+        from cognee.infrastructure.llm import get_max_chunk_tokens
+
+        with _native_model_context(models):
+            limit = await get_max_chunk_tokens()
+        return min(configured, limit)
 
     async def write_answer(
         self, instructions: str, prompt: str, models: ModelSelection | None = None
@@ -1180,7 +1203,7 @@ def assert_runtime_matches_pinned_sdk(runtime: CogneeRuntime | None = None) -> N
 
     cognee = (runtime or CogneeRuntime())._module()
     required = {
-        "remember": {"data", "dataset_name", "dataset_id", "self_improvement"},
+        "remember": {"data", "dataset_name", "dataset_id", "self_improvement", "chunk_size"},
         "recall": {
             "query_text",
             "query_type",
@@ -1205,6 +1228,11 @@ def assert_runtime_matches_pinned_sdk(runtime: CogneeRuntime | None = None) -> N
             raise RuntimeError(
                 f"Pinned provider {operation} signature is missing {sorted(missing)}"
             )
+    # A configured chunk size is capped at the limit the provider computes for the models.
+    from cognee.infrastructure import llm as provider_llm
+
+    if not callable(getattr(provider_llm, "get_max_chunk_tokens", None)):
+        raise RuntimeError("Pinned provider no longer reports the models' chunk limit")
     # Answers go through the bare model client, with the reply as plain text.
     from cognee.infrastructure.llm.LLMGateway import LLMGateway
 

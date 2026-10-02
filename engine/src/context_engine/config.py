@@ -16,6 +16,21 @@ def _env_bool(name: str, default: bool) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+# Smaller chunks multiply embeddings and extraction calls without making citations any finer.
+MIN_CHUNK_TOKENS = 128
+
+
+def _env_chunk_tokens() -> int | None:
+    """Read the target chunk size in tokens, or None to let the provider size chunks.
+
+    Unset keeps the provider's default, chunks as large as the models accept. The value is
+    checked by `KnowledgeBackendSettings` itself, so a bad one stops startup.
+    """
+
+    value = os.getenv("CONTEXT_ENGINE_CHUNK_TOKENS", "").strip()
+    return int(value) if value else None
+
+
 def _env_list(name: str, default: tuple[str, ...]) -> tuple[str, ...]:
     """Read a comma-separated environment value or return the supplied default."""
 
@@ -123,10 +138,21 @@ class KnowledgeBackendSettings:
     embedding_dimensions: int = 1536
     embedding_api_key: str = ""
     storage_path: Path = Path(".context-engine/knowledge")
+    # Target chunk size in tokens for new writes; None keeps the provider's default, chunks as
+    # large as the models accept. Smaller chunks give finer passages and citations.
+    chunk_tokens: int | None = None
     # The engine's own identity; it owns every backend isolation unit and hands out read access.
     service_principal_id: str = "context-engine-service"
     live_test_enabled: bool = False
     live_test_password: str = ""
+
+    def __post_init__(self) -> None:
+        """Refuse a chunk size too small to be useful, whether from the environment or code."""
+
+        if self.chunk_tokens is not None and self.chunk_tokens < MIN_CHUNK_TOKENS:
+            raise ValueError(
+                f"CONTEXT_ENGINE_CHUNK_TOKENS must be at least {MIN_CHUNK_TOKENS} tokens"
+            )
 
     @classmethod
     def from_env(cls) -> KnowledgeBackendSettings:
@@ -159,6 +185,7 @@ class KnowledgeBackendSettings:
             storage_path=Path(
                 os.getenv("CONTEXT_ENGINE_KNOWLEDGE_STORAGE_PATH", ".context-engine/knowledge")
             ).expanduser(),
+            chunk_tokens=_env_chunk_tokens(),
             service_principal_id=os.getenv(
                 "CONTEXT_ENGINE_SERVICE_PRINCIPAL_ID", "context-engine-service"
             ).strip(),

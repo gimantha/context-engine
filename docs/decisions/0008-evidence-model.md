@@ -63,3 +63,14 @@ Queries are stored, evidence can be reopened, and every passage is placed in its
 - **Erasure.** Evidence holds passages, so it lives exactly as long as its version's content. The worker deletes it in the transaction that marks the version's staged bytes released, and space deletion purges queries and evidence with the space. Query rows stay until the retention sweep of slice 4.
 
 Validation: `engine/tests/test_provenance.py` (extraction structure, sentences, headings, JSON paths, repeats), `engine/tests/test_stored_queries.py` (storage, reopening, access, barrier on read, erasure, contract conformance), and the multi-chunk check in `tests/end-to-end/test_live_provider_path.py`, which passed against the pinned provider on 2026-10-01: every passage of a record split into several chunks matched the text at the engine's offsets, chunk order matched text order, and the stored query reopened with the same evidence.
+
+## Revision (2026-10-02, chunk size)
+
+Passages are the provider's chunks, and until now their size was always the provider's default: as large as the models accept, about 8,000 tokens with the default embedding model. That made passages long to read as citations and let one chunk fill most of an answer's budget.
+
+- **A chunk size setting.** `CONTEXT_ENGINE_CHUNK_TOKENS`, at least 128, sets the target chunk size for new writes. Unset keeps the provider's default. The adapter passes it as the provider write call's `chunk_size`, capped at the limit the provider computes for the space's own models, the smaller of the embedding model's input limit and half the language model's output budget, so no space gets chunks its embedding model cannot take.
+- **The provider's chunking setters are inert.** In the pinned version, `config.set_chunk_size`, `set_chunk_overlap`, `set_chunk_strategy`, and `set_chunk_engine` write a configuration that nothing reads: its only reader, `get_chunk_engine()`, has no callers, and the write pipeline chunks with its sentence-joining chunker sized by the write call's argument.
+- **No overlap, same chunker.** Evidence placement (revision of 2026-10-01) relies on ordered, non-overlapping exact slices, so the engine keeps the provider's chunker and adds no overlap.
+- **Existing content.** Records keep the chunks they were written with until their next version; a partition may hold chunks of both sizes, which retrieval and placement handle alike.
+
+Validation: the chunk-size and cap tests and the pinned-SDK check in `engine/tests/test_cognee_adapter.py`, and the end-to-end live test, which now indexes with 1,024-token chunks. On 2026-10-02 it passed against the pinned provider: the 43,583-character record came back as at least four distinct chunks among ten passages, where the default gives two or three, and every passage matched the text at the engine's offsets, in chunk order.
